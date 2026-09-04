@@ -7,7 +7,7 @@ const http = require('http');
 const https = require('https');
 
 const app = express();
-const PORT = 5555;
+const PORT = process.env.PORT || 5555;
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
