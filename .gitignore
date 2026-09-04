@@ -6,6 +6,7 @@ data.json
 *.env
 *.env.*
 *.key
+*.admin-token
 *.pem
 *.pfx
 *.cert

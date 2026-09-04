@@ -38,18 +38,18 @@
 
 ## 🚀 快速开始
 
-### OAuth 配置（必须）
+### 一键启动与首次口令
 
-InboxHarbor 不保存邮箱密码，只通过你自己创建的 OAuth 应用访问邮箱。启动前设置：
+安装依赖后直接启动，无需预先创建或导出管理口令：
 
 ```bash
-MICROSOFT_CLIENT_ID=你的 Microsoft 应用 Client ID
-GOOGLE_CLIENT_ID=你的 Google OAuth Client ID
-GOOGLE_CLIENT_SECRET=你的 Google OAuth Client Secret
-INBOXHARBOR_ADMIN_TOKEN=本机管理口令
+npm install
+npm start
 ```
 
-未设置 `INBOXHARBOR_ADMIN_TOKEN` 时，服务会在每次启动生成一次性本机口令。Microsoft 或 Google OAuth 缺少对应配置会明确拒绝开始授权。
+首次启动会自动生成高强度管理口令，持久保存在项目目录的 `inboxharbor.admin-token`，并在终端显示一次。以后重启继续使用同一个口令；忘记时运行 `npm run credentials` 查询。该文件已被 Git 忽略，请勿上传或公开。
+
+服务在没有 OAuth 配置时也能正常启动。Microsoft/Google Client ID（以及 Google Client Secret）由对应平台签发，无法由本机自动生成；只需为每个平台配置一次，此后可以方便地添加和授权任意多个该平台邮箱。环境变量仍可作为高级部署方式使用：`MICROSOFT_CLIENT_ID`、`GOOGLE_CLIENT_ID`、`GOOGLE_CLIENT_SECRET`、`INBOXHARBOR_ADMIN_TOKEN`。
 
 ### 本地加密存储与备份
 
@@ -90,11 +90,10 @@ npm start
 ```
 打开浏览器访问 `http://localhost:5555` 即可。
 
-首次启动若未设置 `INBOXHARBOR_ADMIN_TOKEN`，终端会显示本次运行的本机访问口令。也可以在启动前自行设置固定口令：
+首次安装只需执行 `npm start`。查询已保存的管理口令：
 
-```powershell
-$env:INBOXHARBOR_ADMIN_TOKEN = "replace-with-a-long-random-token"
-npm start
+```bash
+npm run credentials
 ```
 
 ## 邮箱权限

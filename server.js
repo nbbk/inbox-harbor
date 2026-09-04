@@ -7,11 +7,17 @@ const https = require('https');
 const crypto = require('crypto');
 const { CHANNELS, publicConfig, send, sendAll, messageFor } = require('./notifications');
 const { Storage } = require('./storage');
+const { loadOrCreateAdminToken } = require('./instance-config');
 
 const app = express();
 const PORT = process.env.PORT || 5555;
-const ADMIN_TOKEN = process.env.INBOXHARBOR_ADMIN_TOKEN || crypto.randomBytes(24).toString('base64url');
-if (!process.env.INBOXHARBOR_ADMIN_TOKEN) console.log(`InboxHarbor local access token (valid until restart): ${ADMIN_TOKEN}`);
+const adminCredential = loadOrCreateAdminToken(__dirname);
+const ADMIN_TOKEN = adminCredential.token;
+if (adminCredential.created) {
+  console.log('\n🔑 首次启动已生成管理口令（已持久保存）：');
+  console.log(`   ${ADMIN_TOKEN}`);
+  console.log('   忘记时运行：npm run credentials\n');
+}
 
 // InboxHarbor is deliberately local-first. Do not expose this service to a LAN.
 app.use(express.json({ limit: '512kb' }));

@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/notifications.test.js test/storage.test.js",
+    "credentials": "node scripts/credentials.js",
+    "test": "node --test test/*.test.js",
     "test:ui": "playwright test test/ui.spec.js --reporter=line"
   },
   "keywords": [
