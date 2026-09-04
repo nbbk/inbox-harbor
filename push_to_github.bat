@@ -1,8 +1,9 @@
 @echo off
 cd /d "D:\MailPulse"
 echo ============================================================
-echo   MailPulse - Starting Server on http://localhost:5555
+echo Pushing MailPulse to GitHub...
 echo ============================================================
 echo.
-node server.js
+git push -u origin main
+echo.
 pause
