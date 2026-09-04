@@ -5,7 +5,7 @@
 
 [![Node.js Version](https://img.shields.io/badge/node-%3E%3D16.0.0-brightgreen.svg?style=flat-square&logo=node.js)](https://nodejs.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-orange.svg?style=flat-square)](https://github.com/)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-orange.svg?style=flat-square)](https://github.com/HOLMES6666/MailPulse)
 
 **专为批量多邮箱运维、验证码流监控、Telegram 实时推送设计的轻量极速管理面板**
 
@@ -44,7 +44,7 @@
 - **操作系统**: Windows / macOS / Linux
 
 ### 方式一：Windows 用户（一键双击）
-1. [下载代码压缩包](https://github.com/) 或 `git clone` 到本地；
+1. [下载代码压缩包](https://github.com/HOLMES6666/MailPulse/archive/refs/heads/main.zip) 或 `git clone` 到本地；
 2. 双击运行 **`install.bat`** 自动安装依赖；
 3. 双击运行 **`start.bat`** 启动控制台；
 4. 浏览器访问 **`http://localhost:5555`** 即可开始使用。
@@ -55,7 +55,7 @@
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/your-username/MailPulse.git
+git clone https://github.com/HOLMES6666/MailPulse.git
 cd MailPulse
 
 # 2. 安装依赖

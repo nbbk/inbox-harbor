@@ -757,16 +757,23 @@ document.addEventListener('DOMContentLoaded', () => {
         ? '<span class="provider-badge google"><i class="fa-brands fa-google"></i> Gmail</span>'
         : '<span class="provider-badge microsoft"><i class="fa-brands fa-microsoft"></i> Outlook</span>';
 
+      const safeAccount = escapeHtml(mail.account || '');
+      const safeSender = escapeHtml(mail.sender || '');
+      const safeSubject = escapeHtml(mail.subject || '');
+      const safeCodeText = escapeHtml(codeText || '');
+
       let linksHtml = '';
       if (mail.links && mail.links.length > 0) {
         linksHtml += `<div class="link-box-title"><i class="fa-solid fa-link text-primary"></i> 智能提取验证/激活链接：</div><div class="link-list">`;
         mail.links.forEach((link, idx) => {
+          const safeLink = escapeHtml(link);
+          const encodedLink = encodeURI(link);
           linksHtml += `
             <div class="link-item">
-              <span class="link-url" title="${link}">${link}</span>
+              <span class="link-url" title="${safeLink}">${safeLink}</span>
               <div class="link-actions">
-                <button class="btn btn-outline btn-sm" onclick="copyToClipboard('${link}', '验证链接')"><i class="fa-regular fa-copy"></i> 复制</button>
-                <a href="${link}" target="_blank" class="btn btn-primary btn-sm"><i class="fa-solid fa-arrow-up-right-from-square"></i> 打开</a>
+                <button class="btn btn-outline btn-sm" onclick="copyToClipboard('${safeLink.replace(/'/g, "\\'")}', '验证链接')"><i class="fa-regular fa-copy"></i> 复制</button>
+                <a href="${encodedLink}" target="_blank" rel="noopener noreferrer" class="btn btn-primary btn-sm"><i class="fa-solid fa-arrow-up-right-from-square"></i> 打开</a>
               </div>
             </div>
           `;
@@ -776,19 +783,19 @@ document.addEventListener('DOMContentLoaded', () => {
 
       card.innerHTML = `
         <div style="font-size: 13px; font-weight: 600; color: var(--text-main); margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center;">
-          <span>${providerBadge} <strong style="margin-left: 4px;">${mail.account}</strong></span>
+          <span>${providerBadge} <strong style="margin-left: 4px;">${safeAccount}</strong></span>
           ${codeTypeBadge}
         </div>
         <div class="code-badge-box">
-          <span class="giant-code">${codeText}</span>
-          <button class="btn-copy" onclick="copyToClipboard('${codeText}', '验证码')">
+          <span class="giant-code">${safeCodeText}</span>
+          <button class="btn-copy" onclick="copyToClipboard('${safeCodeText.replace(/'/g, "\\'")}', '验证码')">
             <i class="fa-regular fa-copy"></i> 复制验证码
           </button>
         </div>
         ${linksHtml}
         <div class="mail-meta">
-          <span><strong>发件人：</strong> ${mail.sender}</span>
-          <span><strong>主题：</strong> ${mail.subject}</span>
+          <span><strong>发件人：</strong> ${safeSender}</span>
+          <span><strong>主题：</strong> ${safeSubject}</span>
           <span><strong>收取时间：</strong> ${new Date(mail.receivedAt).toLocaleString()}</span>
         </div>
         <div class="mail-body-label"><i class="fa-solid fa-align-left"></i> 完整邮件正文内容：</div>
