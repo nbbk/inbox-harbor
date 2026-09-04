@@ -11,7 +11,10 @@ const { loadOrCreateAdminToken } = require('./instance-config');
 
 const app = express();
 const PORT = process.env.PORT || 5555;
-const adminCredential = loadOrCreateAdminToken(__dirname);
+const HOST = process.env.HOST || '127.0.0.1';
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+const adminCredential = loadOrCreateAdminToken(DATA_DIR);
 const ADMIN_TOKEN = adminCredential.token;
 if (adminCredential.created) {
   console.log('\n🔑 首次启动已生成管理口令（已持久保存）：');
@@ -31,8 +34,8 @@ app.use('/api', (req, res, next) => {
 });
 app.use(express.static(path.join(__dirname, 'public')));
 
-const DATA_FILE = path.join(__dirname, 'data.json');
-const storage = new Storage(__dirname);
+const DATA_FILE = path.join(DATA_DIR, 'data.json');
+const storage = new Storage(DATA_DIR);
 
 // Default Credentials & Telegram Defaults
 let GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
@@ -922,7 +925,7 @@ app.get('/api/auth/google/url', (req, res) => {
   const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
   googleOAuthTransactions.set(state, { accountId, verifier, expiresAt: Date.now() + 10 * 60 * 1000 });
   const scope = `https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/userinfo.email${account.sendEnabled ? ' https://www.googleapis.com/auth/gmail.send' : ''}`;
-  const redirectUri = `http://localhost:${PORT}/auth/google/callback`;
+  const redirectUri = `${(process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`).replace(/\/$/, '')}/auth/google/callback`;
   const url = `https://accounts.google.com/o/oauth2/v2/auth?response_type=code&client_id=${encodeURIComponent(GOOGLE_CLIENT_ID)}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scope)}&access_type=offline&prompt=consent&code_challenge=${encodeURIComponent(challenge)}&code_challenge_method=S256&state=${encodeURIComponent(state)}`;
   res.json({ success: true, url });
 });
@@ -947,7 +950,7 @@ app.get('/auth/google/callback', async (req, res) => {
     `);
   }
 
-  const redirectUri = `http://localhost:${PORT}/auth/google/callback`;
+  const redirectUri = `${(process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`).replace(/\/$/, '')}/auth/google/callback`;
 
   try {
     const params = new URLSearchParams();
@@ -1454,9 +1457,9 @@ setInterval(async () => {
 // Seed initial memory set from disk
 loadDataFromDisk();
 
-app.listen(PORT, '127.0.0.1', () => {
+app.listen(PORT, HOST, () => {
   console.log(`====================================================`);
   console.log(` ⚓ InboxHarbor（收件港）- 本机邮箱管理台`);
-  console.log(` 🚀 访问地址: http://localhost:${PORT}`);
+  console.log(` 🚀 访问地址: http://${HOST}:${PORT}`);
   console.log(`====================================================`);
 });

@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const { tokenPath } = require('../instance-config');
 
-const file = tokenPath(path.join(__dirname, '..'));
+const file = tokenPath(process.env.DATA_DIR || path.join(__dirname, '..'));
 if (process.env.INBOXHARBOR_ADMIN_TOKEN) {
   console.log(`管理口令（来自环境变量）：${process.env.INBOXHARBOR_ADMIN_TOKEN}`);
 } else if (fs.existsSync(file)) {

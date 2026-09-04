@@ -55,6 +55,12 @@ npm start
 
 状态（包括 OAuth refresh token 与通知凭据）保存在 `inboxharbor.db`，并由 AES-256-GCM 加密。主密钥优先使用 `INBOXHARBOR_MASTER_KEY`（64 位 hex 或 32 字节 base64）；未设置时首次启动会生成同目录的 `inboxharbor.key`。备份或迁移时必须同时安全保存 **`inboxharbor.db` 与 `inboxharbor.key`**；遗失主密钥将无法恢复已保存的凭据。旧版 `data.json` 会在第一次启动时导入，原文件会保留且不会被删除。
 
+### Docker 一键启动（Linux）
+
+需要 Docker Compose。运行 `chmod +x scripts/start-linux.sh && ./scripts/start-linux.sh`；脚本不依赖宿主机 Node.js，会构建 Node.js 24 镜像、启动服务并输出自动生成的管理口令。容器以非 root 的 `node` 用户运行，数据库、密钥与管理口令持久化在 Docker 命名卷 `inboxharbor-data`。
+
+宿主机端口固定发布为 `127.0.0.1:5555`，不会暴露到局域网。可用 `docker compose ps` 查看健康状态；停止使用 `docker compose down`，查询口令使用 `docker compose exec inboxharbor npm run credentials`。不要执行 `docker compose down -v`，否则会删除持久化数据。若经反向代理访问，请在 `.env` 中将 `PUBLIC_BASE_URL` 设为外部 HTTPS 地址，并在 Google OAuth 控制台注册相同的 `/auth/google/callback` 回调地址。
+
 ### 运行环境
 - **Node.js**: >= 24（使用内置 SQLite）
 - **操作系统**: Windows / macOS / Linux

@@ -1,5 +1,6 @@
 # User Data & Private Credentials (CRITICAL)
 data.json
+data/
 *.db
 *.sqlite
 *.sqlite3

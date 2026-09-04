@@ -1,0 +1,22 @@
+services:
+  inboxharbor:
+    build: .
+    image: inboxharbor:local
+    ports:
+      - "127.0.0.1:5555:5555"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 5555
+      DATA_DIR: /data
+      INBOXHARBOR_ADMIN_TOKEN: ${INBOXHARBOR_ADMIN_TOKEN:-}
+      INBOXHARBOR_MASTER_KEY: ${INBOXHARBOR_MASTER_KEY:-}
+      MICROSOFT_CLIENT_ID: ${MICROSOFT_CLIENT_ID:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:5555}
+    volumes:
+      - inboxharbor-data:/data
+    restart: unless-stopped
+
+volumes:
+  inboxharbor-data:
