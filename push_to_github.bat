@@ -1,7 +1,7 @@
 @echo off
-cd /d "D:\MailPulse"
+cd /d "%~dp0"
 echo ============================================================
-echo Pushing MailPulse to GitHub...
+echo Pushing InboxHarbor to GitHub...
 echo ============================================================
 echo.
 git push -u origin main

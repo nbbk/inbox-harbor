@@ -1,7 +1,7 @@
 @echo off
-cd /d "D:\MailPulse"
+cd /d "%~dp0"
 echo ============================================================
-echo   MailPulse - Starting Server on http://localhost:5555
+echo   InboxHarbor - Starting Server on http://localhost:5555
 echo ============================================================
 echo.
 node server.js

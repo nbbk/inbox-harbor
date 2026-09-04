@@ -1,7 +1,7 @@
 @echo off
-cd /d "D:\MailPulse"
+cd /d "%~dp0"
 echo ============================================================
-echo   MailPulse - Installing Node.js Dependencies...
+echo   InboxHarbor - Installing Node.js Dependencies...
 echo ============================================================
 echo.
 npm install

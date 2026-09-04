@@ -1,27 +1,50 @@
 const express = require('express');
-const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const tls = require('tls');
 const http = require('http');
 const https = require('https');
+const crypto = require('crypto');
+const { CHANNELS, publicConfig, send, sendAll, messageFor } = require('./notifications');
+const { Storage } = require('./storage');
 
 const app = express();
 const PORT = process.env.PORT || 5555;
+const ADMIN_TOKEN = process.env.INBOXHARBOR_ADMIN_TOKEN || crypto.randomBytes(24).toString('base64url');
+if (!process.env.INBOXHARBOR_ADMIN_TOKEN) console.log(`InboxHarbor local access token (valid until restart): ${ADMIN_TOKEN}`);
 
-app.use(cors());
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+// InboxHarbor is deliberately local-first. Do not expose this service to a LAN.
+app.use(express.json({ limit: '512kb' }));
+app.use(express.urlencoded({ extended: true, limit: '512kb' }));
+app.use('/api', (req, res, next) => {
+  const supplied = (req.get('authorization') || '').replace(/^Bearer\s+/i, '');
+  const left = Buffer.from(supplied);
+  const right = Buffer.from(ADMIN_TOKEN);
+  if (supplied && left.length === right.length && crypto.timingSafeEqual(left, right)) return next();
+  res.status(401).json({ success: false, message: '请输入本机访问口令' });
+});
 app.use(express.static(path.join(__dirname, 'public')));
 
 const DATA_FILE = path.join(__dirname, 'data.json');
+const storage = new Storage(__dirname);
 
 // Default Credentials & Telegram Defaults
 let GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 let GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
+let MICROSOFT_CLIENT_ID = process.env.MICROSOFT_CLIENT_ID || '';
 
 // Global In-Memory Deduplication Set for TELEGRAM PUSHES ONLY
 const globalPushedFingerprints = new Set();
+const googleOAuthTransactions = new Map();
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
 
 // SINGLE SHARED IN-MEMORY DATA STORE (PREVENTS CONCURRENT OVERWRITES)
 let gData = {
@@ -33,21 +56,32 @@ let gData = {
     enabled: false,
     autoPollInterval: 5
   },
+  notificationConfig: { includeFullBody: true, channels: [] },
   pushedMailIds: [],
   clearedMailIds: [] // Track cleared mail IDs and fingerprints so they NEVER reappear!
 };
 
-function loadDataFromDisk() {
-  if (!fs.existsSync(DATA_FILE)) {
-    saveDataToDisk();
-    return gData;
+async function pushConfiguredNotifications(mails) {
+  if (!Array.isArray(mails) || mails.length === 0) return;
+  for (const mail of mails) {
+    // Telegram's legacy settings are kept only for migration. A new Telegram
+    // channel owns delivery once configured, avoiding a double send.
+    const hasNewTelegram = (gData.notificationConfig.channels || []).some(c => c.enabled && c.type === 'telegram');
+    const config = hasNewTelegram ? { ...gData.notificationConfig, channels: gData.notificationConfig.channels.filter(c => c.type !== 'telegram' || c.enabled) } : gData.notificationConfig;
+    const results = await sendAll(config, mail);
+    results.forEach((result, index) => {
+      if (result.status === 'rejected') console.warn(`Notification channel ${index + 1} failed: ${result.reason?.message || result.reason}`);
+    });
   }
+}
+
+function loadDataFromDisk() {
   try {
-    const fileContent = fs.readFileSync(DATA_FILE, 'utf8');
-    const parsed = JSON.parse(fileContent);
+    const parsed = storage.load(gData, DATA_FILE);
     gData.accounts = parsed.accounts || [];
     gData.mails = parsed.mails || [];
     if (parsed.tgConfig) gData.tgConfig = parsed.tgConfig;
+    if (parsed.notificationConfig) gData.notificationConfig = parsed.notificationConfig;
     gData.tgConfig.autoPollInterval = 1;
     gData.pushedMailIds = parsed.pushedMailIds || [];
     gData.clearedMailIds = parsed.clearedMailIds || [];
@@ -57,16 +91,16 @@ function loadDataFromDisk() {
 
     gData.accounts.forEach(acc => {
       acc.provider = detectProvider(acc.username);
+      acc.readEnabled = acc.readEnabled !== false;
+      acc.sendEnabled = acc.sendEnabled === true;
     });
     return gData;
-  } catch (err) {
-    return gData;
-  }
+  } catch (err) { throw new Error(`无法加载 InboxHarbor 加密存储：${err.message}`); }
 }
 
 function saveDataToDisk() {
   gData.pushedMailIds = Array.from(globalPushedFingerprints);
-  fs.writeFileSync(DATA_FILE, JSON.stringify(gData, null, 2), 'utf8');
+  storage.save(gData);
 }
 
 // Decode RFC 2047 MIME Header Strings (e.g. =?UTF-8?B?...?=)
@@ -301,6 +335,7 @@ async function sendTelegramMessage(text, customToken, customChatId) {
 }
 
 async function checkAndPushNewMailsToTelegram(newMails) {
+  if ((gData.notificationConfig.channels || []).some(channel => channel.enabled && channel.type === 'telegram')) return;
   if (!gData.tgConfig || !gData.tgConfig.enabled) return;
 
   let pushCount = 0;
@@ -370,7 +405,7 @@ function parseCredentials(acc) {
   let refreshToken = '';
 
   if (acc.provider === 'microsoft') {
-    clientId = '9e5f94bc-e8a4-4e73-b8be-63364c29d753';
+    clientId = MICROSOFT_CLIENT_ID;
     clientSecret = '';
   }
 
@@ -410,8 +445,9 @@ async function verifyMicrosoftAccount(acc) {
     params.append('client_id', clientId);
     params.append('grant_type', 'refresh_token');
     params.append('refresh_token', refreshToken);
+    params.append('scope', `openid profile email https://graph.microsoft.com/Mail.Read${acc.sendEnabled ? ' https://graph.microsoft.com/Mail.Send' : ''} offline_access`);
 
-    const resp = await fetch('https://login.live.com/oauth20_token.srf', {
+    const resp = await fetch('https://login.microsoftonline.com/common/oauth2/v2.0/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: params.toString()
@@ -422,6 +458,9 @@ async function verifyMicrosoftAccount(acc) {
     if (resp.ok && data.access_token) {
       acc._cachedToken = data.access_token;
       acc._cachedExpiresAt = Date.now() + (data.expires_in ? (data.expires_in - 120) * 1000 : 3400 * 1000);
+      if (data.refresh_token) acc.note = data.refresh_token;
+      if (data.scope) acc.providerScopes = data.scope;
+      saveDataToDisk();
       return {
         status: 'active',
         accessToken: data.access_token,
@@ -470,6 +509,7 @@ async function verifyGoogleAccount(acc) {
 
       const data = await resp.json();
       if (resp.ok && data.access_token) {
+        if (data.scope) acc.providerScopes = data.scope;
         acc._cachedToken = data.access_token;
         acc._cachedExpiresAt = Date.now() + (data.expires_in ? (data.expires_in - 120) * 1000 : 3400 * 1000);
         return { status: 'active', accessToken: data.access_token, error: null };
@@ -695,6 +735,15 @@ async function sendMicrosoftMail(accessToken, targetEmail, testCode, testLink) {
   return { ok: true };
 }
 
+async function sendGoogleMail(accessToken, targetEmail, testCode, testLink) {
+  const subject = `【测试验证码】您的登录验证码是 ${testCode}`;
+  const content = `您好！\r\n\r\n您的 6 位数字验证码为：${testCode}\r\n\r\n测试确认链接：${testLink}`;
+  const raw = Buffer.from(`To: ${targetEmail}\r\nSubject: ${subject}\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n${content}`).toString('base64url');
+  const resp = await smartProxyFetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', { method: 'POST', headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ raw }) });
+  if (!resp.ok) return { ok: false, error: `Gmail 返回 HTTP ${resp.status}` };
+  return { ok: true };
+}
+
 function parseImportText(text) {
   const lines = text.split(/\r?\n/);
   const accounts = [];
@@ -705,20 +754,20 @@ function parseImportText(text) {
     
     let parts = line.includes('----') ? line.split('----') : (line.includes(',') ? line.split(',') : [line]);
     const username = parts[0] ? parts[0].trim() : '';
-    const password = parts[1] ? parts[1].trim() : '';
-    const note = parts.slice(2).join('----').trim();
     
     if (username) {
       accounts.push({
         id: 'acc_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6),
         username: username,
-        password: password,
-        note: note,
+        password: '',
+        note: '',
         provider: detectProvider(username),
         status: 'pending',
         lastChecked: new Date().toISOString(),
         mailCount: 0,
         createdAt: new Date().toISOString()
+        ,readEnabled: true,
+        sendEnabled: false
       });
     }
   }
@@ -728,10 +777,12 @@ function parseImportText(text) {
 // --- MICROSOFT OFFICIAL DEVICE CODE FLOW ---
 
 app.post('/api/auth/microsoft/device-code', async (req, res) => {
-  const clientId = '9e5f94bc-e8a4-4e73-b8be-63364c29d753';
+  if (!MICROSOFT_CLIENT_ID) return res.status(503).json({ success: false, message: '未配置 MICROSOFT_CLIENT_ID，无法发起 Microsoft OAuth。' });
+  const requested = gData.accounts.find(a => a.id === req.body.accountId);
+  const clientId = MICROSOFT_CLIENT_ID;
   const params = new URLSearchParams();
   params.append('client_id', clientId);
-  params.append('scope', 'openid profile email https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.Send offline_access');
+  params.append('scope', `openid profile email https://graph.microsoft.com/Mail.Read${requested && requested.sendEnabled ? ' https://graph.microsoft.com/Mail.Send' : ''} offline_access`);
 
   try {
     const resp = await fetch('https://login.microsoftonline.com/common/oauth2/v2.0/devicecode', {
@@ -761,7 +812,8 @@ app.post('/api/auth/microsoft/poll-device-token', async (req, res) => {
   const { accountId, deviceCode } = req.body;
   if (!deviceCode) return res.status(400).json({ success: false, message: '缺失 deviceCode' });
 
-  const clientId = '9e5f94bc-e8a4-4e73-b8be-63364c29d753';
+  if (!MICROSOFT_CLIENT_ID) return res.status(503).json({ success: false, message: '未配置 MICROSOFT_CLIENT_ID。' });
+  const clientId = MICROSOFT_CLIENT_ID;
   const params = new URLSearchParams();
   params.append('grant_type', 'urn:ietf:params:oauth:grant-type:device_code');
   params.append('client_id', clientId);
@@ -819,6 +871,7 @@ app.post('/api/auth/microsoft/poll-device-token', async (req, res) => {
           username: userEmail || 'outlook_account@outlook.com',
           password: '',
           note: refreshToken,
+          providerScopes: tokenData.scope || '',
           provider: 'microsoft',
           status: 'active',
           lastChecked: new Date().toISOString(),
@@ -833,11 +886,12 @@ app.post('/api/auth/microsoft/poll-device-token', async (req, res) => {
         targetAcc.status = 'active';
         targetAcc.provider = 'microsoft';
         targetAcc.note = refreshToken;
+        targetAcc.providerScopes = tokenData.scope || targetAcc.providerScopes || '';
         targetAcc.lastChecked = new Date().toISOString();
       }
 
       saveDataToDisk();
-      res.json({ success: true, status: 'completed', account: targetAcc });
+      res.json({ success: true, status: 'completed', account: publicAccount(targetAcc) });
     } else {
       if (tokenData.error === 'authorization_pending') {
         res.json({ success: true, status: 'pending' });
@@ -852,30 +906,36 @@ app.post('/api/auth/microsoft/poll-device-token', async (req, res) => {
 
 // --- GOOGLE OAUTH BROWSER FLOW ---
 
-app.get('/auth/google/login', (req, res) => {
-  const accountId = req.query.id || '';
+app.get('/api/auth/google/url', (req, res) => {
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) return res.status(503).json({ success: false, message: '未配置 GOOGLE_CLIENT_ID 或 GOOGLE_CLIENT_SECRET，无法发起 Google OAuth。' });
+  const accountId = String(req.query.id || '');
+  const account = gData.accounts.find(item => item.id === accountId);
+  if (!account) return res.status(404).json({ success: false, message: '账号不存在' });
+  const state = crypto.randomBytes(24).toString('base64url');
+  const verifier = crypto.randomBytes(48).toString('base64url');
+  const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
+  googleOAuthTransactions.set(state, { accountId, verifier, expiresAt: Date.now() + 10 * 60 * 1000 });
+  const scope = `https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/userinfo.email${account.sendEnabled ? ' https://www.googleapis.com/auth/gmail.send' : ''}`;
   const redirectUri = `http://localhost:${PORT}/auth/google/callback`;
+  const url = `https://accounts.google.com/o/oauth2/v2/auth?response_type=code&client_id=${encodeURIComponent(GOOGLE_CLIENT_ID)}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scope)}&access_type=offline&prompt=consent&code_challenge=${encodeURIComponent(challenge)}&code_challenge_method=S256&state=${encodeURIComponent(state)}`;
+  res.json({ success: true, url });
+});
 
-  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?` +
-    `response_type=code` +
-    `&client_id=${encodeURIComponent(GOOGLE_CLIENT_ID)}` +
-    `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-    `&scope=${encodeURIComponent('https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/userinfo.email')}` +
-    `&access_type=offline` +
-    `&prompt=consent` +
-    `&state=${encodeURIComponent(accountId)}`;
-
-  res.redirect(authUrl);
+app.get('/auth/google/login', (req, res) => {
+  res.status(410).json({ success: false, message: '此入口已弃用，请通过受保护的 /api/auth/google/url 创建授权链接。' });
 });
 
 app.get('/auth/google/callback', async (req, res) => {
   const { code, state, error } = req.query;
+  const transaction = googleOAuthTransactions.get(state);
+  googleOAuthTransactions.delete(state);
+  if (!transaction || transaction.expiresAt < Date.now()) return res.status(400).send('授权会话已过期，请回到 InboxHarbor 重新发起授权。');
 
   if (error || !code) {
     return res.send(`
       <div style="font-family: sans-serif; text-align: center; padding: 50px; background: #0f172a; color: #ef4444;">
         <h2>❌ 谷歌登录授权取消或失败</h2>
-        <p>${error || '未接收到 Authorization Code'}</p>
+        <p>${escapeHtml(error || '未接收到 Authorization Code')}</p>
         <button onclick="window.close()" style="padding: 10px 20px; background: #334155; color: #fff; border: none; border-radius: 6px; cursor: pointer;">关闭窗口</button>
       </div>
     `);
@@ -890,6 +950,7 @@ app.get('/auth/google/callback', async (req, res) => {
     params.append('client_secret', GOOGLE_CLIENT_SECRET);
     params.append('redirect_uri', redirectUri);
     params.append('grant_type', 'authorization_code');
+    params.append('code_verifier', transaction.verifier);
 
     const tokenResp = await smartProxyFetch('https://oauth2.googleapis.com/token', {
       method: 'POST',
@@ -909,7 +970,7 @@ app.get('/auth/google/callback', async (req, res) => {
         if (userData.email) userEmail = userData.email;
       } catch (e) {}
 
-      let targetAcc = gData.accounts.find(a => a.id === state || a.username.toLowerCase() === userEmail.toLowerCase());
+      let targetAcc = gData.accounts.find(a => a.id === transaction.accountId);
 
       const refreshToken = tokenData.refresh_token || (targetAcc ? parseCredentials(targetAcc).refreshToken : '');
 
@@ -918,7 +979,8 @@ app.get('/auth/google/callback', async (req, res) => {
           id: 'acc_gmail_' + Date.now(),
           username: userEmail,
           password: '',
-          note: `${GOOGLE_CLIENT_ID}----${GOOGLE_CLIENT_SECRET}----${refreshToken}`,
+          note: refreshToken,
+          providerScopes: tokenData.scope || '',
           provider: 'google',
           status: 'active',
           lastChecked: new Date().toISOString(),
@@ -930,7 +992,8 @@ app.get('/auth/google/callback', async (req, res) => {
         targetAcc.username = userEmail;
         targetAcc.status = 'active';
         targetAcc.provider = 'google';
-        targetAcc.note = `${GOOGLE_CLIENT_ID}----${GOOGLE_CLIENT_SECRET}----${refreshToken}`;
+        targetAcc.note = refreshToken;
+        targetAcc.providerScopes = tokenData.scope || targetAcc.providerScopes || '';
         targetAcc.lastChecked = new Date().toISOString();
       }
 
@@ -939,7 +1002,7 @@ app.get('/auth/google/callback', async (req, res) => {
       res.send(`
         <div style="font-family: sans-serif; text-align: center; padding: 50px; background: #0f172a; color: #10b981;">
           <h2>🎉 谷歌 OAuth2 授权成功！</h2>
-          <p style="color: #cbd5e1;">已获取 Refresh Token 并成功绑定账号: <strong>${userEmail}</strong></p>
+          <p style="color: #cbd5e1;">已获取 Refresh Token 并成功绑定账号: <strong>${escapeHtml(userEmail)}</strong></p>
           <script>
             if (window.opener) {
               window.opener.location.reload();
@@ -954,19 +1017,24 @@ app.get('/auth/google/callback', async (req, res) => {
       res.send(`
         <div style="font-family: sans-serif; text-align: center; padding: 50px; background: #0f172a; color: #ef4444;">
           <h2>❌ 令牌兑换失败</h2>
-          <p>${tokenData.error_description || tokenData.error || '无法由 Authorization Code 换取 Token'}</p>
+          <p>${escapeHtml(tokenData.error_description || tokenData.error || '无法由 Authorization Code 换取 Token')}</p>
         </div>
       `);
     }
   } catch (err) {
-    res.send(`<div style="font-family: sans-serif; text-align: center; padding: 50px; background: #0f172a; color: #ef4444;"><h2>❌ 网络请求失败</h2><p>${err.message}</p></div>`);
+    res.send(`<div style="font-family: sans-serif; text-align: center; padding: 50px; background: #0f172a; color: #ef4444;"><h2>❌ 网络请求失败</h2><p>${escapeHtml(err.message)}</p></div>`);
   }
 });
 
 // --- REST API ENDPOINTS ---
 
+function publicAccount(account) {
+  const { password, note, accessToken, refreshToken, token, _cachedToken, _cachedExpiresAt, ...safe } = account;
+  return safe;
+}
+
 app.get('/api/tg/config', (req, res) => {
-  res.json({ success: true, tgConfig: gData.tgConfig });
+  res.json({ success: true, tgConfig: { enabled: !!gData.tgConfig.enabled, autoPollInterval: gData.tgConfig.autoPollInterval, configured: { token: !!gData.tgConfig.token, chatId: !!gData.tgConfig.chatId } } });
 });
 
 app.post('/api/tg/config', (req, res) => {
@@ -978,7 +1046,7 @@ app.post('/api/tg/config', (req, res) => {
     autoPollInterval: autoPollInterval ? parseInt(autoPollInterval) : 1
   };
   saveDataToDisk();
-  res.json({ success: true, tgConfig: gData.tgConfig });
+  res.json({ success: true, tgConfig: { enabled: !!gData.tgConfig.enabled, autoPollInterval: gData.tgConfig.autoPollInterval, configured: { token: !!gData.tgConfig.token, chatId: !!gData.tgConfig.chatId } } });
 });
 
 app.post('/api/tg/test', async (req, res) => {
@@ -1015,7 +1083,51 @@ app.get('/api/stats', (req, res) => {
 });
 
 app.get('/api/accounts', (req, res) => {
-  res.json({ success: true, accounts: gData.accounts });
+  const accounts = gData.accounts.map(publicAccount);
+  res.json({ success: true, accounts });
+});
+
+app.put('/api/accounts/:id/permissions', (req, res) => {
+  const account = gData.accounts.find(a => a.id === req.params.id);
+  if (!account) return res.status(404).json({ success: false, message: '账号不存在' });
+  if (typeof req.body.readEnabled === 'boolean') account.readEnabled = req.body.readEnabled;
+  if (typeof req.body.sendEnabled === 'boolean') account.sendEnabled = req.body.sendEnabled;
+  saveDataToDisk();
+  res.json({ success: true, account: publicAccount(account), message: '权限已保存；变更发信权限后请重新授权。' });
+});
+
+app.get('/api/v1/notifications', (req, res) => {
+  res.json({ success: true, catalog: CHANNELS, configuration: publicConfig(gData.notificationConfig) });
+});
+
+app.put('/api/v1/notifications', (req, res) => {
+  try {
+    const incoming = Array.isArray(req.body.channels) ? req.body.channels : [];
+    const previous = Array.isArray(gData.notificationConfig.channels) ? gData.notificationConfig.channels : [];
+    const channels = incoming.map((channel, index) => {
+      if (!CHANNELS[channel.type]) throw new Error(`未知通知渠道: ${channel.type}`);
+      const old = previous.find(item => item.id === channel.id || item.type === channel.type);
+      return { id: old?.id || channel.id || `${channel.type}_${Date.now()}_${index}`, type: channel.type, enabled: channel.enabled === true, config: { ...(old?.config || {}), ...(channel.config || {}) } };
+    });
+    gData.notificationConfig = { includeFullBody: req.body.includeFullBody !== false, channels };
+    saveDataToDisk();
+    res.json({ success: true, configuration: publicConfig(gData.notificationConfig) });
+  } catch (error) {
+    res.status(400).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/api/v1/notifications/:type/test', async (req, res) => {
+  const type = req.params.type;
+  if (!CHANNELS[type]) return res.status(404).json({ success: false, message: '通知渠道不存在' });
+  const saved = (gData.notificationConfig.channels || []).find(item => item.type === type);
+  const channel = { type, config: { ...(saved?.config || {}), ...(req.body.config || {}) } };
+  try {
+    await send(channel, messageFor({ subject: 'InboxHarbor 通知测试', account: 'local@inboxharbor.app', sender: 'InboxHarbor', content: '渠道连接正常。之后的新邮件可按当前设置发送完整正文。' }));
+    res.json({ success: true, message: `${CHANNELS[type].name} 测试成功` });
+  } catch (error) {
+    res.status(400).json({ success: false, message: error.message });
+  }
 });
 
 // Single Account & Verification Code Fast Lookup API
@@ -1044,7 +1156,6 @@ app.get('/api/accounts/lookup', (req, res) => {
     account: {
       id: acc.id,
       username: acc.username,
-      password: acc.password || '',
       provider: acc.provider,
       status: acc.status
     },
@@ -1058,19 +1169,7 @@ app.get('/api/accounts/lookup', (req, res) => {
 });
 
 app.get('/api/export-ms-txt', (req, res) => {
-  try {
-    const msAccounts = (gData.accounts || []).filter(a => {
-      const p = (a.provider || '').toLowerCase();
-      const u = (a.username || '').toLowerCase();
-      return p !== 'google' && !u.includes('gmail.com');
-    });
-    const lines = msAccounts.map(a => `${a.username}----${a.password || ''}\r\n`).join('');
-    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.setHeader('Content-Disposition', 'attachment; filename="microsoft_accounts.txt"');
-    return res.send(lines);
-  } catch (e) {
-    return res.status(500).json({ success: false, error: e.message });
-  }
+  res.status(410).json({ success: false, message: '为保护本机凭据，明文账号密码导出已移除。' });
 });
 
 // Import Accounts Endpoint with Smart Upsert (Updates existing accounts if username matches)
@@ -1085,8 +1184,6 @@ app.post('/api/accounts/import', (req, res) => {
   for (let acc of imported) {
     const existingIndex = gData.accounts.findIndex(a => a.username.toLowerCase() === acc.username.toLowerCase());
     if (existingIndex >= 0) {
-      if (acc.password) gData.accounts[existingIndex].password = acc.password;
-      if (acc.note) gData.accounts[existingIndex].note = acc.note;
       gData.accounts[existingIndex].lastChecked = new Date().toISOString();
       updatedCount++;
     } else {
@@ -1100,7 +1197,7 @@ app.post('/api/accounts/import', (req, res) => {
 });
 
 app.post('/api/accounts/add-outlook-tool', (req, res) => {
-  const { username, password, note } = req.body;
+  const { username } = req.body;
   const email = username ? (username.includes('@') ? username : username + '@outlook.com') : `user_${Math.floor(1000 + Math.random() * 9000)}@outlook.com`;
 
   let exists = gData.accounts.find(a => a.username.toLowerCase() === email.toLowerCase());
@@ -1109,23 +1206,25 @@ app.post('/api/accounts/add-outlook-tool', (req, res) => {
     exists = {
       id: 'acc_ms_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6),
       username: email,
-      password: password || '',
-      note: note || '',
+      password: '',
+      note: '',
       provider: 'microsoft',
       status: 'pending',
       lastChecked: new Date().toISOString(),
       mailCount: 0,
+      readEnabled: true,
+      sendEnabled: false,
       createdAt: new Date().toISOString()
     };
     gData.accounts.unshift(exists);
     saveDataToDisk();
   }
 
-  res.json({ success: true, account: exists, total: gData.accounts.length });
+  res.json({ success: true, account: publicAccount(exists), total: gData.accounts.length });
 });
 
 app.post('/api/accounts/add-gmail-tool', (req, res) => {
-  const { username, password, note, isMock } = req.body;
+  const { username, isMock } = req.body;
   const email = username ? (username.includes('@') ? username : username + '@gmail.com') : `user_${Math.floor(1000 + Math.random() * 9000)}@gmail.com`;
 
   const exists = gData.accounts.find(a => a.username.toLowerCase() === email.toLowerCase());
@@ -1137,30 +1236,25 @@ app.post('/api/accounts/add-gmail-tool', (req, res) => {
   const newAcc = {
     id: 'acc_gmail_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6),
     username: email,
-    password: password || '',
-    note: note || 'Gmail 16位应用专用密码 / OAuth',
+    password: '',
+    note: '',
     provider: 'google',
     status: isMock ? 'active' : 'pending',
     isMock: !!isMock,
     lastChecked: new Date().toISOString(),
     mailCount: 0,
+    readEnabled: true,
+    sendEnabled: false,
     createdAt: new Date().toISOString()
   };
 
   gData.accounts.unshift(newAcc);
   saveDataToDisk();
-  res.json({ success: true, account: newAcc, total: gData.accounts.length });
+  res.json({ success: true, account: publicAccount(newAcc), total: gData.accounts.length });
 });
 
 app.post('/api/accounts/update-password', (req, res) => {
-  const { id, password } = req.body;
-  const acc = gData.accounts.find(a => a.id === id || a.username.toLowerCase() === (id || '').toLowerCase());
-  if (acc) {
-    acc.password = password || '';
-    saveDataToDisk();
-    return res.json({ success: true, account: acc });
-  }
-  res.status(400).json({ success: false, message: '未找到该账号' });
+  res.status(410).json({ success: false, message: 'InboxHarbor 不保存邮箱密码，请使用 OAuth 授权。' });
 });
 
 app.delete('/api/accounts/:id', (req, res) => {
@@ -1183,7 +1277,7 @@ app.post('/api/accounts/check-status', async (req, res) => {
   const { ids } = req.body;
   const now = new Date().toISOString();
 
-  const targetAccounts = gData.accounts.filter(acc => !ids || ids.length === 0 || ids.includes(acc.id));
+  const targetAccounts = gData.accounts.filter(acc => acc.readEnabled !== false && (!ids || ids.length === 0 || ids.includes(acc.id)));
   let checkedCount = 0;
 
   for (let acc of targetAccounts) {
@@ -1201,11 +1295,12 @@ app.post('/api/accounts/check-status', async (req, res) => {
   }
 
   saveDataToDisk();
-  res.json({ success: true, checkedCount, accounts: gData.accounts });
+  res.json({ success: true, checkedCount, accounts: gData.accounts.map(publicAccount) });
 });
 
 // Single Mail Fetcher Core Logic (Strict TOP 10 recent messages)
 async function processSingleAccountFetch(acc, dataStore) {
+  if (acc.readEnabled === false) return [];
   let verify = acc.provider === 'google' ? await verifyGoogleAccount(acc) : await verifyMicrosoftAccount(acc);
   acc.status = verify.status;
   acc.errorDetail = verify.error;
@@ -1241,7 +1336,7 @@ async function processSingleAccountFetch(acc, dataStore) {
 
 app.post('/api/accounts/fetch-mail', async (req, res) => {
   const { ids } = req.body;
-  const targetAccounts = gData.accounts.filter(acc => !ids || ids.length === 0 || ids.includes(acc.id));
+  const targetAccounts = gData.accounts.filter(acc => acc.readEnabled !== false && (!ids || ids.length === 0 || ids.includes(acc.id)));
   const newMailsAll = [];
 
   // Run in Parallel batches of 15
@@ -1257,6 +1352,7 @@ app.post('/api/accounts/fetch-mail', async (req, res) => {
   // Directly trigger Telegram Push for new mails!
   if (newMailsAll.length > 0) {
     await checkAndPushNewMailsToTelegram(newMailsAll);
+    await pushConfiguredNotifications(newMailsAll);
   }
 
   res.json({ success: true, fetchedCount: newMailsAll.length, mails: newMailsAll });
@@ -1274,48 +1370,27 @@ app.post('/api/accounts/send-test-mail', async (req, res) => {
     return res.status(400).json({ success: false, message: '未找到可用的账号' });
   }
 
-  const recipient = targetEmail || senderAcc.username;
-  const testCode = Math.floor(100000 + Math.random() * 900000).toString();
-  const testLink = `https://login.live.com/oauth20_authorize.srf?client_id=9e5f94bc-e8a4-4e73-b8be-63364c29d753&scope=mail.read&response_type=code&redirect_uri=https://example.com/activate?token=${testCode}`;
-
-  let isSentViaApi = false;
-  const verify = senderAcc.provider === 'google' ? await verifyGoogleAccount(senderAcc) : await verifyMicrosoftAccount(senderAcc);
-  
-  if (verify.status === 'active' && verify.accessToken && senderAcc.provider === 'microsoft') {
-    const sendRes = await sendMicrosoftMail(verify.accessToken, recipient, testCode, testLink);
-    if (sendRes.ok) {
-      isSentViaApi = true;
-    }
+  if (senderAcc.sendEnabled !== true) {
+    return res.status(403).json({ success: false, message: '该账户未开启发信权限，请先开启并重新完成 OAuth 授权。' });
   }
 
-  // Smart Fallback: Generate real test mail entry & push to TG instantly!
-  const testMail = {
-    id: 'mail_test_' + Date.now(),
-    account: recipient,
-    provider: senderAcc.provider || 'microsoft',
-    sender: senderAcc.username,
-    subject: `【测试验证码】您的登录验证码是 ${testCode}`,
-    content: `您好！正在对账号 [${recipient}] 进行本地极速探查校验。\n验证码：${testCode}\n确认链接：${testLink}`,
-    preview: `您的测试验证码为: ${testCode}`,
-    code: testCode,
-    codeType: '6位数字码',
-    links: [testLink],
-    receivedAt: new Date().toISOString()
-  };
+  const recipient = targetEmail || senderAcc.username;
+  const testCode = Math.floor(100000 + Math.random() * 900000).toString();
+  const testLink = `https://example.invalid/inboxharbor-test?code=${testCode}`;
 
-  gData.mails.unshift(testMail);
-  saveDataToDisk();
-
-  // Instant Push to Telegram
-  await checkAndPushNewMailsToTelegram([testMail]);
-
-  const tipMsg = isSentViaApi
-    ? `已通过微软真实服务器发送测试邮件！验证码为: ${testCode}`
-    : `测试验证码邮件已自动生成并推送到 TG！验证码为: ${testCode}`;
+  const verify = senderAcc.provider === 'google' ? await verifyGoogleAccount(senderAcc) : await verifyMicrosoftAccount(senderAcc);
+  if (verify.status !== 'active' || !verify.accessToken) return res.status(400).json({ success: false, message: verify.error || '账户授权无效，请重新授权。' });
+  const scopes = String(senderAcc.providerScopes || '').split(/\s+/);
+  const requiredScope = senderAcc.provider === 'google' ? 'https://www.googleapis.com/auth/gmail.send' : 'Mail.Send';
+  if (!scopes.includes(requiredScope)) return res.status(403).json({ success: false, message: '当前 OAuth 授权未包含发信权限，请重新授权。' });
+  const sendResult = senderAcc.provider === 'google'
+    ? await sendGoogleMail(verify.accessToken, recipient, testCode, testLink)
+    : await sendMicrosoftMail(verify.accessToken, recipient, testCode, testLink);
+  if (!sendResult.ok) return res.status(502).json({ success: false, message: sendResult.error || '邮件发送失败' });
 
   res.json({
     success: true,
-    message: tipMsg,
+    message: `测试邮件已真实发送至 ${recipient}`,
     testCode,
     testLink
   });
@@ -1345,11 +1420,12 @@ app.post('/api/mails/clear', (req, res) => {
 let isPolling = false;
 setInterval(async () => {
   if (isPolling) return;
-  if (!gData.tgConfig || !gData.tgConfig.enabled) return;
+  const notificationEnabled = (gData.notificationConfig.channels || []).some(c => c.enabled);
+  if ((!gData.tgConfig || !gData.tgConfig.enabled) && !notificationEnabled) return;
 
   isPolling = true;
   try {
-    const allAccounts = gData.accounts || [];
+      const allAccounts = (gData.accounts || []).filter(acc => acc.readEnabled !== false);
     if (allAccounts.length > 0) {
       // True full concurrency across all accounts simultaneously for sub-second scan!
       const batchResults = await Promise.all(allAccounts.map(acc => processSingleAccountFetch(acc, gData)));
@@ -1359,6 +1435,7 @@ setInterval(async () => {
 
       if (newMailsAll.length > 0) {
         await checkAndPushNewMailsToTelegram(newMailsAll);
+        await pushConfiguredNotifications(newMailsAll);
       }
     }
   } catch (err) {
@@ -1371,9 +1448,9 @@ setInterval(async () => {
 // Seed initial memory set from disk
 loadDataFromDisk();
 
-app.listen(PORT, '0.0.0.0', () => {
+app.listen(PORT, '127.0.0.1', () => {
   console.log(`====================================================`);
-  console.log(` ⚡ MailPulse - 现代化多邮局极速管理控制台`);
+  console.log(` ⚓ InboxHarbor（收件港）- 本机邮箱管理台`);
   console.log(` 🚀 访问地址: http://localhost:${PORT}`);
   console.log(`====================================================`);
 });
