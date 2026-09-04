@@ -9,7 +9,7 @@
 
 **为个人邮箱收件、验证码、完整正文通知而设计的本机优先管理台。默认只读，可按账户开启发信权限。**
 
-[功能特性](#-核心功能特性) • [快速开始](#-快速开始) • [使用指南](#-使用指南) • [安全与隐私](#-安全与隐私声明) • [开源协议](#-开源协议)
+[功能特性](#-核心功能特性) • [Docker 部署](docs/deployment.md) • [OAuth 配置](docs/oauth.md) • [运维](docs/operations.md) • [安全与隐私](#-安全与隐私声明)
 
 </div>
 
@@ -38,9 +38,22 @@
 
 ## 🚀 快速开始
 
-### 一键启动与首次口令
+### 默认方式：Docker Compose
 
-安装依赖后直接启动，无需预先创建或导出管理口令：
+生产与宝塔部署请使用 Docker Compose，而不是直接运行 Node。私有仓库请先按[部署指南](docs/deployment.md#获取私有仓库)配置 Deploy Key，然后执行：
+
+```sh
+git clone git@github-inbox-harbor:nbbk/inbox-harbor.git /www/wwwroot/InboxHarbor
+cd /www/wwwroot/InboxHarbor
+chmod +x scripts/start-linux.sh
+./scripts/start-linux.sh
+```
+
+Compose 仅发布 `127.0.0.1:5555`，适合再由宝塔/Nginx 反向代理。完整的私有仓库拉取、宝塔 Docker、OAuth、更新、备份恢复与卸载说明见 [部署指南](docs/deployment.md)。
+
+### 非 Docker 备用方式
+
+仅用于开发或没有 Docker 的机器：
 
 ```bash
 npm install
@@ -53,54 +66,13 @@ npm start
 
 ### 本地加密存储与备份
 
-状态（包括 OAuth refresh token 与通知凭据）保存在 `inboxharbor.db`，并由 AES-256-GCM 加密。主密钥优先使用 `INBOXHARBOR_MASTER_KEY`（64 位 hex 或 32 字节 base64）；未设置时首次启动会生成同目录的 `inboxharbor.key`。备份或迁移时必须同时安全保存 **`inboxharbor.db` 与 `inboxharbor.key`**；遗失主密钥将无法恢复已保存的凭据。旧版 `data.json` 会在第一次启动时导入，原文件会保留且不会被删除。
-
-### Docker 一键启动（Linux）
-
-需要 Docker Compose。运行 `chmod +x scripts/start-linux.sh && ./scripts/start-linux.sh`；脚本不依赖宿主机 Node.js，会构建 Node.js 24 镜像、启动服务并输出自动生成的管理口令。容器以非 root 的 `node` 用户运行，数据库、密钥与管理口令持久化在 Docker 命名卷 `inboxharbor-data`。
-
-宿主机端口固定发布为 `127.0.0.1:5555`，不会暴露到局域网。可用 `docker compose ps` 查看健康状态；停止使用 `docker compose down`，查询口令使用 `docker compose exec inboxharbor npm run credentials`。不要执行 `docker compose down -v`，否则会删除持久化数据。若经反向代理访问，请在 `.env` 中将 `PUBLIC_BASE_URL` 设为外部 HTTPS 地址，并在 Google OAuth 控制台注册相同的 `/auth/google/callback` 回调地址。
+状态（包括 OAuth refresh token 与通知凭据）保存在 `inboxharbor.db`，并由 AES-256-GCM 加密。主密钥优先使用 `INBOXHARBOR_MASTER_KEY`（64 位 hex 或 32 字节 base64）；未设置时首次启动会生成同目录的 `inboxharbor.key`。备份或迁移时必须同时保存数据库和对应主密钥：默认模式备份 `inboxharbor.db` 与 `inboxharbor.key`，环境变量模式则备份包含原主密钥的 `.env`。遗失主密钥将无法恢复已保存的凭据。旧版 `data.json` 会在第一次启动时导入，原文件会保留且不会被删除。
 
 ### 运行环境
 - **Node.js**: >= 24（使用内置 SQLite）
 - **操作系统**: Windows / macOS / Linux
 
-### 方式一：Windows 用户（一键双击）
-1. [下载代码压缩包](https://github.com/nbbk/inbox-harbor/archive/refs/heads/main.zip) 或 `git clone` 到本地；
-2. 双击运行 **`install.bat`** 自动安装依赖；
-3. 双击运行 **`start.bat`** 启动控制台；
-4. 浏览器访问 **`http://localhost:5555`** 即可开始使用。
-
----
-
-### 方式二：命令行启动 (Linux / macOS / Windows)
-
-```bash
-# 1. 克隆仓库
-git clone https://github.com/nbbk/inbox-harbor.git
-cd inbox-harbor
-
-# 2. 安装依赖
-npm install
-
-# 3. 启动服务
-npm start
-```
-
-启动成功后，控制台输出：
-```text
-====================================================
- ⚓ InboxHarbor（收件港）- 本机邮箱管理台
- 🚀 访问地址: http://localhost:5555
-====================================================
-```
-打开浏览器访问 `http://localhost:5555` 即可。
-
-首次安装只需执行 `npm start`。查询已保存的管理口令：
-
-```bash
-npm run credentials
-```
+Docker 环境无需在宿主机安装 Node.js。直接运行模式才需要 Node.js 24；Windows 可使用 `install.bat` 与 `start.bat`，详细限制见部署指南的“非 Docker 备用方式”。
 
 ## 邮箱权限
 

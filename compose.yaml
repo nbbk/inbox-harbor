@@ -20,3 +20,4 @@ services:
 
 volumes:
   inboxharbor-data:
+    name: inboxharbor-data

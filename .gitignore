@@ -14,6 +14,8 @@ data/
 
 # Logs & Temporary Exports
 logs/
+backups/
+*.tgz
 *.log
 npm-debug.log*
 yarn-debug.log*
