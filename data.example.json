@@ -1,0 +1,12 @@
+{
+  "accounts": [],
+  "mails": [],
+  "tgConfig": {
+    "token": "",
+    "chatId": "",
+    "enabled": false,
+    "autoPollInterval": 5
+  },
+  "pushedMailIds": [],
+  "clearedMailIds": []
+}

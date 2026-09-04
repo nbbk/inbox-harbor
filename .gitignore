@@ -1,0 +1,32 @@
+# User Data & Private Credentials (CRITICAL)
+data.json
+*.db
+*.sqlite
+*.sqlite3
+*.env
+*.env.*
+*.key
+*.pem
+*.pfx
+*.cert
+
+# Logs & Temporary Exports
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*accounts*.txt
+*banned*.txt
+*locked*.txt
+
+# Dependencies
+node_modules/
+
+# Editor & OS Artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo

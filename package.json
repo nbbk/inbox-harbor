@@ -1,0 +1,24 @@
+{
+  "name": "mailpulse",
+  "version": "1.0.0",
+  "description": "⚡ MailPulse - 现代化多邮局极速管理控制台（Microsoft & Google 统一收件、秒级并发、Telegram 实时推送）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [
+    "outlook",
+    "gmail",
+    "mail-dashboard",
+    "telegram-bot",
+    "oauth2",
+    "verification-code"
+  ],
+  "author": "holmes",
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.2.1"
+  }
+}

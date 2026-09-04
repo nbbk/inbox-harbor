@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MailPulse - 现代化多邮局极速管理系统</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="dark-theme">
+  <div class="app-container">
+    
+    <aside class="sidebar">
+      <div class="logo-area">
+        <div class="logo-icon">
+          <i class="fa-solid fa-bolt-lightning"></i>
+        </div>
+        <div class="logo-text">
+          <h2>MailPulse</h2>
+          <span class="version-tag">v1.0 Pro</span>
+        </div>
+      </div>
+
+      <nav class="nav-menu">
+        <button class="nav-item active" data-tab="tab-accounts">
+          <i class="fa-solid fa-users-gear"></i> 账号列表面板
+        </button>
+        <button class="nav-item" data-tab="tab-codes">
+          <i class="fa-solid fa-key"></i> 验证码与邮件大厅
+          <span class="badge-count" id="nav-code-count">0</span>
+        </button>
+        <button class="nav-item" data-tab="tab-import">
+          <i class="fa-solid fa-file-import"></i> 批量导入账号
+        </button>
+        <button class="nav-item" data-tab="tab-api">
+          <i class="fa-solid fa-code"></i> REST API 集成
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="server-status">
+          <span class="pulse-dot"></span>
+          <div class="status-info">
+            <span class="status-title">双平台服务运行中</span>
+            <span class="status-sub">端口: 5555</span>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      
+      <header class="top-header">
+        <div class="header-title">
+          <h1>微软 + 谷歌 邮箱双平台管理面板</h1>
+          <p class="subtitle">高效支持 Outlook & Gmail 邮箱检测、智能验证码与链接提取</p>
+        </div>
+        <div class="header-actions">
+          <button class="btn btn-secondary" id="btn-tg-settings">
+            <i class="fa-brands fa-telegram text-accent"></i> 🤖 TG 推送设置
+          </button>
+          <button class="btn btn-secondary btn-sm" id="btn-add-outlook-tool">
+            <i class="fa-brands fa-microsoft text-primary"></i> + 快捷添加 Outlook
+          </button>
+          <button class="btn btn-secondary btn-sm" id="btn-add-gmail-tool">
+            <i class="fa-brands fa-google text-danger"></i> + 快捷添加 Gmail
+          </button>
+          <button class="btn btn-secondary" id="btn-send-test">
+            <i class="fa-solid fa-paper-plane"></i> 发送测试邮件
+          </button>
+          <button class="btn btn-secondary" id="btn-global-refresh">
+            <i class="fa-solid fa-rotate"></i> 刷新数据
+          </button>
+          <button class="btn btn-primary" id="btn-quick-fetch">
+            <i class="fa-solid fa-bolt"></i> 批量一键取件
+          </button>
+        </div>
+      </header>
+
+      <section class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-icon icon-blue">
+            <i class="fa-solid fa-at"></i>
+          </div>
+          <div class="stat-data">
+            <span class="stat-label">总账号数量</span>
+            <h3 class="stat-value" id="stat-total-accounts">0</h3>
+          </div>
+        </div>
+
+        <div class="stat-card">
+          <div class="stat-icon icon-green">
+            <i class="fa-solid fa-circle-check"></i>
+          </div>
+          <div class="stat-data">
+            <span class="stat-label">活跃/可用账号</span>
+            <h3 class="stat-value" id="stat-active-accounts">0</h3>
+          </div>
+        </div>
+
+        <div class="stat-card">
+          <div class="stat-icon icon-purple">
+            <i class="fa-solid fa-shield-halved"></i>
+          </div>
+          <div class="stat-data">
+            <span class="stat-label">已提取验证码</span>
+            <h3 class="stat-value" id="stat-total-codes">0</h3>
+          </div>
+        </div>
+
+        <div class="stat-card">
+          <div class="stat-icon icon-orange">
+            <i class="fa-solid fa-inbox"></i>
+          </div>
+          <div class="stat-data">
+            <span class="stat-label">历史接收邮件</span>
+            <h3 class="stat-value" id="stat-total-mails">0</h3>
+          </div>
+        </div>
+      </section>
+
+      <div class="tab-content active" id="tab-accounts">
+        <div class="content-card">
+          
+          <!-- Provider Filter Tabs -->
+          <div class="provider-filter-bar">
+            <button class="provider-tab active" data-provider="all">
+              <i class="fa-solid fa-layer-group"></i> 全部账号 (<span id="count-all">0</span>)
+            </button>
+            <button class="provider-tab" data-provider="microsoft">
+              <i class="fa-brands fa-microsoft text-primary"></i> 微软 Outlook (<span id="count-ms">0</span>)
+            </button>
+            <button class="provider-tab" data-provider="google">
+              <i class="fa-brands fa-google text-danger"></i> 谷歌 Gmail (<span id="count-gg">0</span>)
+            </button>
+          </div>
+
+          <div class="toolbar">
+            <div class="toolbar-left">
+              <div class="search-box">
+                <i class="fa-solid fa-magnifying-glass"></i>
+                <input type="text" id="search-account" placeholder="搜索邮箱账号 / 密码 / 备注...">
+              </div>
+            </div>
+
+            <div class="toolbar-right">
+              <button class="btn btn-outline" id="btn-batch-check">
+                <i class="fa-solid fa-heart-pulse"></i> 批量检测活跃
+              </button>
+              <button class="btn btn-outline" id="btn-batch-fetch">
+                <i class="fa-solid fa-inbox"></i> 选定账号取件
+              </button>
+              <button class="btn btn-outline" id="btn-batch-export">
+                <i class="fa-solid fa-file-export"></i> 导出 CSV
+              </button>
+              <button class="btn btn-primary" onclick="exportMsTxt()" style="background: linear-gradient(135deg, #059669, #10b981); border: none; font-weight: 700;" title="一键导出微软邮箱账号密码文本TXT到桌面">
+                <i class="fa-solid fa-file-arrow-down"></i> 导出微软账号密码TXT
+              </button>
+              <button class="btn btn-danger" id="btn-batch-delete">
+                <i class="fa-solid fa-trash-can"></i> 删除选定
+              </button>
+            </div>
+          </div>
+
+          <div class="table-responsive">
+            <table class="data-table" id="table-accounts">
+              <thead>
+                <tr>
+                  <th style="width: 40px;"><input type="checkbox" id="select-all"></th>
+                  <th>序号</th>
+                  <th>邮局类型</th>
+                  <th>邮箱账号</th>
+                  <th>密码</th>
+                  <th>活跃状态</th>
+                  <th>备注 / Token / UUID</th>
+                  <th>最后检测时间</th>
+                  <th style="width: 220px; text-align: right;">快捷操作</th>
+                </tr>
+              </thead>
+              <tbody id="accounts-tbody">
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="tab-content" id="tab-codes">
+        <div class="content-card">
+          <div class="feed-header">
+            <h3><i class="fa-solid fa-bolt-lightning text-warning"></i> 实时验证码与邮件流</h3>
+            <button class="btn btn-secondary btn-sm" id="btn-clear-mails">
+              <i class="fa-solid fa-eraser"></i> 清空邮件历史
+            </button>
+          </div>
+
+          <div class="feed-grid" id="mail-feed-container">
+          </div>
+        </div>
+      </div>
+
+      <div class="tab-content" id="tab-import">
+        <div class="content-card">
+          <h3><i class="fa-solid fa-file-import text-accent"></i> 批量导入账号数据</h3>
+          <p class="import-help">格式支持（自动识别微软或谷歌）：每行一条，格式为 <code>邮箱账号----密码----Token/备注</code> 或 CSV 文本。</p>
+
+          <div class="form-group margin-top-md">
+            <textarea id="import-text" rows="10" placeholder="user1@outlook.com----password123----9e5f94bc-e8a4-4e73-b8be-63364c29d753
+user2@gmail.com----app_password_or_token..."></textarea>
+          </div>
+
+          <div class="form-actions" style="display: flex; gap: 12px; margin-top: 16px;">
+            <button class="btn btn-primary btn-lg" id="btn-submit-import">
+              <i class="fa-solid fa-upload"></i> 确认批量导入
+            </button>
+            <button class="btn btn-secondary btn-lg" id="btn-generate-gmail-demo">
+              <i class="fa-brands fa-google text-danger"></i> + 快捷生成演示 Gmail 账号
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="tab-content" id="tab-api">
+        <div class="content-card">
+          <h3><i class="fa-solid fa-code text-primary"></i> RESTful API 集成接口说明</h3>
+          <p class="margin-bottom-md">支持同时通过 REST API 调用 Outlook 与 Gmail 的验证码与活跃检测：</p>
+
+          <div class="api-doc-block">
+            <div class="api-endpoint"><span class="method post">POST</span> <code>http://localhost:5555/api/tg/test</code></div>
+            <p>测试 Telegram Bot 实时消息推送。</p>
+          </div>
+
+          <div class="api-doc-block">
+            <div class="api-endpoint"><span class="method post">POST</span> <code>http://localhost:5555/api/accounts/fetch-mail</code></div>
+            <p>触发批量取件（自动处理微软 OAuth 与 Gmail 接口，新邮件自动推送 TG）。</p>
+          </div>
+        </div>
+      </div>
+
+    </main>
+  </div>
+
+  <!-- Telegram Bot Settings Modal -->
+  <div id="modal-tg-settings" class="modal-backdrop" style="display: none;">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3><i class="fa-brands fa-telegram text-accent"></i> Telegram Bot 实时推送配置</h3>
+        <button class="btn-close-modal" id="btn-close-tg-modal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label><i class="fa-solid fa-robot"></i> Telegram Bot Token:</label>
+          <input type="text" id="tg-token-input" class="form-input" placeholder="例如: 1234567890:AAH_example_bot_token">
+        </div>
+        <div class="form-group">
+          <label><i class="fa-solid fa-user"></i> Telegram Chat ID (您的用户或群组ID):</label>
+          <input type="text" id="tg-chatid-input" class="form-input" placeholder="例如: 123456789">
+        </div>
+        <div class="form-group row-flex">
+          <label><i class="fa-solid fa-toggle-on"></i> 开启 Telegram 推送:</label>
+          <input type="checkbox" id="tg-enabled-toggle" style="width: 20px; height: 20px; cursor: pointer;">
+        </div>
+        <div class="form-group">
+          <label><i class="fa-solid fa-clock"></i> 自动全轮询取件间隔 (秒):</label>
+          <input type="number" id="tg-poll-interval" class="form-input" value="1" min="1" max="600">
+          <span class="help-text">后台将每隔 1 秒自动对所有微软/谷歌账号发起极速探查取件，发现新邮件即刻推送至 TG！</span>
+        </div>
+      </div>
+      <div class="modal-footer" style="display: flex; gap: 10px; justify-content: flex-end;">
+        <button class="btn btn-secondary" id="btn-test-tg-push">
+          <i class="fa-solid fa-paper-plane"></i> 测试 TG 推送
+        </button>
+        <button class="btn btn-primary" id="btn-save-tg-config">
+          <i class="fa-solid fa-floppy-disk"></i> 保存设置
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Microsoft Device Code Modal -->
+  <div id="modal-ms-device" class="modal-backdrop" style="display: none;">
+    <div class="modal-box" style="max-width: 500px; text-align: center;">
+      <div class="modal-header">
+        <h3><i class="fa-brands fa-microsoft text-primary"></i> 微软 Outlook 官方设备码授权</h3>
+        <button class="btn-close-modal" id="btn-close-ms-device">&times;</button>
+      </div>
+      <div class="modal-body" style="padding: 20px 10px;">
+        <p style="color: var(--text-muted); margin-bottom: 15px;">您的 8 位微软官方授权验证码为：</p>
+        <div style="background: rgba(37, 99, 235, 0.15); border: 2px dashed #3b82f6; padding: 15px; border-radius: 12px; margin-bottom: 20px;">
+          <span id="ms-user-code" style="font-size: 32px; font-weight: 800; letter-spacing: 4px; color: #60a5fa; font-family: monospace;">--------</span>
+        </div>
+        
+        <div style="display: flex; gap: 10px; justify-content: center; margin-bottom: 20px;">
+          <button class="btn btn-secondary btn-sm" onclick="copyToClipboard(document.getElementById('ms-user-code').textContent, '验证码')">
+            <i class="fa-regular fa-copy"></i> 复制验证码
+          </button>
+          <a id="ms-verify-link" href="https://login.microsoft.com/device" target="_blank" class="btn btn-primary btn-sm" style="background: #2563eb; color: #fff; text-decoration: none;">
+            <i class="fa-solid fa-arrow-up-right-from-square"></i> 打开微软官方验证网页
+          </a>
+        </div>
+
+        <div id="ms-poll-status" style="font-size: 14px; color: #38bdf8; display: flex; align-items: center; justify-content: center; gap: 8px;">
+          <i class="fa-solid fa-spinner fa-spin"></i> 正在等待您在网页中完成授权...
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast-container"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
