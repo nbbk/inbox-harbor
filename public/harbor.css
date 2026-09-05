@@ -290,7 +290,7 @@ body.dark-theme {
   }
   .ih-mobile {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(5, 1fr);
     position: fixed;
     bottom: 0;
     left: 0;
@@ -478,6 +478,12 @@ body.dark-theme {
     Consolas,
     monospace;
 }
+.ih-callback-note {
+  margin: 9px 0 0 54px;
+  color: #5d7380;
+  font-size: 12px;
+  line-height: 1.6;
+}
 .ih-clear-secret {
   display: flex;
   align-items: center;
@@ -566,6 +572,41 @@ body.dark-theme {
     grid-template-columns: 1fr;
   }
 }
+.ih-guide-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+.ih-guide-grid .ih-card {
+  min-width: 0;
+}
+.ih-guide-grid .ih-card h2 {
+  margin: 0 0 13px;
+  color: #14334a;
+  font: 650 17px/1.3 Inter, system-ui, sans-serif;
+}
+.ih-guide-grid .ih-card p {
+  margin-bottom: 0;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.ih-command {
+  max-width: 100%;
+  overflow-x: auto;
+  margin: 0;
+  padding: 14px;
+  border: 1px solid #dce6eb;
+  border-radius: 7px;
+  background: #f5f8fa;
+  color: #264b61;
+  font: 12px/1.7 ui-monospace, SFMono-Regular, Consolas, monospace;
+  white-space: pre;
+}
+@media (max-width: 900px) {
+  .ih-guide-grid {
+    grid-template-columns: 1fr;
+  }
+}
 @media (max-width: 768px) {
   .ih-setup-block {
     padding: 20px 16px;
@@ -573,6 +614,7 @@ body.dark-theme {
   .ih-setup-block .ih-field-label,
   .ih-copy-field,
   .ih-clear-secret,
+  .ih-callback-note,
   .ih-tutorial {
     margin-left: 0;
   }

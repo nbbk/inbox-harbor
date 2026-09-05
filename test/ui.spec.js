@@ -262,6 +262,20 @@ test("connector setup guides beginners, saves once, and supports multiple mailbo
   await page.getByRole("button", { name: "连接器设置" }).click();
   await expect(page.getByText("每个平台只配置一次应用")).toBeVisible();
   await expect(page.getByText("如何授权多个邮箱")).toBeVisible();
+  await page.getByText("Google 新手配置教程（展开逐步操作）").click();
+  await expect(page.getByRole("link", { name: "Google Cloud 新建项目" })).toHaveAttribute(
+    "href",
+    "https://console.cloud.google.com/projectcreate",
+  );
+  await expect(page.getByRole("link", { name: "Gmail API", exact: true })).toHaveAttribute(
+    "href",
+    "https://console.cloud.google.com/apis/library/gmail.googleapis.com",
+  );
+  await page.getByText("Microsoft 新手配置教程（展开逐步操作）").click();
+  await expect(page.getByRole("link", { name: "Microsoft Entra 应用注册" })).toHaveAttribute(
+    "href",
+    /entra\.microsoft\.com/,
+  );
   await page.getByLabel("PUBLIC_BASE_URL").fill("https://mail.example.com");
   await page
     .getByLabel("Application (client) ID")
@@ -293,6 +307,39 @@ test("connector setup guides beginners, saves once, and supports multiple mailbo
   expect(overflows).toBe(false);
   await page.screenshot({
     path: "../qa/inboxharbor-connectors-mobile.png",
+    fullPage: true,
+  });
+});
+
+test("deployment guide shows corrected update and manual startup commands responsively", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 960 });
+  await unlock(page);
+  await page.getByRole("button", { name: "使用说明" }).click();
+  await expect(page.getByText("首次 Docker 手动启动")).toBeVisible();
+  await expect(page.getByText("更新到最新版")).toBeVisible();
+  await expect(page.locator("#ih-guide")).toContainText(
+    "git config --global --add safe.directory /www/wwwroot/InboxHarbor",
+  );
+  await expect(page.locator("#ih-guide")).toContainText(
+    "git pull --ff-only origin main",
+  );
+  await expect(page.locator("#ih-guide")).toContainText("npm ci --omit=dev");
+  await page.screenshot({
+    path: "../qa/inboxharbor-guide-desktop.png",
+    fullPage: true,
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.locator(".ih-mobile").getByRole("button", { name: "帮助" }).click();
+  const overflows = await page.evaluate(
+    () =>
+      document.documentElement.scrollWidth >
+      document.documentElement.clientWidth,
+  );
+  expect(overflows).toBe(false);
+  await page.screenshot({
+    path: "../qa/inboxharbor-guide-mobile.png",
     fullPage: true,
   });
 });

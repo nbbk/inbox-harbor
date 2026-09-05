@@ -1268,7 +1268,7 @@ app.get("/auth/google/callback", async (req, res) => {
   if (!transaction || transaction.expiresAt < Date.now())
     return res
       .status(400)
-      .send("授权会话已过期，请回到 InboxHarbor 重新发起授权。");
+      .send("这里是 Google OAuth 回调地址，不是登录页面。请勿直接打开；请把它复制到 Google 控制台的 Authorized redirect URIs。需要授权邮箱时，请回到 InboxHarbor 的邮箱账户并点击“授权”。");
 
   if (error || !code) {
     return res.send(`

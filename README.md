@@ -51,14 +51,49 @@ chmod +x scripts/start-linux.sh
 
 Compose 仅发布 `127.0.0.1:5555`，适合再由宝塔/Nginx 反向代理。完整的源码下载、宝塔 Docker、OAuth、更新、备份恢复与卸载说明见 [部署指南](docs/deployment.md)。
 
+### 手动启动（不使用一键脚本）
+
+```sh
+cd /www/wwwroot/InboxHarbor
+docker compose build --pull
+docker compose up -d
+docker compose ps
+docker compose exec -T inboxharbor npm run credentials
+```
+
+### 更新到最新版
+
+第一次更新或遇到 `detected dubious ownership` 时执行下面的完整命令。这里只信任 InboxHarbor 的准确目录，不要使用 `safe.directory '*'`：
+
+```sh
+git config --global --add safe.directory /www/wwwroot/InboxHarbor
+cd /www/wwwroot/InboxHarbor
+git remote set-url origin https://github.com/nbbk/inbox-harbor.git
+git pull --ff-only origin main
+docker compose up -d --build
+docker compose ps
+```
+
+完成这次更新后，也可使用项目自带更新脚本：
+
+```sh
+cd /www/wwwroot/InboxHarbor
+chmod +x scripts/update-linux.sh
+./scripts/update-linux.sh
+```
+
 ### 非 Docker 备用方式
 
 仅用于开发或没有 Docker 的机器：
 
-```bash
-npm install
+```sh
+node --version
+npm --version
+npm ci --omit=dev
 npm start
 ```
+
+`node --version` 必须显示 `v24` 或更高版本。`npm start` 为前台运行，关闭终端程序会停止；生产服务器优先使用上面的 Docker Compose 方式。
 
 首次启动会自动生成高强度管理口令，持久保存在项目目录的 `inboxharbor.admin-token`，并在终端显示一次。以后重启继续使用同一个口令；忘记时运行 `npm run credentials` 查询。该文件已被 Git 忽略，请勿上传或公开。
 
