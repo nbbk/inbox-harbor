@@ -39,13 +39,15 @@ docker compose exec -T inboxharbor npm run credentials
 
 ## 宝塔 / Nginx 反向代理
 
-Compose 已固定 `127.0.0.1:5555:5555`，不要改成 `0.0.0.0:5555:5555`。在宝塔“网站”中新建域名并配置反向代理到 `http://127.0.0.1:5555`，启用 HTTPS 证书及 WebSocket 支持。外部地址必须写入 `.env`：
+Compose 已固定 `127.0.0.1:5555:5555`，不要改成 `0.0.0.0:5555:5555`。在宝塔“网站”中新建域名并配置反向代理到 `http://127.0.0.1:5555`，启用 HTTPS 证书及 WebSocket 支持。登录 InboxHarbor 后进入“连接器设置”，把外部访问地址填写为完整 HTTPS 域名，例如 `https://mail.example.com`，再按页面向导配置 Google 与 Microsoft。
+
+也可以使用高级环境变量方式，在 `.env` 中设置：
 
 ```dotenv
 PUBLIC_BASE_URL=https://mail.example.com
 ```
 
-修改后执行 `docker compose up -d`。Google OAuth 回调地址必须精确登记为 `https://mail.example.com/auth/google/callback`。完整 OAuth 创建步骤见 [OAuth 配置](oauth.md)。
+使用 `.env` 时执行 `docker compose up -d --force-recreate` 使其生效。Google OAuth 回调地址必须精确登记为 `https://mail.example.com/auth/google/callback`。完整 OAuth 创建步骤见 [OAuth 配置](oauth.md)。
 
 ## 更新、状态与日志
 
@@ -93,8 +95,8 @@ docker compose up -d
 ## 常见错误
 
 - `permission denied`：容器使用非 root 用户；不要手工把命名卷内文件设成 root 所有。若自行改为 bind mount，确保目录可由容器 node 用户写入。
-- `OAuth 配置缺失`：在 `.env` 填入对应平台 Client ID；Google 还需要 Client Secret，然后 `docker compose up -d`。
-- Google redirect mismatch：核对 `.env` 的 `PUBLIC_BASE_URL` 与控制台登记的回调地址完全一致（含 https、域名和路径）。
+- `OAuth 配置缺失`：进入网页“连接器设置”，填写对应平台 Client ID；Google 还需要 Client Secret，然后点击“保存并检测配置”。
+- Google redirect mismatch：复制“连接器设置”页面生成的回调地址，并确认它与 Google 控制台登记值完全一致（含 https、域名和路径）。
 - 无法访问面板：先执行 `docker compose ps` 和 `docker compose logs --tail=200 inboxharbor`；Nginx 应代理到 `127.0.0.1:5555`。
 
 ## 非 Docker 备用方式

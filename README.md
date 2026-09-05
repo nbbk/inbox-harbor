@@ -62,7 +62,7 @@ npm start
 
 首次启动会自动生成高强度管理口令，持久保存在项目目录的 `inboxharbor.admin-token`，并在终端显示一次。以后重启继续使用同一个口令；忘记时运行 `npm run credentials` 查询。该文件已被 Git 忽略，请勿上传或公开。
 
-服务在没有 OAuth 配置时也能正常启动。Microsoft/Google Client ID（以及 Google Client Secret）由对应平台签发，无法由本机自动生成；只需为每个平台配置一次，此后可以方便地添加和授权任意多个该平台邮箱。环境变量仍可作为高级部署方式使用：`MICROSOFT_CLIENT_ID`、`GOOGLE_CLIENT_ID`、`GOOGLE_CLIENT_SECRET`、`INBOXHARBOR_ADMIN_TOKEN`。
+服务在没有 OAuth 配置时也能正常启动。首次登录后进入“连接器设置”，页面会自动生成 Google 回调地址，并提供 Microsoft、Google 的逐步配置教程、格式示例、保存和检测功能。Microsoft/Google Client ID（以及 Google Client Secret）仍需由对应平台签发，无法由本机自动生成；每个平台只需配置一次，此后列表中的每个邮箱都可以分别授权。页面保存的 Secret 会进入 AES-256-GCM 加密数据库且不会回显。环境变量仍可作为高级部署方式使用，并优先于页面配置：`MICROSOFT_CLIENT_ID`、`GOOGLE_CLIENT_ID`、`GOOGLE_CLIENT_SECRET`、`PUBLIC_BASE_URL`。
 
 ### 本地加密存储与备份
 

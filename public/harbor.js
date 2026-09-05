@@ -81,6 +81,7 @@
     [
       "概览|overview",
       "邮箱账户|accounts",
+      "连接器设置|connectors",
       "通知渠道|notifications",
       "使用说明|guide",
     ].forEach((x) => {
@@ -93,10 +94,22 @@
     const lockButton = element("button", "ih-button ih-button-quiet", "锁定");
     lockButton.onclick = lock;
     head.append(element("div"), lockButton);
-    main.append(head, overview(), accounts(), notifications(), guide());
+    main.append(
+      head,
+      overview(),
+      accounts(),
+      connectors(),
+      notifications(),
+      guide(),
+    );
     shell.append(side, main);
     const mobile = element("nav", "ih-mobile");
-    ["概览|overview", "账户|accounts", "通知|notifications"].forEach((x) => {
+    [
+      "概览|overview",
+      "账户|accounts",
+      "设置|connectors",
+      "通知|notifications",
+    ].forEach((x) => {
       const [a, b] = x.split("|");
       mobile.append(navButton(a, b));
     });
@@ -114,6 +127,13 @@
     root
       .querySelectorAll("[data-page]")
       .forEach((n) => n.classList.toggle("active", n.dataset.page === page));
+  }
+  function handleAuthorizationError(error) {
+    alert(error.message);
+    if (/未配置.*(CLIENT|OAuth)|请填写.*Client/i.test(error.message)) {
+      show("connectors");
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
   }
   function overview() {
     const s = element("section", "ih-page active");
@@ -135,6 +155,134 @@
     s.innerHTML =
       '<div class="ih-section-head"><div><p class="ih-eyebrow">FULL BODY DELIVERY</p><h2>通知渠道</h2></div><label>完整正文 <input id="ih-full" type="checkbox" checked></label></div><div class="ih-layout"><div><div class="ih-channels" id="ih-channel-list"></div><button id="ih-save" class="ih-button">保存通知设置</button></div><aside class="ih-card ih-guide" id="ih-channel-guide"><p class="ih-eyebrow">CONFIGURATION</p><h3>选择一个渠道</h3><p>Telegram、Bark、微信、钉钉和 Webhook 都在这里配置；凭据不会回显。</p></aside></div>';
     return s;
+  }
+  function connectors() {
+    const s = element("section", "ih-page");
+    s.id = "ih-connectors";
+    s.innerHTML = `
+      <div class="ih-section-head"><div><h1>连接器设置</h1><p class="ih-section-copy">每个平台只配置一次应用，之后可以逐个授权任意多个邮箱。</p></div></div>
+      <div class="ih-connector-status" id="cx-summary" aria-live="polite"></div>
+      <div class="ih-connector-layout">
+        <form class="ih-connector-form" id="cx-form">
+          <section class="ih-setup-block">
+            <div class="ih-setup-heading"><span>1</span><div><h2>外部访问地址</h2><p>填写浏览器访问 InboxHarbor 的完整地址，用于生成 Google 回调地址。</p></div></div>
+            <label class="ih-field-label">PUBLIC_BASE_URL<input id="cx-base" placeholder="https://mail.example.com" autocomplete="url"><small>格式：必须包含 https://；公网地址不能带路径或参数。</small></label>
+            <div class="ih-copy-field"><code id="cx-callback">保存地址后自动生成</code><button type="button" id="cx-copy" class="ih-button ih-button-quiet">复制回调地址</button></div>
+          </section>
+          <section class="ih-setup-block">
+            <div class="ih-setup-heading"><span>2</span><div><h2>Microsoft 邮箱</h2><p>一个应用配置可供所有 Outlook、Hotmail 与 Microsoft 365 邮箱分别授权。</p></div></div>
+            <label class="ih-field-label">Application (client) ID<input id="cx-ms" placeholder="00001111-aaaa-2222-bbbb-3333cccc4444" autocomplete="off"><small>格式：36 位 UUID，只填写“应用程序(客户端) ID”，不需要 Client Secret。</small></label>
+            <details class="ih-tutorial"><summary>Microsoft 新手配置教程</summary><ol><li>打开 Microsoft Entra 管理中心，进入“应用注册”，点击“新注册”。</li><li>需要同时管理个人和企业邮箱时，选择“任何组织目录中的账户和个人 Microsoft 账户”。</li><li>创建后复制“应用程序(客户端) ID”到上方。</li><li>进入“身份验证”→“高级设置”，把“允许公共客户端流”设为“是”。</li><li>进入“API 权限”，添加 Microsoft Graph 委托权限 <code>Mail.Read</code>；需要发信再添加 <code>Mail.Send</code>。</li></ol></details>
+          </section>
+          <section class="ih-setup-block">
+            <div class="ih-setup-heading"><span>3</span><div><h2>Google 邮箱</h2><p>一个 Web OAuth 客户端可供多个 Gmail 或 Google Workspace 邮箱分别授权。</p></div></div>
+            <label class="ih-field-label">Google Client ID<input id="cx-google" placeholder="123456789012-abcdef.apps.googleusercontent.com" autocomplete="off"><small>格式：通常以数字开头，并以 <code>.apps.googleusercontent.com</code> 结尾。</small></label>
+            <label class="ih-field-label">Google Client Secret<input id="cx-secret" type="password" placeholder="已配置时留空可保持原值" autocomplete="new-password"><small>只在保存时提交；保存后加密存储且页面不会回显。</small></label>
+            <label class="ih-clear-secret"><input id="cx-clear" type="checkbox"> 清除已保存的 Google Client Secret</label>
+            <details class="ih-tutorial"><summary>Google 新手配置教程</summary><ol><li>打开 Google Cloud Console，新建或选择项目，并启用 Gmail API。</li><li>进入“Google Auth Platform”，完成 Branding、Audience 和 Data Access；个人使用通常选择 External。</li><li>应用处于 Testing 时，在 Audience 的 Test users 中加入每一个要授权的 Gmail。</li><li>进入 Clients，创建“Web application”类型的 OAuth Client。</li><li>在 Authorized redirect URIs 中粘贴本页生成的回调地址，必须逐字一致。</li><li>创建后复制 Client ID 与 Client Secret 到上方并保存。</li></ol></details>
+          </section>
+          <div class="ih-connector-actions"><button type="submit" id="cx-save" class="ih-button">保存并检测配置</button><span id="cx-result" aria-live="polite"></span></div>
+        </form>
+        <aside class="ih-setup-aside"><h2>如何授权多个邮箱</h2><ol><li>Google 与 Microsoft 的应用配置各保存一次。</li><li>到“邮箱账户”批量添加地址，并选择对应平台。</li><li>在每一行点击“授权”，登录与该行完全相同的邮箱。</li><li>默认只读；开启发信后，需要为该邮箱重新授权。</li></ol><p>程序不会保存邮箱登录密码。OAuth Token 与 Client Secret 使用本机主密钥加密存储。</p><p>更换 Client ID 或 Secret 后，请重新授权该平台已有的全部邮箱。</p></aside>
+      </div>`;
+    return s;
+  }
+
+  function connectorStateCard(label, ready, detail) {
+    return `<div class="ih-config-state ${ready ? "ready" : "missing"}"><span>${ready ? "✓" : "!"}</span><div><b>${label}</b><small>${detail}</small></div></div>`;
+  }
+
+  async function copyText(value, button) {
+    try {
+      await navigator.clipboard.writeText(value);
+    } catch {
+      const area = document.createElement("textarea");
+      area.value = value;
+      document.body.append(area);
+      area.select();
+      document.execCommand("copy");
+      area.remove();
+    }
+    const previous = button.textContent;
+    button.textContent = "已复制";
+    setTimeout(() => {
+      button.textContent = previous;
+    }, 1500);
+  }
+
+  async function loadConnectors() {
+    const r = await request("/api/v1/connectors");
+    const c = r.configuration;
+    const ms = document.getElementById("cx-ms");
+    const google = document.getElementById("cx-google");
+    const secret = document.getElementById("cx-secret");
+    const base = document.getElementById("cx-base");
+    ms.value = c.microsoft.clientId || "";
+    google.value = c.google.clientId || "";
+    base.value = c.publicBaseUrl;
+    ms.disabled = c.microsoft.managedByEnvironment;
+    google.disabled = c.google.clientIdManagedByEnvironment;
+    secret.disabled = c.google.clientSecretManagedByEnvironment;
+    base.disabled = c.publicBaseUrlManagedByEnvironment;
+    [ms, google, secret, base].forEach((input) => {
+      if (input.disabled)
+        input.title = "该项由服务器环境变量管理，请在 .env 中修改并重建容器。";
+    });
+    document.getElementById("cx-callback").textContent = c.googleCallbackUrl;
+    document.getElementById("cx-summary").innerHTML =
+      connectorStateCard(
+        "Microsoft",
+        c.microsoft.configured,
+        c.microsoft.configured
+          ? "可授权多个 Microsoft 邮箱"
+          : "等待填写 Client ID",
+      ) +
+      connectorStateCard(
+        "Google",
+        c.google.clientIdConfigured && c.google.clientSecretConfigured,
+        c.google.clientIdConfigured && c.google.clientSecretConfigured
+          ? "可授权多个 Google 邮箱"
+          : "需要 Client ID 与 Client Secret",
+      );
+    document.getElementById("cx-copy").onclick = (event) =>
+      copyText(c.googleCallbackUrl, event.currentTarget);
+    const form = document.getElementById("cx-form");
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      const button = document.getElementById("cx-save");
+      const result = document.getElementById("cx-result");
+      button.disabled = true;
+      button.textContent = "正在保存…";
+      result.textContent = "";
+      try {
+        await request("/api/v1/connectors", {
+          method: "PUT",
+          body: JSON.stringify({
+            microsoftClientId: ms.disabled ? "" : ms.value,
+            googleClientId: google.disabled ? "" : google.value,
+            googleClientSecret: secret.disabled ? "" : secret.value,
+            clearGoogleClientSecret:
+              !secret.disabled && document.getElementById("cx-clear").checked,
+            publicBaseUrl: base.disabled ? "" : base.value,
+          }),
+        });
+        const check = await request("/api/v1/connectors/check", {
+          method: "POST",
+          body: "{}",
+        });
+        result.textContent = `保存成功。Microsoft：${check.results.microsoft.message} Google：${check.results.google.message}`;
+        result.className = "success";
+        secret.value = "";
+        document.getElementById("cx-clear").checked = false;
+        await loadConnectors();
+      } catch (error) {
+        result.textContent = error.message;
+        result.className = "error";
+      } finally {
+        button.disabled = false;
+        button.textContent = "保存并检测配置";
+      }
+    };
   }
   function guide() {
     const s = element("section", "ih-page");
@@ -158,6 +306,7 @@
         ? (notices.configuration.channels || []).filter((c) => c.enabled).length
         : 0;
       renderAccounts(accounts.accounts);
+      loadConnectors().catch(() => {});
       const feed = document.getElementById("ih-overview");
       const old = feed.querySelector(".ih-mail-feed");
       if (old) old.remove();
@@ -393,8 +542,14 @@
           { method: "PUT", body: JSON.stringify({ [field]: input.checked }) },
         );
         account[field] = input.checked;
-        if (field === "sendEnabled" && input.checked && account.status === "active") {
-          alert("发信权限已开启，请点击“授权”重新完成 OAuth，授权平台才会授予发信范围。");
+        if (
+          field === "sendEnabled" &&
+          input.checked &&
+          account.status === "active"
+        ) {
+          alert(
+            "发信权限已开启，请点击“授权”重新完成 OAuth，授权平台才会授予发信范围。",
+          );
         }
       } catch (error) {
         input.checked = !input.checked;
@@ -578,7 +733,7 @@
         try {
           await authorize(a);
         } catch (error) {
-          alert(error.message);
+          handleAuthorizationError(error);
           auth.disabled = false;
           auth.textContent = "授权";
         }

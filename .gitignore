@@ -6,6 +6,7 @@ data/
 *.sqlite3
 *.env
 *.env.*
+!.env.example
 *.key
 *.admin-token
 *.pem
