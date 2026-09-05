@@ -8,7 +8,7 @@ async function unlock(page) {
   await expect(page).toHaveTitle(/InboxHarbor/);
   await page.getByPlaceholder("本机访问口令").fill(token);
   await page.getByRole("button", { name: "进入收件港" }).click();
-  await expect(page.getByText("你的邮件，安静地靠岸。")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "邮件中心" })).toBeVisible();
 }
 
 test("desktop notification settings render and expose channel guidance", async ({
@@ -307,6 +307,114 @@ test("connector setup guides beginners, saves once, and supports multiple mailbo
   expect(overflows).toBe(false);
   await page.screenshot({
     path: "../qa/inboxharbor-connectors-mobile.png",
+    fullPage: true,
+  });
+});
+
+test("mail center filters, reads verification codes, and sends composed mail", async ({
+  page,
+}) => {
+  const sent = [];
+  const accounts = [
+    {
+      id: "sender-google",
+      username: "owner@gmail.com",
+      provider: "google",
+      status: "active",
+      readEnabled: true,
+      sendEnabled: true,
+      providerScopes:
+        "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send",
+    },
+  ];
+  const mails = [
+    {
+      id: "verify-1",
+      account: "owner@gmail.com",
+      sender: "security@example.com",
+      subject: "登录验证码",
+      content: "请使用验证码 591845 完成登录。\n十分钟内有效。",
+      preview: "请使用验证码 591845 完成登录。",
+      category: "验证码",
+      code: "591845",
+      receivedAt: "2026-09-05T08:00:00.000Z",
+    },
+    {
+      id: "promo-1",
+      account: "owner@gmail.com",
+      sender: "shop@example.com",
+      subject: "本周优惠",
+      content: "新品推广邮件",
+      preview: "新品推广邮件",
+      category: "推广",
+      code: "未发现验证码",
+      receivedAt: "2026-09-04T08:00:00.000Z",
+    },
+  ];
+  await page.route("**/api/accounts", (route) =>
+    route.fulfill({ json: { success: true, accounts } }),
+  );
+  await page.route("**/api/mails", (route) =>
+    route.fulfill({ json: { success: true, mails } }),
+  );
+  await page.route("**/api/mails/send", async (route) => {
+    const body = route.request().postDataJSON();
+    if (body.to === "blocked@example.com") {
+      await route.fulfill({
+        status: 403,
+        json: { success: false, message: "发信授权无效，请重新授权" },
+      });
+      return;
+    }
+    sent.push(body);
+    await route.fulfill({ json: { success: true, message: "邮件已发送" } });
+  });
+  page.on("dialog", (dialog) => dialog.accept());
+  await page.setViewportSize({ width: 1440, height: 960 });
+  await unlock(page);
+  await expect(page.getByRole("heading", { name: "邮件中心" })).toBeVisible();
+  await expect(page.locator(".ih-side")).toHaveCSS("position", "fixed");
+  await page.getByRole("button", { name: "验证码 1" }).click();
+  await expect(page.locator("#ih-mail-list")).toContainText("登录验证码");
+  await expect(page.locator("#ih-mail-list")).not.toContainText("本周优惠");
+  await expect(page.locator("#ih-mail-reader")).toContainText("591845");
+  await page.getByRole("button", { name: "复制验证码" }).click();
+  await expect(page.getByRole("button", { name: "已复制" })).toBeVisible();
+  await page.getByPlaceholder("搜索主题、发件人或正文").fill("不存在的内容");
+  await expect(page.locator("#ih-mail-list")).toContainText("没有符合条件的邮件");
+  await page.getByPlaceholder("搜索主题、发件人或正文").fill("");
+  await page.locator("#ih-mail-account").selectOption("owner@gmail.com");
+  await expect(page.locator("#ih-mail-list")).toContainText("登录验证码");
+  await page.getByRole("button", { name: "写邮件" }).click();
+  await page.getByLabel("发件账户").selectOption("sender-google");
+  await page.getByLabel("收件人").fill("blocked@example.com");
+  await page.getByLabel("主题").fill("测试主题");
+  await page.getByRole("textbox", { name: "正文", exact: true }).fill("这是一封测试邮件。");
+  await page.getByRole("button", { name: "发送邮件" }).click();
+  await expect(page.locator(".ih-dialog-help")).toContainText("发信授权无效");
+  await page.getByLabel("收件人").fill("friend@example.com");
+  await page.screenshot({
+    path: "../qa/inboxharbor-compose-desktop.png",
+    fullPage: false,
+  });
+  await page.getByRole("button", { name: "发送邮件" }).click();
+  await expect.poll(() => sent.length).toBe(1);
+  expect(sent[0]).toMatchObject({
+    accountId: "sender-google",
+    to: "friend@example.com",
+    subject: "测试主题",
+  });
+  await page.screenshot({
+    path: "../qa/inboxharbor-mail-center-desktop.png",
+    fullPage: true,
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  const overflows = await page.evaluate(
+    () => document.documentElement.scrollWidth > document.documentElement.clientWidth,
+  );
+  expect(overflows).toBe(false);
+  await page.screenshot({
+    path: "../qa/inboxharbor-mail-center-mobile.png",
     fullPage: true,
   });
 });

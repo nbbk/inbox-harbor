@@ -25,6 +25,12 @@ const {
   toPublicConnectorConfig,
   updateStoredConnectorConfig,
 } = require("./connector-config");
+const {
+  cleanMailText,
+  getGmailBody,
+  publicMail,
+  sortMailsNewestFirst,
+} = require("./mail-utils");
 
 const app = express();
 const PORT = process.env.PORT || 5555;
@@ -206,30 +212,6 @@ function decodeMimeHeader(headerStr) {
   } catch (e) {
     return headerStr;
   }
-}
-
-// Recursively decode Gmail MIME Payload Body Parts
-function getGmailBody(payload) {
-  if (!payload) return "";
-  let body = "";
-  if (payload.body && payload.body.data) {
-    try {
-      body += Buffer.from(payload.body.data, "base64").toString("utf8") + "\n";
-    } catch (e) {}
-  }
-  if (payload.parts && Array.isArray(payload.parts)) {
-    for (let part of payload.parts) {
-      if (part.body && part.body.data) {
-        try {
-          body += Buffer.from(part.body.data, "base64").toString("utf8") + "\n";
-        } catch (e) {}
-      }
-      if (part.parts) {
-        body += getGmailBody(part) + "\n";
-      }
-    }
-  }
-  return body;
 }
 
 // Proxy-aware Fetch for Google & Telegram APIs with Fast 1.5s Timeout
@@ -795,7 +777,7 @@ async function fetchMicrosoftMails(acc, accessToken) {
       const data = await resp.json();
       for (let item of data.value || []) {
         const rawContent = item.body?.content || "";
-        const cleanBody = rawContent.replace(/<[^>]*>?/gm, "").trim();
+        const cleanBody = cleanMailText(rawContent);
         const cleanSubject = decodeMimeHeader(item.subject || "无主题");
         const cleanSender = decodeMimeHeader(
           item.from?.emailAddress?.address || "System",
@@ -887,9 +869,7 @@ async function fetchGoogleMails(acc, accessToken) {
 
             // Decode Full Payload Body HTML/Text
             const fullPayloadBody = getGmailBody(item.payload);
-            const cleanBody = fullPayloadBody
-              ? fullPayloadBody.replace(/<[^>]*>?/gm, "").trim()
-              : snippet;
+            const cleanBody = cleanMailText(fullPayloadBody || snippet);
 
             const cleanSubject = decodeMimeHeader(rawSubject) || "无主题";
             const cleanSender = decodeMimeHeader(rawFrom) || "Google System";
@@ -1845,6 +1825,7 @@ async function processSingleAccountFetch(acc, dataStore) {
         existingFps.add(fp);
       }
     }
+    dataStore.mails = sortMailsNewestFirst(dataStore.mails);
     if (dataStore.mails.length > 200) {
       dataStore.mails = dataStore.mails.slice(0, 200);
     }
@@ -1963,7 +1944,92 @@ app.post("/api/accounts/send-test-mail", async (req, res) => {
 });
 
 app.get("/api/mails", (req, res) => {
-  res.json({ success: true, mails: gData.mails });
+  const mails = sortMailsNewestFirst(gData.mails.map(publicMail));
+  res.json({ success: true, mails });
+});
+
+app.post("/api/mails/send", async (req, res) => {
+  const { accountId, to, subject, body } = req.body || {};
+  const recipient = String(to || "").trim();
+  const mailSubject = String(subject || "").trim();
+  const mailBody = String(body || "").trim();
+  const account = gData.accounts.find((item) => item.id === accountId);
+  if (!account || !supportsOAuth(account.provider))
+    return res
+      .status(400)
+      .json({ success: false, message: "请选择已接入的邮箱账户" });
+  if (account.sendEnabled !== true)
+    return res
+      .status(403)
+      .json({ success: false, message: "请先开启发信权限并重新授权该账户" });
+  if (
+    !/^[^@\s\r\n]+@[^@\s\r\n]+\.[^@\s\r\n]+$/.test(recipient) ||
+    !mailSubject ||
+    mailSubject.length > 200 ||
+    /[\r\n]/.test(mailSubject) ||
+    !mailBody ||
+    mailBody.length > 100000
+  )
+    return res.status(400).json({
+      success: false,
+      message: "请填写有效收件人、主题和正文（主题最多 200 字，正文最多 100000 字）",
+    });
+  const verified =
+    account.provider === "google"
+      ? await verifyGoogleAccount(account)
+      : await verifyMicrosoftAccount(account);
+  const scope =
+    account.provider === "google"
+      ? "https://www.googleapis.com/auth/gmail.send"
+      : "Mail.Send";
+  if (
+    verified.status !== "active" ||
+    !verified.accessToken ||
+    !String(account.providerScopes || "").split(/\s+/).includes(scope)
+  )
+    return res.status(403).json({
+      success: false,
+      message: "发信授权无效，请在账户页重新授权并允许发信",
+    });
+  let response;
+  if (account.provider === "google") {
+    const encodedSubject = Buffer.from(mailSubject).toString("base64");
+    const raw = Buffer.from(
+      `To: ${recipient}\r\nSubject: =?UTF-8?B?${encodedSubject}?=\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n${mailBody}`,
+    ).toString("base64url");
+    response = await smartProxyFetch(
+      "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${verified.accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ raw }),
+      },
+    );
+  } else {
+    response = await fetch("https://graph.microsoft.com/v1.0/me/sendMail", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${verified.accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        message: {
+          subject: mailSubject,
+          body: { contentType: "Text", content: mailBody },
+          toRecipients: [{ emailAddress: { address: recipient } }],
+        },
+      }),
+    });
+  }
+  if (!response.ok)
+    return res.status(502).json({
+      success: false,
+      message: `邮件服务返回 HTTP ${response.status}`,
+    });
+  res.json({ success: true, message: "邮件已发送" });
 });
 
 app.post("/api/mails/clear", (req, res) => {

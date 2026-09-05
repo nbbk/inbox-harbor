@@ -3,6 +3,14 @@
   let token = sessionStorage.getItem("inboxharbor-token") || "";
   let catalog = {};
   let config = { includeFullBody: true, channels: [] };
+  let mailState = {
+    mails: [],
+    accounts: [],
+    category: "全部",
+    account: "全部",
+    query: "",
+    selectedId: "",
+  };
   const esc = (value) => String(value || "");
   function request(url, opts = {}) {
     return fetch(url, {
@@ -139,9 +147,210 @@
   function overview() {
     const s = element("section", "ih-page active");
     s.id = "ih-overview";
-    s.innerHTML =
-      '<div class="ih-hero"><div><p>你的邮件，安静地靠岸。</p><h1>一处查看所有重要邮件。</h1><span>默认只读；需要时可为单个账户开启发信权限。</span></div><div class="ih-number"><b id="ih-total">0</b><span>已连接邮箱</span></div></div><div class="ih-stats"><div class="ih-card"><span>活跃账户</span><b id="ih-active">0</b></div><div class="ih-card"><span>邮件归档</span><b id="ih-mails">0</b></div><div class="ih-card"><span>通知渠道</span><b id="ih-channels">0</b></div></div>';
+    s.innerHTML = `<div class="ih-mail-head"><div><h1>邮件中心</h1><p>聚合查看所有账户的重要邮件与验证码。</p></div><div class="ih-mail-head-actions"><span id="ih-mail-summary">0 封邮件</span><button id="ih-compose" class="ih-button">写邮件</button></div></div>
+      <div class="ih-mail-categories" id="ih-mail-categories" aria-label="邮件分类"></div>
+      <div class="ih-mail-tools"><label class="ih-mail-search"><span>搜索</span><input id="ih-mail-search" placeholder="搜索主题、发件人或正文"></label><label><span>邮箱账户</span><select id="ih-mail-account"><option value="全部">全部账户</option></select></label></div>
+      <div class="ih-mail-workspace"><div class="ih-mail-list" id="ih-mail-list"></div><article class="ih-mail-reader" id="ih-mail-reader"><div class="ih-mail-empty"><b>选择一封邮件</b><span>正文会在这里清晰呈现。</span></div></article></div>`;
+    s.querySelector("#ih-compose").onclick = openCompose;
+    s.querySelector("#ih-mail-search").oninput = (event) => {
+      mailState.query = event.target.value.trim().toLowerCase();
+      renderMailCenter();
+    };
+    s.querySelector("#ih-mail-account").onchange = (event) => {
+      mailState.account = event.target.value;
+      renderMailCenter();
+    };
     return s;
+  }
+
+  const mailCategories = ["全部", "验证码", "通知", "账单", "社交", "推广", "其他"];
+
+  function formatMailTime(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "时间未知";
+    return new Intl.DateTimeFormat("zh-CN", {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).format(date);
+  }
+
+  function visibleMails() {
+    return mailState.mails.filter((mail) => {
+      if (mailState.category !== "全部" && mail.category !== mailState.category)
+        return false;
+      if (mailState.account !== "全部" && mail.account !== mailState.account)
+        return false;
+      if (!mailState.query) return true;
+      return `${mail.subject || ""} ${mail.sender || ""} ${mail.content || ""}`
+        .toLowerCase()
+        .includes(mailState.query);
+    });
+  }
+
+  function renderMailCenter(mails, accounts) {
+    if (mails) mailState.mails = mails;
+    if (accounts) mailState.accounts = accounts;
+    const list = document.getElementById("ih-mail-list");
+    if (!list) return;
+    const categories = document.getElementById("ih-mail-categories");
+    categories.replaceChildren();
+    mailCategories.forEach((category) => {
+      const count =
+        category === "全部"
+          ? mailState.mails.length
+          : mailState.mails.filter((mail) => mail.category === category).length;
+      const button = element(
+        "button",
+        category === mailState.category ? "active" : "",
+        `${category} ${count}`,
+      );
+      button.onclick = () => {
+        mailState.category = category;
+        mailState.selectedId = "";
+        renderMailCenter();
+      };
+      categories.append(button);
+    });
+    const accountSelect = document.getElementById("ih-mail-account");
+    const current = mailState.account;
+    accountSelect.replaceChildren(new Option("全部账户", "全部"));
+    [...new Set(mailState.accounts.map((account) => account.username))].forEach(
+      (username) => accountSelect.append(new Option(username, username)),
+    );
+    accountSelect.value = current;
+    const filtered = visibleMails();
+    document.getElementById("ih-mail-summary").textContent = `${filtered.length} 封邮件`;
+    list.replaceChildren();
+    if (!filtered.length) {
+      const empty = element("div", "ih-mail-empty");
+      empty.append(element("b", "", "没有符合条件的邮件"), element("span", "", "换个分类或搜索词试试。"));
+      list.append(empty);
+      renderMailReader(null);
+      return;
+    }
+    if (!filtered.some((mail) => mail.id === mailState.selectedId))
+      mailState.selectedId = filtered[0].id;
+    filtered.forEach((mail) => {
+      const button = element(
+        "button",
+        `ih-mail-row${mail.id === mailState.selectedId ? " active" : ""}`,
+      );
+      const top = element("span", "ih-mail-row-top");
+      top.append(
+        element("b", "", mail.sender || "未知发件人"),
+        element("time", "", formatMailTime(mail.receivedAt)),
+      );
+      const subject = element("strong", "", mail.subject || "无主题");
+      const preview = element("span", "ih-mail-preview", mail.preview || mail.content || "无正文内容");
+      const meta = element("span", "ih-mail-row-meta");
+      meta.append(
+        element("em", `ih-mail-tag ih-mail-tag-${mail.category}`, mail.category || "其他"),
+        element("small", "", mail.account || ""),
+      );
+      button.append(top, subject, preview, meta);
+      button.onclick = () => {
+        mailState.selectedId = mail.id;
+        renderMailCenter();
+        if (matchMedia("(max-width: 760px)").matches)
+          document.getElementById("ih-mail-reader").scrollIntoView({ behavior: "smooth" });
+      };
+      list.append(button);
+    });
+    renderMailReader(filtered.find((mail) => mail.id === mailState.selectedId));
+  }
+
+  function renderMailReader(mail) {
+    const reader = document.getElementById("ih-mail-reader");
+    if (!reader) return;
+    reader.replaceChildren();
+    if (!mail) {
+      const empty = element("div", "ih-mail-empty");
+      empty.append(element("b", "", "选择一封邮件"), element("span", "", "正文会在这里清晰呈现。"));
+      reader.append(empty);
+      return;
+    }
+    const tag = element("span", `ih-mail-tag ih-mail-tag-${mail.category}`, mail.category || "其他");
+    const title = element("h2", "", mail.subject || "无主题");
+    const meta = element("div", "ih-reader-meta");
+    const sender = element("div");
+    sender.append(element("b", "", mail.sender || "未知发件人"), element("span", "", `发送至 ${mail.account || "未知账户"}`));
+    meta.append(sender, element("time", "", formatMailTime(mail.receivedAt)));
+    reader.append(tag, title, meta);
+    if (mail.code && mail.code !== "未发现验证码") {
+      const codeBox = element("div", "ih-code-box");
+      const copy = element("button", "ih-button ih-button-quiet", "复制验证码");
+      copy.onclick = async () => {
+        await copyText(mail.code, copy);
+        copy.textContent = "已复制";
+      };
+      codeBox.append(element("span", "", "验证码"), element("strong", "", mail.code), copy);
+      reader.append(codeBox);
+    }
+    const body = element("div", "ih-mail-body", mail.content || "无正文内容");
+    reader.append(body);
+  }
+
+  function openCompose() {
+    const eligible = mailState.accounts.filter((account) => {
+      const requiredScope =
+        account.provider === "google"
+          ? "https://www.googleapis.com/auth/gmail.send"
+          : "Mail.Send";
+      return (
+        account.sendEnabled === true &&
+        account.status === "active" &&
+        String(account.providerScopes || "").split(/\s+/).includes(requiredScope)
+      );
+    });
+    const dialog = element("dialog", "ih-dialog ih-compose-dialog");
+    const form = element("form", "ih-dialog-card ih-compose-card");
+    form.method = "dialog";
+    form.innerHTML = `<div class="ih-dialog-head"><div><h2>写邮件</h2><p>使用已开启发信权限并重新授权的账户发送。</p></div><button type="button" class="ih-dialog-close" aria-label="关闭">×</button></div>
+      <label class="ih-field-label">发件账户<select name="accountId" required><option value="">请选择发件账户</option></select></label>
+      <label class="ih-field-label">收件人<input name="to" type="email" placeholder="name@example.com" required></label>
+      <label class="ih-field-label">主题<input name="subject" maxlength="200" placeholder="请输入邮件主题" required></label>
+      <label class="ih-field-label">正文<textarea name="body" rows="10" maxlength="100000" placeholder="请输入邮件正文" required></textarea></label>
+      <p class="ih-dialog-help">${eligible.length ? "发送前请再次核对收件人。" : "暂无可发信账户。请先到邮箱账户开启发信权限，并重新完成 OAuth 授权。"}</p>
+      <div class="ih-dialog-actions"><button type="button" class="ih-button ih-button-quiet ih-compose-cancel">取消</button><button type="submit" class="ih-button" ${eligible.length ? "" : "disabled"}>发送邮件</button></div>`;
+    const select = form.elements.accountId;
+    eligible.forEach((account) =>
+      select.append(new Option(`${account.username} · ${account.provider}`, account.id)),
+    );
+    dialog.append(form);
+    document.body.append(dialog);
+    const close = () => {
+      dialog.close();
+      dialog.remove();
+    };
+    form.querySelector(".ih-dialog-close").onclick = close;
+    form.querySelector(".ih-compose-cancel").onclick = close;
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      const submit = form.querySelector('[type="submit"]');
+      submit.disabled = true;
+      submit.textContent = "正在发送…";
+      try {
+        const values = new FormData(form);
+        const result = await request("/api/mails/send", {
+          method: "POST",
+          body: JSON.stringify(Object.fromEntries(values)),
+        });
+        close();
+        alert(result.message || "邮件已发送");
+      } catch (error) {
+        form.querySelector(".ih-dialog-help").textContent = error.message;
+        submit.disabled = false;
+        submit.textContent = "发送邮件";
+      }
+    };
+    dialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      close();
+    });
+    dialog.showModal();
   }
   function accounts() {
     const s = element("section", "ih-page");
@@ -301,29 +510,9 @@
         request("/api/v1/notifications").catch(() => null),
         request("/api/mails"),
       ]);
-      document.getElementById("ih-total").textContent = stats.totalAccounts;
-      document.getElementById("ih-active").textContent = stats.activeAccounts;
-      document.getElementById("ih-mails").textContent = stats.totalMails;
-      document.getElementById("ih-channels").textContent = notices
-        ? (notices.configuration.channels || []).filter((c) => c.enabled).length
-        : 0;
       renderAccounts(accounts.accounts);
+      renderMailCenter(mails.mails || [], accounts.accounts || []);
       loadConnectors().catch(() => {});
-      const feed = document.getElementById("ih-overview");
-      const old = feed.querySelector(".ih-mail-feed");
-      if (old) old.remove();
-      const mailBox = element("div", "ih-card ih-mail-feed");
-      (mails.mails || []).slice(0, 8).forEach((m) => {
-        const d = element("details", "ih-account");
-        const sum = element(
-          "summary",
-          "",
-          `${m.subject || "无主题"} · ${m.account || ""}`,
-        );
-        d.append(sum, element("pre", "ih-muted", m.content || m.preview || ""));
-        mailBox.append(d);
-      });
-      feed.append(mailBox);
       if (notices) {
         catalog = notices.catalog;
         config = notices.configuration;
