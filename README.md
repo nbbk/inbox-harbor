@@ -40,16 +40,16 @@
 
 ### 默认方式：Docker Compose
 
-生产与宝塔部署请使用 Docker Compose，而不是直接运行 Node。私有仓库请先按[部署指南](docs/deployment.md#获取私有仓库)配置 Deploy Key，然后执行：
+生产与宝塔部署请使用 Docker Compose，而不是直接运行 Node。仓库为公开仓库，无需 GitHub 账号、密码、Token 或 SSH Key，直接执行：
 
 ```sh
-git clone git@github-inbox-harbor:nbbk/inbox-harbor.git /www/wwwroot/InboxHarbor
+git clone https://github.com/nbbk/inbox-harbor.git /www/wwwroot/InboxHarbor
 cd /www/wwwroot/InboxHarbor
 chmod +x scripts/start-linux.sh
 ./scripts/start-linux.sh
 ```
 
-Compose 仅发布 `127.0.0.1:5555`，适合再由宝塔/Nginx 反向代理。完整的私有仓库拉取、宝塔 Docker、OAuth、更新、备份恢复与卸载说明见 [部署指南](docs/deployment.md)。
+Compose 仅发布 `127.0.0.1:5555`，适合再由宝塔/Nginx 反向代理。完整的源码下载、宝塔 Docker、OAuth、更新、备份恢复与卸载说明见 [部署指南](docs/deployment.md)。
 
 ### 非 Docker 备用方式
 

@@ -8,37 +8,16 @@ Docker Compose 是 InboxHarbor 的默认部署方式。Compose 会把应用数�
 2. 使用宝塔终端或 SSH 登录服务器，确认：`docker --version` 与 `docker compose version` 都有输出。
 3. 选择一个仅管理员可读的目录，例如 `/www/wwwroot/InboxHarbor`。不要让 Web 服务器直接提供该目录中的文件。
 
-## 获取私有仓库
+## 下载源码
 
-推荐给这台服务器配置仓库专用的只读 Deploy Key。先创建密钥（如果目标文件已经存在，请换一个文件名，不要覆盖）：
-
-```sh
-mkdir -p ~/.ssh
-chmod 700 ~/.ssh
-ssh-keygen -t ed25519 -C "inbox-harbor-server" -f ~/.ssh/inbox_harbor_deploy
-cat ~/.ssh/inbox_harbor_deploy.pub
-```
-
-复制公钥，在 GitHub 仓库的 `Settings → Deploy keys → Add deploy key` 中添加，不勾选写权限。然后编辑 `~/.ssh/config`，加入：
-
-```sshconfig
-Host github-inbox-harbor
-    HostName github.com
-    User git
-    IdentityFile ~/.ssh/inbox_harbor_deploy
-    IdentitiesOnly yes
-```
-
-保存后执行：
+仓库为公开仓库。服务器无需登录 GitHub，也不需要配置账号密码、Personal Access Token、SSH Key 或自定义 SSH 主机别名。首次安装直接使用 HTTPS 克隆：
 
 ```sh
-chmod 600 ~/.ssh/config
-ssh -T git@github-inbox-harbor
-git clone git@github-inbox-harbor:nbbk/inbox-harbor.git /www/wwwroot/InboxHarbor
+git clone https://github.com/nbbk/inbox-harbor.git /www/wwwroot/InboxHarbor
 cd /www/wwwroot/InboxHarbor
 ```
 
-若服务器已经有可访问仓库的默认 SSH key，可直接使用 `git@github.com:nbbk/inbox-harbor.git`。不建议把 PAT 写进克隆 URL，它会进入 shell 历史；确需 HTTPS 时，密码提示处填写 fine-grained PAT，而不是 GitHub 登录密码。
+如果 `/www/wwwroot/InboxHarbor` 已经存在且此前就是该仓库，不要再次执行 `git clone`，请按下方“更新、状态与日志”运行 `git pull --ff-only`。如果目录存在但不是 Git 仓库，请先备份其中的数据并换一个空目录，避免覆盖现有文件。
 
 ## 首次启动
 
@@ -78,7 +57,7 @@ docker compose ps
 docker compose logs -f --tail=200 inboxharbor
 ```
 
-若 `git pull` 需要凭据，使用已配置的 SSH deploy key 或 Git 凭据管理器；不要将令牌写入 `compose.yaml`。
+公开仓库正常执行 `git pull` 不需要凭据。如果终端仍提示 GitHub 用户名，先确认远端地址：`git remote -v`；应为 `https://github.com/nbbk/inbox-harbor.git`。可用 `git remote set-url origin https://github.com/nbbk/inbox-harbor.git` 修正。
 
 ## 备份与恢复
 
