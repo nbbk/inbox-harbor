@@ -8,6 +8,7 @@ const crypto = require('crypto');
 const { CHANNELS, publicConfig, send, sendAll, messageFor } = require('./notifications');
 const { Storage } = require('./storage');
 const { loadOrCreateAdminToken } = require('./instance-config');
+const { detectProvider, normalizeProvider, supportsOAuth, validateOAuthIdentity } = require('./providers');
 
 const app = express();
 const PORT = process.env.PORT || 5555;
@@ -45,6 +46,16 @@ let MICROSOFT_CLIENT_ID = process.env.MICROSOFT_CLIENT_ID || '';
 // Global In-Memory Deduplication Set for TELEGRAM PUSHES ONLY
 const globalPushedFingerprints = new Set();
 const googleOAuthTransactions = new Map();
+const microsoftOAuthTransactions = new Map();
+
+function pruneOAuthTransactions(now = Date.now()) {
+  for (const [key, transaction] of googleOAuthTransactions) {
+    if (transaction.expiresAt < now) googleOAuthTransactions.delete(key);
+  }
+  for (const [key, transaction] of microsoftOAuthTransactions) {
+    if (transaction.expiresAt < now) microsoftOAuthTransactions.delete(key);
+  }
+}
 
 function escapeHtml(value) {
   return String(value || '')
@@ -99,7 +110,7 @@ function loadDataFromDisk() {
     gData.clearedMailIds.forEach(id => globalPushedFingerprints.add(id));
 
     gData.accounts.forEach(acc => {
-      acc.provider = detectProvider(acc.username);
+      acc.provider = normalizeProvider(acc.provider, acc.username);
       acc.readEnabled = acc.readEnabled !== false;
       acc.sendEnabled = acc.sendEnabled === true;
     });
@@ -256,15 +267,6 @@ async function smartProxyFetch(url, options = {}) {
     await new Promise(r => setTimeout(r, 100));
     return await fetch(url, options);
   }
-}
-
-function detectProvider(email) {
-  if (!email) return 'microsoft';
-  const lower = email.toLowerCase();
-  if (lower.includes('gmail') || lower.includes('google')) {
-    return 'google';
-  }
-  return 'microsoft';
 }
 
 // Clean invariant fingerprint including Message ID / Code to distinguish multiple verification codes in the same thread
@@ -786,8 +788,11 @@ function parseImportText(text) {
 // --- MICROSOFT OFFICIAL DEVICE CODE FLOW ---
 
 app.post('/api/auth/microsoft/device-code', async (req, res) => {
+  pruneOAuthTransactions();
   if (!MICROSOFT_CLIENT_ID) return res.status(503).json({ success: false, message: '未配置 MICROSOFT_CLIENT_ID，无法发起 Microsoft OAuth。' });
   const requested = gData.accounts.find(a => a.id === req.body.accountId);
+  if (!requested) return res.status(404).json({ success: false, message: '账号不存在' });
+  if (requested.provider !== 'microsoft') return res.status(400).json({ success: false, message: '该账号未选择 Microsoft OAuth 连接器。' });
   const clientId = MICROSOFT_CLIENT_ID;
   const params = new URLSearchParams();
   params.append('client_id', clientId);
@@ -801,7 +806,8 @@ app.post('/api/auth/microsoft/device-code', async (req, res) => {
     });
 
     const data = await resp.json();
-    if (resp.ok && data.user_code) {
+    if (resp.ok && data.user_code && data.device_code) {
+      microsoftOAuthTransactions.set(data.device_code, { accountId: requested.id, expiresAt: Date.now() + Number(data.expires_in || 600) * 1000 });
       res.json({
         success: true,
         userCode: data.user_code,
@@ -818,8 +824,14 @@ app.post('/api/auth/microsoft/device-code', async (req, res) => {
 });
 
 app.post('/api/auth/microsoft/poll-device-token', async (req, res) => {
-  const { accountId, deviceCode } = req.body;
+  pruneOAuthTransactions();
+  const { deviceCode } = req.body;
   if (!deviceCode) return res.status(400).json({ success: false, message: '缺失 deviceCode' });
+  const transaction = microsoftOAuthTransactions.get(deviceCode);
+  if (!transaction) return res.status(400).json({ success: false, message: 'Microsoft 授权事务不存在或已经结束。' });
+  if (transaction.expiresAt < Date.now()) { microsoftOAuthTransactions.delete(deviceCode); return res.status(400).json({ success: false, message: 'Microsoft 授权事务已过期。' }); }
+  const targetAcc = gData.accounts.find(account => account.id === transaction.accountId);
+  if (!targetAcc || targetAcc.provider !== 'microsoft') { microsoftOAuthTransactions.delete(deviceCode); return res.status(409).json({ success: false, message: '原 Microsoft 账户不存在或连接器已改变。' }); }
 
   if (!MICROSOFT_CLIENT_ID) return res.status(503).json({ success: false, message: '未配置 MICROSOFT_CLIENT_ID。' });
   const clientId = MICROSOFT_CLIENT_ID;
@@ -832,13 +844,13 @@ app.post('/api/auth/microsoft/poll-device-token', async (req, res) => {
     const resp = await fetch('https://login.microsoftonline.com/common/oauth2/v2.0/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: params.toString()
+      body: params.toString(),
+      signal: AbortSignal.timeout(15000)
     });
 
     const tokenData = await resp.json();
 
     if (resp.ok && (tokenData.access_token || tokenData.refresh_token)) {
-      let targetAcc = gData.accounts.find(a => a.id === accountId);
       let userEmail = '';
 
       // Try 1: Parse ID Token JWT Payload (preferred_username)
@@ -864,47 +876,28 @@ app.post('/api/auth/microsoft/poll-device-token', async (req, res) => {
         } catch (e) {}
       }
 
-      if (!targetAcc && userEmail) {
-        targetAcc = gData.accounts.find(a => a.username.toLowerCase() === userEmail.toLowerCase());
-      }
-
-      if (targetAcc && !userEmail) {
-        userEmail = targetAcc.username;
+      const identity = validateOAuthIdentity(gData.accounts, targetAcc, userEmail);
+      if (!identity.ok) {
+        microsoftOAuthTransactions.delete(deviceCode);
+        return res.status(409).json({ success: false, status: 'failed', error: identity.reason });
       }
 
       const refreshToken = tokenData.refresh_token || '';
 
-      if (!targetAcc) {
-        targetAcc = {
-          id: 'acc_ms_' + Date.now(),
-          username: userEmail || 'outlook_account@outlook.com',
-          password: '',
-          note: refreshToken,
-          providerScopes: tokenData.scope || '',
-          provider: 'microsoft',
-          status: 'active',
-          lastChecked: new Date().toISOString(),
-          mailCount: 0,
-          createdAt: new Date().toISOString()
-        };
-        gData.accounts.unshift(targetAcc);
-      } else {
-        if (userEmail && !userEmail.includes('outlook_account')) {
-          targetAcc.username = userEmail;
-        }
-        targetAcc.status = 'active';
-        targetAcc.provider = 'microsoft';
-        targetAcc.note = refreshToken;
-        targetAcc.providerScopes = tokenData.scope || targetAcc.providerScopes || '';
-        targetAcc.lastChecked = new Date().toISOString();
-      }
+      targetAcc.username = identity.identity;
+      targetAcc.status = 'active';
+      targetAcc.note = refreshToken;
+      targetAcc.providerScopes = tokenData.scope || targetAcc.providerScopes || '';
+      targetAcc.lastChecked = new Date().toISOString();
 
+      microsoftOAuthTransactions.delete(deviceCode);
       saveDataToDisk();
       res.json({ success: true, status: 'completed', account: publicAccount(targetAcc) });
     } else {
       if (tokenData.error === 'authorization_pending') {
         res.json({ success: true, status: 'pending' });
       } else {
+        microsoftOAuthTransactions.delete(deviceCode);
         res.json({ success: false, status: 'failed', error: tokenData.error_description || tokenData.error });
       }
     }
@@ -916,10 +909,12 @@ app.post('/api/auth/microsoft/poll-device-token', async (req, res) => {
 // --- GOOGLE OAUTH BROWSER FLOW ---
 
 app.get('/api/auth/google/url', (req, res) => {
+  pruneOAuthTransactions();
   if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) return res.status(503).json({ success: false, message: '未配置 GOOGLE_CLIENT_ID 或 GOOGLE_CLIENT_SECRET，无法发起 Google OAuth。' });
   const accountId = String(req.query.id || '');
   const account = gData.accounts.find(item => item.id === accountId);
   if (!account) return res.status(404).json({ success: false, message: '账号不存在' });
+  if (account.provider !== 'google') return res.status(400).json({ success: false, message: '该账号未选择 Google OAuth 连接器。' });
   const state = crypto.randomBytes(24).toString('base64url');
   const verifier = crypto.randomBytes(48).toString('base64url');
   const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
@@ -970,7 +965,7 @@ app.get('/auth/google/callback', async (req, res) => {
     const tokenData = await tokenResp.json();
 
     if (tokenResp.ok && (tokenData.access_token || tokenData.refresh_token)) {
-      let userEmail = 'gmail_account@gmail.com';
+      let userEmail = '';
       try {
         const userResp = await smartProxyFetch('https://www.googleapis.com/oauth2/v2/userinfo', {
           headers: { 'Authorization': `Bearer ${tokenData.access_token}` }
@@ -979,32 +974,20 @@ app.get('/auth/google/callback', async (req, res) => {
         if (userData.email) userEmail = userData.email;
       } catch (e) {}
 
-      let targetAcc = gData.accounts.find(a => a.id === transaction.accountId);
-
-      const refreshToken = tokenData.refresh_token || (targetAcc ? parseCredentials(targetAcc).refreshToken : '');
-
-      if (!targetAcc) {
-        targetAcc = {
-          id: 'acc_gmail_' + Date.now(),
-          username: userEmail,
-          password: '',
-          note: refreshToken,
-          providerScopes: tokenData.scope || '',
-          provider: 'google',
-          status: 'active',
-          lastChecked: new Date().toISOString(),
-          mailCount: 0,
-          createdAt: new Date().toISOString()
-        };
-        gData.accounts.unshift(targetAcc);
-      } else {
-        targetAcc.username = userEmail;
-        targetAcc.status = 'active';
-        targetAcc.provider = 'google';
-        targetAcc.note = refreshToken;
-        targetAcc.providerScopes = tokenData.scope || targetAcc.providerScopes || '';
-        targetAcc.lastChecked = new Date().toISOString();
+      const targetAcc = gData.accounts.find(a => a.id === transaction.accountId);
+      if (!targetAcc || targetAcc.provider !== 'google') {
+        return res.status(409).send('原 Google 账户已不存在或服务商已变更，请回到 InboxHarbor 重新添加并授权。');
       }
+
+      const identity = validateOAuthIdentity(gData.accounts, targetAcc, userEmail);
+      if (!identity.ok) return res.status(409).send(escapeHtml(identity.reason));
+
+      const refreshToken = tokenData.refresh_token || parseCredentials(targetAcc).refreshToken;
+      targetAcc.username = identity.identity;
+      targetAcc.status = 'active';
+      targetAcc.note = refreshToken;
+      targetAcc.providerScopes = tokenData.scope || targetAcc.providerScopes || '';
+      targetAcc.lastChecked = new Date().toISOString();
 
       saveDataToDisk();
 
@@ -1183,84 +1166,25 @@ app.get('/api/export-ms-txt', (req, res) => {
 
 // Import Accounts Endpoint with Smart Upsert (Updates existing accounts if username matches)
 app.post('/api/accounts/import', (req, res) => {
-  const { text } = req.body;
-  if (!text) return res.status(400).json({ success: false, message: '内容不能为空' });
-
-  const imported = parseImportText(text);
-  let addedCount = 0;
-  let updatedCount = 0;
-
-  for (let acc of imported) {
-    const existingIndex = gData.accounts.findIndex(a => a.username.toLowerCase() === acc.username.toLowerCase());
-    if (existingIndex >= 0) {
-      gData.accounts[existingIndex].lastChecked = new Date().toISOString();
-      updatedCount++;
-    } else {
-      gData.accounts.unshift(acc);
-      addedCount++;
-    }
-  }
-
-  saveDataToDisk();
-  res.json({ success: true, addedCount, updatedCount, total: gData.accounts.length });
+  res.status(410).json({ success: false, message: '旧导入接口已停用，请在邮箱账户页批量添加，并明确选择 Google 或 Microsoft。' });
 });
 
-app.post('/api/accounts/add-outlook-tool', (req, res) => {
-  const { username } = req.body;
-  const email = username ? (username.includes('@') ? username : username + '@outlook.com') : `user_${Math.floor(1000 + Math.random() * 9000)}@outlook.com`;
+app.post('/api/accounts/add-outlook-tool', (req, res) => res.status(410).json({ success: false, message: '旧添加接口已停用，请使用 /api/accounts/add 并明确选择 Microsoft。' }));
 
-  let exists = gData.accounts.find(a => a.username.toLowerCase() === email.toLowerCase());
-
-  if (!exists) {
-    exists = {
-      id: 'acc_ms_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6),
-      username: email,
-      password: '',
-      note: '',
-      provider: 'microsoft',
-      status: 'pending',
-      lastChecked: new Date().toISOString(),
-      mailCount: 0,
-      readEnabled: true,
-      sendEnabled: false,
-      createdAt: new Date().toISOString()
-    };
-    gData.accounts.unshift(exists);
-    saveDataToDisk();
-  }
-
-  res.json({ success: true, account: publicAccount(exists), total: gData.accounts.length });
+app.post('/api/accounts/add', (req, res) => {
+  const username = String(req.body.username || '').trim().toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(username)) return res.status(400).json({ success: false, message: '请输入有效邮箱地址' });
+  const existing = gData.accounts.find(item => item.username.toLowerCase() === username);
+  if (existing) return res.json({ success: true, account: publicAccount(existing), existing: true });
+  const requestedProvider = String(req.body.provider || '');
+  const provider = requestedProvider ? normalizeProvider(requestedProvider, username) : detectProvider(username);
+  if (!supportsOAuth(provider)) return res.status(400).json({ success: false, message: '当前版本仅支持 Google 与 Microsoft 邮箱。' });
+  const account = { id: `acc_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`, username, provider, status: 'pending', readEnabled: true, sendEnabled: false, mailCount: 0, lastChecked: new Date().toISOString(), createdAt: new Date().toISOString(), password: '', note: '' };
+  gData.accounts.unshift(account); saveDataToDisk();
+  res.json({ success: true, account: publicAccount(account) });
 });
 
-app.post('/api/accounts/add-gmail-tool', (req, res) => {
-  const { username, isMock } = req.body;
-  const email = username ? (username.includes('@') ? username : username + '@gmail.com') : `user_${Math.floor(1000 + Math.random() * 9000)}@gmail.com`;
-
-  const exists = gData.accounts.find(a => a.username.toLowerCase() === email.toLowerCase());
-
-  if (exists) {
-    return res.status(400).json({ success: false, message: '该 Gmail 账号已存在' });
-  }
-
-  const newAcc = {
-    id: 'acc_gmail_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6),
-    username: email,
-    password: '',
-    note: '',
-    provider: 'google',
-    status: isMock ? 'active' : 'pending',
-    isMock: !!isMock,
-    lastChecked: new Date().toISOString(),
-    mailCount: 0,
-    readEnabled: true,
-    sendEnabled: false,
-    createdAt: new Date().toISOString()
-  };
-
-  gData.accounts.unshift(newAcc);
-  saveDataToDisk();
-  res.json({ success: true, account: publicAccount(newAcc), total: gData.accounts.length });
-});
+app.post('/api/accounts/add-gmail-tool', (req, res) => res.status(410).json({ success: false, message: '旧添加接口已停用，请使用 /api/accounts/add 并明确选择 Google。' }));
 
 app.post('/api/accounts/update-password', (req, res) => {
   res.status(410).json({ success: false, message: 'InboxHarbor 不保存邮箱密码，请使用 OAuth 授权。' });
@@ -1290,6 +1214,9 @@ app.post('/api/accounts/check-status', async (req, res) => {
   let checkedCount = 0;
 
   for (let acc of targetAccounts) {
+    if (!supportsOAuth(acc.provider)) {
+      acc.status = 'unsupported'; acc.errorDetail = '该服务商连接器暂未接入'; acc.lastChecked = now; checkedCount++; continue;
+    }
     let result;
     if (acc.provider === 'google') {
       result = await verifyGoogleAccount(acc);
@@ -1310,6 +1237,9 @@ app.post('/api/accounts/check-status', async (req, res) => {
 // Single Mail Fetcher Core Logic (Strict TOP 10 recent messages)
 async function processSingleAccountFetch(acc, dataStore) {
   if (acc.readEnabled === false) return [];
+  if (!supportsOAuth(acc.provider)) {
+    acc.status = 'unsupported'; acc.errorDetail = '该服务商连接器暂未接入'; acc.lastChecked = new Date().toISOString(); return [];
+  }
   let verify = acc.provider === 'google' ? await verifyGoogleAccount(acc) : await verifyMicrosoftAccount(acc);
   acc.status = verify.status;
   acc.errorDetail = verify.error;
@@ -1378,6 +1308,8 @@ app.post('/api/accounts/send-test-mail', async (req, res) => {
   if (!senderAcc) {
     return res.status(400).json({ success: false, message: '未找到可用的账号' });
   }
+
+  if (!supportsOAuth(senderAcc.provider)) return res.status(400).json({ success: false, message: '该服务商连接器暂未接入，当前不能发信。' });
 
   if (senderAcc.sendEnabled !== true) {
     return res.status(403).json({ success: false, message: '该账户未开启发信权限，请先开启并重新完成 OAuth 授权。' });
