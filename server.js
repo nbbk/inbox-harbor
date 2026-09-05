@@ -2029,7 +2029,39 @@ app.post("/api/mails/send", async (req, res) => {
       success: false,
       message: `邮件服务返回 HTTP ${response.status}`,
     });
-  res.json({ success: true, message: "邮件已发送" });
+  const sentMail = {
+    id: `sent_${crypto.randomUUID()}`,
+    direction: "sent",
+    account: account.username,
+    provider: account.provider,
+    sender: account.username,
+    recipient,
+    subject: mailSubject,
+    content: mailBody,
+    preview: mailBody.slice(0, 220),
+    code: "未发现验证码",
+    codeType: "",
+    links: [],
+    receivedAt: new Date().toISOString(),
+  };
+  gData.mails = sortMailsNewestFirst([sentMail, ...gData.mails]).slice(0, 200);
+  saveDataToDisk();
+  res.json({ success: true, message: "邮件已发送", mail: publicMail(sentMail) });
+});
+
+app.delete("/api/mails/:id", (req, res) => {
+  const id = String(req.params.id || "");
+  const index = gData.mails.findIndex((mail) => mail.id === id);
+  if (index < 0)
+    return res.status(404).json({ success: false, message: "邮件不存在或已删除" });
+  const [removed] = gData.mails.splice(index, 1);
+  const cleared = new Set(gData.clearedMailIds || []);
+  cleared.add(id);
+  const fingerprint = getMailFingerprint(removed);
+  if (fingerprint) cleared.add(fingerprint);
+  gData.clearedMailIds = [...cleared];
+  saveDataToDisk();
+  res.json({ success: true, message: "邮件已从本地归档删除" });
 });
 
 app.post("/api/mails/clear", (req, res) => {

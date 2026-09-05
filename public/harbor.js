@@ -163,7 +163,16 @@
     return s;
   }
 
-  const mailCategories = ["全部", "验证码", "通知", "账单", "社交", "推广", "其他"];
+  const mailCategories = [
+    "全部",
+    "已发送",
+    "验证码",
+    "通知",
+    "账单",
+    "社交",
+    "推广",
+    "其他",
+  ];
 
   function formatMailTime(value) {
     const date = new Date(value);
@@ -240,7 +249,13 @@
       );
       const top = element("span", "ih-mail-row-top");
       top.append(
-        element("b", "", mail.sender || "未知发件人"),
+        element(
+          "b",
+          "",
+          mail.direction === "sent"
+            ? `发送至 ${mail.recipient || "未知收件人"}`
+            : mail.sender || "未知发件人",
+        ),
         element("time", "", formatMailTime(mail.receivedAt)),
       );
       const subject = element("strong", "", mail.subject || "无主题");
@@ -273,12 +288,31 @@
       return;
     }
     const tag = element("span", `ih-mail-tag ih-mail-tag-${mail.category}`, mail.category || "其他");
+    const readerTop = element("div", "ih-reader-top");
     const title = element("h2", "", mail.subject || "无主题");
+    const remove = element("button", "ih-button ih-button-danger", "删除邮件");
+    remove.onclick = () => deleteMail(mail);
+    readerTop.append(tag, remove);
     const meta = element("div", "ih-reader-meta");
     const sender = element("div");
-    sender.append(element("b", "", mail.sender || "未知发件人"), element("span", "", `发送至 ${mail.account || "未知账户"}`));
+    sender.append(
+      element(
+        "b",
+        "",
+        mail.direction === "sent"
+          ? mail.account || "未知发件账户"
+          : mail.sender || "未知发件人",
+      ),
+      element(
+        "span",
+        "",
+        mail.direction === "sent"
+          ? `发送至 ${mail.recipient || "未知收件人"}`
+          : `发送至 ${mail.account || "未知账户"}`,
+      ),
+    );
     meta.append(sender, element("time", "", formatMailTime(mail.receivedAt)));
-    reader.append(tag, title, meta);
+    reader.append(readerTop, title, meta);
     if (mail.code && mail.code !== "未发现验证码") {
       const codeBox = element("div", "ih-code-box");
       const copy = element("button", "ih-button ih-button-quiet", "复制验证码");
@@ -291,6 +325,20 @@
     }
     const body = element("div", "ih-mail-body", mail.content || "无正文内容");
     reader.append(body);
+  }
+
+  async function deleteMail(mail) {
+    if (!confirm(`确定从本地归档删除“${mail.subject || "无主题"}”吗？`)) return;
+    try {
+      await request(`/api/mails/${encodeURIComponent(mail.id)}`, {
+        method: "DELETE",
+      });
+      mailState.mails = mailState.mails.filter((item) => item.id !== mail.id);
+      mailState.selectedId = "";
+      renderMailCenter();
+    } catch (error) {
+      alert(error.message);
+    }
   }
 
   function openCompose() {
@@ -338,6 +386,12 @@
           method: "POST",
           body: JSON.stringify(Object.fromEntries(values)),
         });
+        if (result.mail) {
+          mailState.mails = [result.mail, ...mailState.mails];
+          mailState.category = "已发送";
+          mailState.selectedId = result.mail.id;
+          renderMailCenter();
+        }
         close();
         alert(result.message || "邮件已发送");
       } catch (error) {

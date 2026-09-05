@@ -493,10 +493,19 @@ body.dark-theme {
 .ih-mail-tag-账单 { background: #fff4df; color: #8b641e; }
 .ih-mail-tag-社交 { background: #f0eef9; color: #5d5185; }
 .ih-mail-tag-推广 { background: #f9eeee; color: #895151; }
+.ih-mail-tag-已发送 { background: #edf3fb; color: #365f87; }
 .ih-mail-reader {
   min-width: 0;
+  max-height: 720px;
   padding: clamp(24px, 3vw, 42px);
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+.ih-reader-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
 }
 .ih-mail-reader h2 {
   margin: 14px 0 20px;
@@ -564,7 +573,7 @@ body.dark-theme {
   .ih-mail-tools { grid-template-columns: 1fr; }
   .ih-mail-workspace { display: block; min-height: 0; overflow: visible; }
   .ih-mail-list { max-height: 440px; border-right: 0; border-bottom: 1px solid #dfe8ec; }
-  .ih-mail-reader { min-height: 420px; padding: 24px 18px; }
+  .ih-mail-reader { min-height: 420px; max-height: 620px; padding: 24px 18px; }
   .ih-code-box { grid-template-columns: 1fr; align-items: stretch; }
   .ih-code-box button { grid-column: 1; grid-row: 3; margin-top: 10px; }
   .ih-code-box strong { font-size: 27px; }

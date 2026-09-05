@@ -315,6 +315,7 @@ test("mail center filters, reads verification codes, and sends composed mail", a
   page,
 }) => {
   const sent = [];
+  const deleted = [];
   const accounts = [
     {
       id: "sender-google",
@@ -350,6 +351,17 @@ test("mail center filters, reads verification codes, and sends composed mail", a
       code: "未发现验证码",
       receivedAt: "2026-09-04T08:00:00.000Z",
     },
+    {
+      id: "bill-1",
+      account: "owner@gmail.com",
+      sender: "billing@example.com",
+      subject: "Invoice #397528",
+      content: "Amount Due: ¥96.51\nDue Date: 2026-09-21",
+      preview: "Amount Due: ¥96.51",
+      category: "账单",
+      code: "397528",
+      receivedAt: "2026-09-03T08:00:00.000Z",
+    },
   ];
   await page.route("**/api/accounts", (route) =>
     route.fulfill({ json: { success: true, accounts } }),
@@ -367,7 +379,30 @@ test("mail center filters, reads verification codes, and sends composed mail", a
       return;
     }
     sent.push(body);
-    await route.fulfill({ json: { success: true, message: "邮件已发送" } });
+    await route.fulfill({
+      json: {
+        success: true,
+        message: "邮件已发送",
+        mail: {
+          id: "sent-1",
+          direction: "sent",
+          account: "owner@gmail.com",
+          recipient: body.to,
+          sender: "owner@gmail.com",
+          subject: body.subject,
+          content: body.body,
+          preview: body.body,
+          category: "已发送",
+          code: "未发现验证码",
+          receivedAt: "2026-09-06T08:00:00.000Z",
+        },
+      },
+    });
+  });
+  await page.route("**/api/mails/*", async (route) => {
+    if (route.request().method() !== "DELETE") return route.fallback();
+    deleted.push(route.request().url());
+    await route.fulfill({ json: { success: true, message: "邮件已从本地归档删除" } });
   });
   page.on("dialog", (dialog) => dialog.accept());
   await page.setViewportSize({ width: 1440, height: 960 });
@@ -404,6 +439,16 @@ test("mail center filters, reads verification codes, and sends composed mail", a
     to: "friend@example.com",
     subject: "测试主题",
   });
+  await expect(page.getByRole("button", { name: "已发送 1" })).toHaveClass(/active/);
+  await expect(page.locator("#ih-mail-reader")).toContainText("发送至 friend@example.com");
+  await expect(page.locator(".ih-mail-reader")).toHaveCSS("overflow-y", "auto");
+  await page.screenshot({
+    path: "../qa/inboxharbor-mail-center-sent-desktop.png",
+    fullPage: true,
+  });
+  await page.getByRole("button", { name: "删除邮件" }).click();
+  await expect.poll(() => deleted.length).toBe(1);
+  await expect(page.getByRole("button", { name: "已发送 0" })).toBeVisible();
   await page.screenshot({
     path: "../qa/inboxharbor-mail-center-desktop.png",
     fullPage: true,
