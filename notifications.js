@@ -19,9 +19,20 @@ function publicConfig(config = {}) {
     configured: Object.fromEntries(Object.entries(channel.config || {}).map(([key, value]) => [key, Boolean(value)]))
   })) };
 }
+function escapeHtml(value) {
+  return String(value || '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
+}
 function messageFor(mail = {}) {
-  const body = mail.content || mail.preview || '';
-  return { title: mail.subject || 'InboxHarbor 测试通知', content: `账户：${mail.account || 'demo@inboxharbor.local'}\n发件人：${mail.sender || 'InboxHarbor'}\n\n${body || '这是一条来自 InboxHarbor 的测试通知。'}` };
+  const title = mail.subject || 'InboxHarbor 测试通知';
+  const account = mail.account || 'demo@inboxharbor.local';
+  const sender = mail.sender || 'InboxHarbor';
+  const summary = mail.preview || mail.content || '这是一条来自 InboxHarbor 的测试通知。';
+  const receivedAt = mail.receivedAt ? new Date(mail.receivedAt).toLocaleString('zh-CN') : '刚刚';
+  const appUrl = mail.appUrl || process.env.PUBLIC_BASE_URL || '';
+  const openLink = appUrl ? `<a href="${escapeHtml(appUrl)}" style="display:inline-block;padding:10px 16px;border-radius:8px;background:#147ea8;color:#fff;text-decoration:none">打开邮件中心</a>` : '<span style="color:#6b7b87">请打开 InboxHarbor 查看完整邮件</span>';
+  const content = `【新邮件】\n发件人：${sender}\n账户：${account}\n时间：${receivedAt}\n主题：${title}\n摘要：${summary}\n\n${appUrl ? `查看完整邮件：${appUrl}` : '请打开 InboxHarbor 查看完整邮件'}`;
+  const html = `<div style="margin:0;background:#f4f8fa;padding:28px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;color:#17324d"><div style="max-width:640px;margin:0 auto;background:#fff;border:1px solid #dbe7ec;border-radius:14px;overflow:hidden"><div style="padding:22px 24px;border-bottom:1px solid #e7eef1"><div style="font-size:13px;color:#147ea8;font-weight:700">InboxHarbor · 新邮件提醒</div><h1 style="margin:10px 0 0;font-size:22px;line-height:1.35">${escapeHtml(title)}</h1></div><div style="padding:20px 24px"><div style="font-size:14px;line-height:1.8;color:#526879"><b style="color:#17324d">${escapeHtml(sender)}</b><br>发送至 ${escapeHtml(account)}<br>${escapeHtml(receivedAt)}</div><div style="margin-top:18px;padding:16px;background:#f5fafb;border-radius:10px;white-space:pre-wrap;line-height:1.7">${escapeHtml(summary)}</div><div style="margin-top:22px">${openLink}</div></div></div></div>`;
+  return { title, content, html };
 }
 async function postJson(url, payload, headers = {}) {
   const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(payload), signal: AbortSignal.timeout(10000) });
@@ -57,14 +68,14 @@ async function send(channel, message) {
       const smtp = validateEmailConfig(c); let nodemailer;
       try { nodemailer = require('nodemailer'); } catch { throw new Error('未安装 nodemailer；请执行 npm install。'); }
       const transporter = nodemailer.createTransport({ host: smtp.host, port: smtp.port, secure: smtp.secure, auth: smtp.auth });
-      return transporter.sendMail({ from: smtp.from, to: smtp.to, subject: message.title, text: message.content });
+      return transporter.sendMail({ from: smtp.from, to: smtp.to, subject: message.title, text: message.content, html: message.html });
     }
     case 'webhook': { let extra = {}; try { extra = c.headers ? JSON.parse(c.headers) : {}; } catch { throw new Error('Headers JSON 格式不正确'); } return postJson(c.url, { title: message.title, content: message.content, source: 'InboxHarbor' }, extra); }
     default: throw new Error('未知通知渠道');
   }
 }
 async function sendAll(config, mail) {
-  const message = messageFor(config.includeFullBody === false ? { ...mail, content: mail.preview } : mail);
+  const message = messageFor(mail);
   return Promise.allSettled((config.channels || []).filter(c => c.enabled).map(c => send(c, message)));
 }
 module.exports = { CHANNELS, publicConfig, send, sendAll, messageFor, dingtalkSignedUrl, validateEmailConfig };
