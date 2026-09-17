@@ -147,10 +147,19 @@
   function overview() {
     const s = element("section", "ih-page active");
     s.id = "ih-overview";
-    s.innerHTML = `<div class="ih-mail-head"><div><h1>邮件中心</h1><p>聚合查看所有账户的重要邮件与验证码。</p></div><div class="ih-mail-head-actions"><span id="ih-mail-summary">0 封邮件</span><button id="ih-compose" class="ih-button">写邮件</button></div></div>
+    s.innerHTML = `<div class="ih-mail-head"><div><h1>邮件中心</h1><p>聚合查看所有账户的重要邮件与验证码。</p></div><div class="ih-mail-head-actions"><span id="ih-mail-summary">0 封邮件</span><button id="ih-mail-refresh" class="ih-button ih-button-quiet">刷新列表</button><button id="ih-compose" class="ih-button">写邮件</button></div></div>
       <div class="ih-mail-categories" id="ih-mail-categories" aria-label="邮件分类"></div>
       <div class="ih-mail-tools"><label class="ih-mail-search"><span>搜索</span><input id="ih-mail-search" placeholder="搜索主题、发件人或正文"></label><label><span>邮箱账户</span><select id="ih-mail-account"><option value="全部">全部账户</option></select></label></div>
       <div class="ih-mail-workspace"><div class="ih-mail-list" id="ih-mail-list"></div><article class="ih-mail-reader" id="ih-mail-reader"><div class="ih-mail-empty"><b>选择一封邮件</b><span>正文会在这里清晰呈现。</span></div></article></div>`;
+    s.querySelector("#ih-mail-refresh").onclick = async () => {
+      const button = s.querySelector("#ih-mail-refresh");
+      button.disabled = true; button.textContent = "刷新中…";
+      try {
+        const [accounts, mails] = await Promise.all([request("/api/accounts"), request("/api/mails")]);
+        renderMailCenter(mails.mails || [], accounts.accounts || []);
+      } catch (error) { alert(error.message); }
+      finally { button.disabled = false; button.textContent = "刷新列表"; }
+    };
     s.querySelector("#ih-compose").onclick = openCompose;
     s.querySelector("#ih-mail-search").oninput = (event) => {
       mailState.query = event.target.value.trim().toLowerCase();
@@ -188,6 +197,7 @@
 
   function visibleMails() {
     return mailState.mails.filter((mail) => {
+      if (mailState.category === "全部" && mail.direction === "sent") return false;
       if (mailState.category !== "全部" && mail.category !== mailState.category)
         return false;
       if (mailState.account !== "全部" && mail.account !== mailState.account)
@@ -209,7 +219,7 @@
     mailCategories.forEach((category) => {
       const count =
         category === "全部"
-          ? mailState.mails.length
+          ? mailState.mails.filter((mail) => mail.direction !== "sent").length
           : mailState.mails.filter((mail) => mail.category === category).length;
       const button = element(
         "button",
@@ -970,6 +980,14 @@
         a.lastChecked ? new Date(a.lastChecked).toLocaleString() : "尚未检查",
       );
       const actions = element("div", "ih-account-actions");
+      const fetchButton = element("button", "ih-button ih-button-quiet", "取件");
+      fetchButton.type = "button";
+      fetchButton.onclick = async () => {
+        fetchButton.disabled = true; fetchButton.textContent = "取件中…";
+        try { await request("/api/accounts/fetch-mail", { method: "POST", body: JSON.stringify({ ids: [a.id] }) }); await load(); }
+        catch (error) { alert(error.message); }
+        finally { fetchButton.disabled = false; fetchButton.textContent = "取件"; }
+      };
       const auth = element("button", "ih-button", "授权");
       auth.type = "button";
       auth.onclick = async () => {
@@ -998,6 +1016,7 @@
           alert(error.message);
         }
       };
+      actions.append(fetchButton);
       if (isSupported) actions.append(auth);
       actions.append(del);
       row.append(identity, provider, state, permissions, checked, actions);

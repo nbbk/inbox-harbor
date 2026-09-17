@@ -2087,8 +2087,7 @@ setInterval(async () => {
   const notificationEnabled = (gData.notificationConfig.channels || []).some(
     (c) => c.enabled,
   );
-  if ((!gData.tgConfig || !gData.tgConfig.enabled) && !notificationEnabled)
-    return;
+  // Poll mailboxes continuously so the mail center stays current even when notifications are disabled.
 
   isPolling = true;
   try {
