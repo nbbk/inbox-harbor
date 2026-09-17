@@ -60,6 +60,14 @@ app.use("/api", (req, res, next) => {
     return next();
   res.status(401).json({ success: false, message: "请输入本机访问口令" });
 });
+app.get("/shared/mail/:id", (req, res) => {
+  const mail = gData.mails.find((item) => item.id === req.params.id);
+  const expected = crypto.createHmac("sha256", ADMIN_TOKEN).update(req.params.id).digest("hex");
+  const supplied = String(req.query.token || "");
+  if (!mail || supplied.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(expected))) return res.status(404).send("共享邮件不存在或链接已失效");
+  const safe = publicMail(mail);
+  res.send("<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>" + escapeHtml(safe.subject || "邮件") + "</title><body style=\"margin:0;background:#f4f8fa;padding:24px;font-family:Arial;color:#17324d\"><main style=\"max-width:760px;margin:auto;background:#fff;border:1px solid #dbe7ec;border-radius:14px;padding:28px\"><div style=\"color:#147ea8;font-weight:700\">InboxHarbor · 共享邮件</div><h1>" + escapeHtml(safe.subject || "无主题") + "</h1><p><b>" + escapeHtml(safe.sender || "未知发件人") + "</b><br>所属账户：" + escapeHtml(safe.account || "未知账户") + "<br>接收时间：" + escapeHtml(safe.receivedAt || "") + "</p><hr><h3>邮件正文</h3><div style=\"white-space:pre-wrap;line-height:1.8\">" + escapeHtml(safe.content) + "</div></main></body>");
+});
 app.use(express.static(path.join(__dirname, "public")));
 
 const DATA_FILE = path.join(DATA_DIR, "data.json");
@@ -149,7 +157,7 @@ async function pushConfiguredNotifications(mails) {
           ),
         }
       : gData.notificationConfig;
-    const results = await sendAll(config, { ...mail, appUrl: PUBLIC_BASE_URL });
+    const results = await sendAll(config, { ...mail, appUrl: PUBLIC_BASE_URL + "/shared/mail/" + encodeURIComponent(mail.id) + "?token=" + crypto.createHmac("sha256", ADMIN_TOKEN).update(mail.id).digest("hex") });
     results.forEach((result, index) => {
       if (result.status === "rejected")
         console.warn(
