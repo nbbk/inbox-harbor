@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const { cleanMailText } = require('./mail-utils');
 const CHANNELS = {
   telegram: { name: 'Telegram Bot', icon: '✈', fields: [{ key: 'token', label: 'Bot Token', placeholder: '123456:AA...'}, { key: 'chatId', label: 'Chat ID', placeholder: '-1001234567890'}], guide: '在 @BotFather 创建机器人，将 Token 粘贴至此；把机器人加入目标聊天后填写 Chat ID。' },
   bark: { name: 'Bark (iOS)', icon: '●', fields: [{ key: 'deviceKey', label: 'Device Key', placeholder: 'YOUR_BARK_DEVICE_KEY' }, { key: 'serverUrl', label: '自定义服务器（可选）', placeholder: 'https://api.day.app' }], guide: '打开 Bark iOS 应用，复制 Device Key。官方服务默认使用 https://api.day.app。' },
@@ -26,11 +27,11 @@ function messageFor(mail = {}) {
   const title = mail.subject || 'InboxHarbor 测试通知';
   const account = mail.account || 'demo@inboxharbor.local';
   const sender = mail.sender || 'InboxHarbor';
-  const summary = mail.preview || mail.content || '这是一条来自 InboxHarbor 的测试通知。';
+  const summary = cleanMailText(mail.preview || mail.content || '这是一条来自 InboxHarbor 的测试通知。');
   const receivedAt = mail.receivedAt ? new Date(mail.receivedAt).toLocaleString('zh-CN') : '刚刚';
   const appUrl = mail.appUrl || process.env.PUBLIC_BASE_URL || '';
   const openLink = appUrl ? `<a href="${escapeHtml(appUrl)}" style="display:inline-block;padding:10px 16px;border-radius:8px;background:#147ea8;color:#fff;text-decoration:none">打开邮件中心</a>` : '<span style="color:#6b7b87">请打开 InboxHarbor 查看完整邮件</span>';
-  const body = mail.content || summary;
+  const body = cleanMailText(mail.content || summary);
   const content = `【新邮件】\n发件人：${sender}\n账户：${account}\n时间：${receivedAt}\n主题：${title}\n摘要：${summary}\n\n【邮件正文】\n${body}\n\n【查看入口】\n${appUrl ? appUrl : '请打开 InboxHarbor 查看完整邮件'}`;
   const html = `<div style="margin:0;background:#f4f8fa;padding:28px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;color:#17324d"><div style="max-width:640px;margin:0 auto;background:#fff;border:1px solid #dbe7ec;border-radius:14px;overflow:hidden"><div style="padding:22px 24px;border-bottom:1px solid #e7eef1"><div style="font-size:13px;color:#147ea8;font-weight:700">InboxHarbor · 新邮件提醒</div><h1 style="margin:10px 0 0;font-size:22px;line-height:1.35">${escapeHtml(title)}</h1></div><div style="padding:20px 24px"><div style="font-size:14px;line-height:1.8;color:#526879"><b style="color:#17324d">${escapeHtml(sender)}</b><br>发送至 ${escapeHtml(account)}<br>${escapeHtml(receivedAt)}</div><div style="margin-top:18px;padding:16px;background:#f5fafb;border-radius:10px;white-space:pre-wrap;line-height:1.7">${escapeHtml(summary)}</div><div style="margin-top:18px;padding:16px;border:1px solid #e7eef1;border-radius:10px;white-space:pre-wrap;line-height:1.7"><b>邮件正文</b><br>${escapeHtml(body)}</div><div style="margin-top:22px">${openLink}</div></div></div></div>`;
   return { title, content, html };

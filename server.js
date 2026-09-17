@@ -149,7 +149,7 @@ async function pushConfiguredNotifications(mails) {
           ),
         }
       : gData.notificationConfig;
-    const results = await sendAll(config, mail);
+    const results = await sendAll(config, { ...mail, appUrl: PUBLIC_BASE_URL });
     results.forEach((result, index) => {
       if (result.status === "rejected")
         console.warn(
