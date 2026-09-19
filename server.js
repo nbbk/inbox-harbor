@@ -37,6 +37,13 @@ const {
   queryMails,
   sortMailsNewestFirst,
 } = require("./mail-utils");
+const {
+  clearGmailBootstrap,
+  fetchGmailIncremental,
+  fetchMicrosoftDelta,
+  getPendingGmailBootstrap,
+  stageGmailBootstrap,
+} = require("./mail-sync");
 
 const app = express();
 const PORT = process.env.PORT || 5555;
@@ -826,54 +833,48 @@ function extractCodeAndLinks(subject, bodyText, rawContent) {
 async function fetchMicrosoftMails(acc, accessToken) {
   const mails = [];
   try {
-    const resp = await fetch(
-      "https://graph.microsoft.com/v1.0/me/messages?$top=25&$select=id,subject,body,bodyPreview,from,toRecipients,ccRecipients,receivedDateTime,hasAttachments,isRead,importance",
-      {
-        headers: { Authorization: `Bearer ${accessToken}` },
-      },
-    );
+    const result = await fetchMicrosoftDelta({
+      accessToken,
+      cursor: acc.syncCursor,
+      fetchImpl: fetch,
+      bootstrap:
+        acc.syncBootstrap === true ||
+        !acc.syncCursor ||
+        (acc.syncBootstrap === undefined && !String(acc.syncCursor).includes("$deltatoken")),
+    });
+    for (const item of result.messages) {
+      const rawContent = item.body?.content || "";
+      const cleanBody = cleanMailText(rawContent);
+      const cleanSubject = decodeMimeHeader(item.subject || "无主题");
+      const cleanSender = decodeMimeHeader(
+        item.from?.emailAddress?.address || "System",
+      );
+      const extracted = extractCodeAndLinks(cleanSubject, cleanBody, rawContent);
 
-    if (!resp.ok) throw new Error(`Microsoft 邮件接口返回 HTTP ${resp.status}`);
-    if (resp.ok) {
-      const data = await resp.json();
-      for (let item of data.value || []) {
-        const rawContent = item.body?.content || "";
-        const cleanBody = cleanMailText(rawContent);
-        const cleanSubject = decodeMimeHeader(item.subject || "无主题");
-        const cleanSender = decodeMimeHeader(
-          item.from?.emailAddress?.address || "System",
-        );
-        const extracted = extractCodeAndLinks(
-          cleanSubject,
-          cleanBody,
-          rawContent,
-        );
-
-        mails.push({
-          id: "mail_" + item.id,
-          account: acc.username,
-          provider: "microsoft",
-          sender: cleanSender,
-          recipient: (item.toRecipients || []).map((entry) => entry.emailAddress?.address).filter(Boolean).join(", "),
-          cc: (item.ccRecipients || []).map((entry) => entry.emailAddress?.address).filter(Boolean),
-          subject: cleanSubject,
-          content: cleanBody || "无正文内容",
-          preview: item.bodyPreview || cleanBody.substr(0, 100),
-          code: extracted.code,
-          codeType: extracted.codeType,
-          links: extracted.links,
-          hasAttachments: item.hasAttachments === true,
-          attachments: [],
-          isRead: item.isRead === true,
-          importance: item.importance || "normal",
-          receivedAt: item.receivedDateTime || new Date().toISOString(),
-        });
-      }
+      mails.push({
+        id: "mail_" + item.id,
+        account: acc.username,
+        provider: "microsoft",
+        sender: cleanSender,
+        recipient: (item.toRecipients || []).map((entry) => entry.emailAddress?.address).filter(Boolean).join(", "),
+        cc: (item.ccRecipients || []).map((entry) => entry.emailAddress?.address).filter(Boolean),
+        subject: cleanSubject,
+        content: cleanBody || "无正文内容",
+        preview: item.bodyPreview || cleanBody.substr(0, 100),
+        code: extracted.code,
+        codeType: extracted.codeType,
+        links: extracted.links,
+        hasAttachments: item.hasAttachments === true,
+        attachments: [],
+        isRead: item.isRead === true,
+        importance: item.importance || "normal",
+        receivedAt: item.receivedDateTime || new Date().toISOString(),
+      });
     }
+    return { mails, cursor: result.cursor, bootstrap: result.bootstrap, complete: result.complete };
   } catch (error) {
     throw new Error(`Microsoft 取件失败：${error.message}`);
   }
-  return mails;
 }
 
 async function fetchGoogleMails(acc, accessToken) {
@@ -886,49 +887,58 @@ async function fetchGoogleMails(acc, accessToken) {
       mockLink,
     );
 
-    return [
-      {
-        id: "mail_gmail_mock_" + Date.now(),
-        account: acc.username,
-        provider: "google",
-        sender: "no-reply@accounts.google.com",
-        subject: "【Google 验证码】您的登录验证码是 " + mockCode,
-        content: `您好！正在登录 Google 账号。\n您的验证码为：${mockCode}\n请点击下方安全验证链接确认：\n${mockLink}`,
-        preview: `您的 Gmail 安全验证码为: ${mockCode}`,
-        code: extracted.code,
-        codeType: extracted.codeType,
-        links: extracted.links,
-        receivedAt: new Date().toISOString(),
-      },
-    ];
+    return {
+      mails: [
+        {
+          id: "mail_gmail_mock_" + Date.now(),
+          account: acc.username,
+          provider: "google",
+          sender: "no-reply@accounts.google.com",
+          subject: "【Google 验证码】您的登录验证码是 " + mockCode,
+          content: `您好！正在登录 Google 账号。\n您的验证码为：${mockCode}\n请点击下方安全验证链接确认：\n${mockLink}`,
+          preview: `您的 Gmail 安全验证码为: ${mockCode}`,
+          code: extracted.code,
+          codeType: extracted.codeType,
+          links: extracted.links,
+          receivedAt: new Date().toISOString(),
+        },
+      ],
+      cursor: acc.syncCursor || null,
+    };
   }
 
   if (accessToken) {
     const mails = [];
     try {
-      const queryUrl =
-        "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=15&q=" +
-        encodeURIComponent("in:inbox OR in:spam");
-      const listResp = await smartProxyFetch(queryUrl, {
-        headers: { Authorization: `Bearer ${accessToken}` },
-      });
-      if (!listResp || !listResp.ok)
-        throw new Error(`Gmail 邮件接口返回 HTTP ${listResp?.status || "网络错误"}`);
-
-      if (listResp && listResp.ok) {
-        const listData = await listResp.json();
-        for (let msg of listData.messages || []) {
-          const detailResp = await smartProxyFetch(
+      const pendingBootstrap = getPendingGmailBootstrap(acc);
+      const incremental = pendingBootstrap
+        ? pendingBootstrap
+        : await fetchGmailIncremental({
+            accessToken,
+            cursor: acc.syncCursor,
+            fetchImpl: smartProxyFetch,
+          });
+      if (!pendingBootstrap && stageGmailBootstrap(acc, incremental)) {
+        // Persist the fixed baseline and work list before requesting details. If a
+        // detail call fails, the next run replays exactly this batch instead of
+        // taking a newer baseline that could permanently skip an older message.
+        saveDataToDisk();
+      }
+      for (const msg of incremental.messageIds.map((id) => ({ id }))) {
+        const detailResp = await smartProxyFetch(
             `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`,
             {
               headers: { Authorization: `Bearer ${accessToken}` },
             },
-          );
-          if (!detailResp || !detailResp.ok)
-            throw new Error(`Gmail 邮件详情接口返回 HTTP ${detailResp?.status || "网络错误"}`);
+        );
+        if (detailResp?.status === 404) continue;
+        if (!detailResp || !detailResp.ok)
+          throw new Error(`Gmail 邮件详情接口返回 HTTP ${detailResp?.status || "网络错误"}`);
 
           if (detailResp && detailResp.ok) {
             const item = await detailResp.json();
+            const labelIds = item.labelIds || [];
+            if (!labelIds.includes("INBOX") && !labelIds.includes("SPAM")) continue;
             const headers = item.payload?.headers || [];
             const rawSubject =
               headers.find((h) => h.name.toLowerCase() === "subject")?.value ||
@@ -949,7 +959,7 @@ async function fetchGoogleMails(acc, accessToken) {
             const cleanSubject = decodeMimeHeader(rawSubject) || "无主题";
             const cleanSender = decodeMimeHeader(rawFrom) || "Google System";
 
-            const isSpam = item.labelIds && item.labelIds.includes("SPAM");
+            const isSpam = labelIds.includes("SPAM");
             const prefix = isSpam ? "【垃圾箱】" : "";
 
             // Run extractCodeAndLinks on full body content + subject + snippet
@@ -980,19 +990,23 @@ async function fetchGoogleMails(acc, accessToken) {
               links: extracted.links,
               hasAttachments: (item.payload?.parts || []).some((part) => Boolean(part.filename)),
               attachments: (item.payload?.parts || []).filter((part) => part.filename).map((part) => ({ name: part.filename, mimeType: part.mimeType || "application/octet-stream", size: part.body?.size || 0 })),
-              isRead: !(item.labelIds || []).includes("UNREAD"),
+              isRead: !labelIds.includes("UNREAD"),
               receivedAt: validTime,
             });
           }
-        }
       }
-      return mails;
+      return {
+        mails,
+        cursor: incremental.cursor,
+        bootstrap: incremental.bootstrap,
+        clearBootstrapPending: incremental.bootstrap === true,
+      };
     } catch (error) {
       throw new Error(`Google 取件失败：${error.message}`);
     }
   }
 
-  return [];
+  return { mails: [], cursor: acc.syncCursor || null };
 }
 
 async function sendMicrosoftMail(accessToken, targetEmail, testCode, testLink) {
@@ -1892,7 +1906,7 @@ app.post("/api/accounts/check-status", async (req, res) => {
   });
 });
 
-// Single Mail Fetcher Core Logic (Strict TOP 10 recent messages)
+// Single-account incremental fetcher core; accountSyncFlights supplies the single-flight lock.
 async function processSingleAccountFetchCore(acc, dataStore) {
   if (acc.readEnabled === false || acc.syncEnabled === false) return [];
   acc.syncStatus = "syncing";
@@ -1916,21 +1930,20 @@ async function processSingleAccountFetchCore(acc, dataStore) {
   const newMails = [];
   if (verify.status === "active") {
     try {
-    let fetched =
+    const fetchResult =
       acc.provider === "google"
         ? await fetchGoogleMails(acc, verify.accessToken)
         : await fetchMicrosoftMails(acc, verify.accessToken);
+    const fetched = fetchResult.mails;
 
     fetched.sort((a, b) => new Date(b.receivedAt) - new Date(a.receivedAt));
-    const top10 = fetched.slice(0, 10);
-
     const existingIds = new Set(dataStore.mails.map((m) => m.id));
     const existingFps = new Set(
       dataStore.mails.map((m) => getMailFingerprint(m)),
     );
     const clearedSet = new Set(dataStore.clearedMailIds || []);
 
-    for (let m of top10) {
+    for (let m of fetched) {
       const fp = getMailFingerprint(m);
       if (
         !existingIds.has(m.id) &&
@@ -1939,7 +1952,7 @@ async function processSingleAccountFetchCore(acc, dataStore) {
         !clearedSet.has(fp)
       ) {
         dataStore.mails.unshift(m);
-        newMails.push(m);
+        if (!fetchResult.bootstrap) newMails.push(m);
         existingIds.add(m.id);
         existingFps.add(fp);
       }
@@ -1952,7 +1965,11 @@ async function processSingleAccountFetchCore(acc, dataStore) {
       acc.syncStatus = "idle";
       acc.syncFailures = 0;
       acc.lastSyncAt = new Date().toISOString();
-      acc.syncCursor = fetched[0]?.id || acc.syncCursor || null;
+      acc.syncCursor = fetchResult.cursor || acc.syncCursor || null;
+      acc.syncBootstrap = fetchResult.bootstrap === true && fetchResult.complete !== true;
+      if (fetchResult.clearBootstrapPending === true) {
+        clearGmailBootstrap(acc);
+      }
     } catch (error) {
       acc.syncStatus = "failed";
       acc.syncFailures = (acc.syncFailures || 0) + 1;
