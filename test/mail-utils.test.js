@@ -6,6 +6,7 @@ const {
   getGmailBody,
   isNakedCssBlock,
   publicMail,
+  queryMails,
   sortMailsNewestFirst,
 } = require("../mail-utils");
 
@@ -111,4 +112,30 @@ test("mail ordering is newest first with a stable id tie-breaker", () => {
     sorted.map((mail) => mail.id),
     ["a", "c", "b"],
   );
+});
+
+test("manual category and sender rules override automatic classification", () => {
+  const rules = [
+    { type: "domain", value: "example.com", category: "推广", createdAt: "2026-01-01" },
+    { type: "sender", value: "billing@example.com", category: "账单", createdAt: "2026-01-02" },
+  ];
+  assert.equal(classifyMail({ sender: "Billing <billing@example.com>", subject: "Hello" }, rules), "账单");
+  assert.equal(classifyMail({ sender: "news@example.com", subject: "Hello" }, rules), "推广");
+  assert.equal(classifyMail({ sender: "news@example.com", categoryOverride: "社交" }, rules), "社交");
+});
+
+test("mail query supports advanced filters and pagination", () => {
+  const mails = [
+    { id: "3", account: "a@gmail.com", sender: "Billing <pay@example.com>", recipient: "a@gmail.com", subject: "Invoice", code: "未发现验证码", receivedAt: "2026-09-03T08:00:00Z" },
+    { id: "2", account: "a@gmail.com", sender: "login@example.net", recipient: "a@gmail.com", subject: "Login code", content: "verification code", code: "123456", receivedAt: "2026-09-02T08:00:00Z" },
+    { id: "1", direction: "sent", account: "a@gmail.com", sender: "a@gmail.com", recipient: "friend@example.org", subject: "Hello", receivedAt: "2026-09-01T08:00:00Z" },
+  ];
+  const filtered = queryMails(mails, { account: "gmail", hasCode: "true", direction: "received" });
+  assert.deepEqual(filtered.mails.map((mail) => mail.id), ["2"]);
+  assert.equal(filtered.pagination.total, 1);
+  const paged = queryMails(mails, { q: "example", page: "2", pageSize: "1" });
+  assert.deepEqual(paged.mails.map((mail) => mail.id), ["2"]);
+  assert.deepEqual(paged.pagination, { page: 2, pageSize: 1, total: 3, totalPages: 3 });
+  assert.deepEqual(queryMails(mails, { from: "pay@", category: "账单", dateFrom: "2026-09-03" }).mails.map((mail) => mail.id), ["3"]);
+  assert.deepEqual(queryMails(mails, { to: "friend", direction: "sent", dateTo: "2026-09-01T23:59:59Z" }).mails.map((mail) => mail.id), ["1"]);
 });

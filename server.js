@@ -11,6 +11,10 @@ const {
   send,
   sendAll,
   messageFor,
+  createShareToken,
+  verifyShareToken,
+  notificationDeliveryKey,
+  clearOAuthSecrets,
 } = require("./notifications");
 const { Storage } = require("./storage");
 const { loadOrCreateAdminToken } = require("./instance-config");
@@ -28,7 +32,9 @@ const {
 const {
   cleanMailText,
   getGmailBody,
+  MAIL_CATEGORIES,
   publicMail,
+  queryMails,
   sortMailsNewestFirst,
 } = require("./mail-utils");
 
@@ -62,9 +68,7 @@ app.use("/api", (req, res, next) => {
 });
 app.get("/shared/mail/:id", (req, res) => {
   const mail = gData.mails.find((item) => item.id === req.params.id);
-  const expected = crypto.createHmac("sha256", ADMIN_TOKEN).update(req.params.id).digest("hex");
-  const supplied = String(req.query.token || "");
-  if (!mail || supplied.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(expected))) return res.status(404).send("共享邮件不存在或链接已失效");
+  if (!mail || !verifyShareToken(ADMIN_TOKEN, req.params.id, req.query.expires, req.query.token)) return res.status(404).send("共享邮件不存在或链接已失效");
   const safe = publicMail(mail);
   res.send("<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>" + escapeHtml(safe.subject || "邮件") + "</title><body style=\"margin:0;background:#f4f8fa;padding:24px;font-family:Arial;color:#17324d\"><main style=\"max-width:760px;margin:auto;background:#fff;border:1px solid #dbe7ec;border-radius:14px;padding:28px\"><div style=\"color:#147ea8;font-weight:700\">InboxHarbor · 共享邮件</div><h1>" + escapeHtml(safe.subject || "无主题") + "</h1><p><b>" + escapeHtml(safe.sender || "未知发件人") + "</b><br>所属账户：" + escapeHtml(safe.account || "未知账户") + "<br>接收时间：" + escapeHtml(safe.receivedAt || "") + "</p><hr><h3>邮件正文</h3><div style=\"white-space:pre-wrap;line-height:1.8\">" + escapeHtml(safe.content) + "</div></main></body>");
 });
@@ -106,6 +110,7 @@ function publicConnectorConfig() {
 const globalPushedFingerprints = new Set();
 const googleOAuthTransactions = new Map();
 const microsoftOAuthTransactions = new Map();
+const accountSyncFlights = new Map();
 
 function pruneOAuthTransactions(now = Date.now()) {
   for (const [key, transaction] of googleOAuthTransactions) {
@@ -135,15 +140,27 @@ let gData = {
     enabled: false,
     autoPollInterval: 5,
   },
-  notificationConfig: { includeFullBody: true, channels: [] },
+  notificationConfig: { includeFullBody: false, shareLinkDays: 30, channels: [] },
+  notificationDeliveries: [],
   connectorConfig: {},
   pushedMailIds: [],
   clearedMailIds: [], // Track cleared mail IDs and fingerprints so they NEVER reappear!
+  classificationRules: [],
 };
 
 async function pushConfiguredNotifications(mails) {
-  if (!Array.isArray(mails) || mails.length === 0) return;
-  for (const mail of mails) {
+  const now = Date.now();
+  const deliveries = Array.isArray(gData.notificationDeliveries)
+    ? gData.notificationDeliveries
+    : (gData.notificationDeliveries = []);
+  const mailById = new Map((gData.mails || []).map((mail) => [mail.id, mail]));
+  for (const mail of mails || []) if (mail?.id) mailById.set(mail.id, mail);
+  const dueMailIds = deliveries
+    .filter((item) => item.status === "failed" && item.attempts < 3 && Number(item.nextRetryAt || 0) <= now)
+    .map((item) => item.mailId);
+  const candidates = [...new Map([...(mails || []).map((mail) => [mail.id, mail]), ...dueMailIds.map((id) => [id, mailById.get(id)])]).values()].filter(Boolean);
+  if (candidates.length === 0) return;
+  for (const mail of candidates) {
     // Telegram's legacy settings are kept only for migration. A new Telegram
     // channel owns delivery once configured, avoiding a double send.
     const hasNewTelegram = (gData.notificationConfig.channels || []).some(
@@ -157,13 +174,34 @@ async function pushConfiguredNotifications(mails) {
           ),
         }
       : gData.notificationConfig;
-    const results = await sendAll(config, { ...mail, appUrl: PUBLIC_BASE_URL + "/shared/mail/" + encodeURIComponent(mail.id) + "?token=" + crypto.createHmac("sha256", ADMIN_TOKEN).update(mail.id).digest("hex") });
-    results.forEach((result, index) => {
-      if (result.status === "rejected")
-        console.warn(
-          `Notification channel ${index + 1} failed: ${result.reason?.message || result.reason}`,
-        );
-    });
+    const shareLinkDays = Math.min(365, Math.max(1, Number(gData.notificationConfig.shareLinkDays) || 30));
+    const expires = now + shareLinkDays * 24 * 60 * 60 * 1000;
+    const appUrl = PUBLIC_BASE_URL + "/shared/mail/" + encodeURIComponent(mail.id) + "?expires=" + expires + "&token=" + createShareToken(ADMIN_TOKEN, mail.id, expires);
+    const message = messageFor({ ...mail, appUrl });
+    for (const channel of (config.channels || []).filter((item) => item.enabled)) {
+      const key = notificationDeliveryKey(mail.id, channel);
+      let delivery = deliveries.find((item) => item.key === key);
+      if (delivery?.status === "delivered" || (delivery?.status === "failed" && (delivery.attempts >= 3 || Number(delivery.nextRetryAt || 0) > now))) continue;
+      if (!delivery) {
+        delivery = { key, mailId: mail.id, channelId: channel.id || null, channelType: channel.type, status: "pending", attempts: 0 };
+        deliveries.push(delivery);
+      }
+      delivery.attempts += 1;
+      delivery.lastAttemptAt = new Date(now).toISOString();
+      try {
+        await send(channel, message);
+        delivery.status = "delivered";
+        delivery.deliveredAt = new Date().toISOString();
+        delivery.error = null;
+        delivery.nextRetryAt = null;
+      } catch (error) {
+        delivery.status = "failed";
+        delivery.error = String(error?.message || error);
+        delivery.nextRetryAt = now + Math.min(15 * 60 * 1000, 30 * 1000 * 2 ** (delivery.attempts - 1));
+        console.warn(`Notification channel ${channel.type} failed: ${delivery.error}`);
+      }
+      saveDataToDisk();
+    }
   }
 }
 
@@ -175,11 +213,17 @@ function loadDataFromDisk() {
     if (parsed.tgConfig) gData.tgConfig = parsed.tgConfig;
     if (parsed.notificationConfig)
       gData.notificationConfig = parsed.notificationConfig;
+    gData.notificationDeliveries = Array.isArray(parsed.notificationDeliveries)
+      ? parsed.notificationDeliveries
+      : [];
     if (parsed.connectorConfig) gData.connectorConfig = parsed.connectorConfig;
     applyConnectorConfig();
     gData.tgConfig.autoPollInterval = 1;
     gData.pushedMailIds = parsed.pushedMailIds || [];
     gData.clearedMailIds = parsed.clearedMailIds || [];
+    gData.classificationRules = Array.isArray(parsed.classificationRules)
+      ? parsed.classificationRules
+      : [];
 
     gData.pushedMailIds.forEach((id) => globalPushedFingerprints.add(id));
     gData.clearedMailIds.forEach((id) => globalPushedFingerprints.add(id));
@@ -188,6 +232,14 @@ function loadDataFromDisk() {
       acc.provider = normalizeProvider(acc.provider, acc.username);
       acc.readEnabled = acc.readEnabled !== false;
       acc.sendEnabled = acc.sendEnabled === true;
+      acc.syncStatus = acc.syncStatus || (acc.status === "active" ? "idle" : "pending");
+      acc.syncCursor = acc.syncCursor || null;
+      acc.lastSyncAt = acc.lastSyncAt || null;
+      acc.lastSyncError = acc.lastSyncError || null;
+      acc.syncFailures = Number.isInteger(acc.syncFailures) ? acc.syncFailures : 0;
+      acc.syncEnabled = acc.syncEnabled !== false;
+      acc.pollIntervalSeconds = Math.max(30, Number(acc.pollIntervalSeconds) || 60);
+      acc.nextSyncAt = acc.nextSyncAt || null;
     });
     return gData;
   } catch (err) {
@@ -775,12 +827,13 @@ async function fetchMicrosoftMails(acc, accessToken) {
   const mails = [];
   try {
     const resp = await fetch(
-      "https://graph.microsoft.com/v1.0/me/messages?$top=10&$select=subject,body,bodyPreview,from,receivedDateTime",
+      "https://graph.microsoft.com/v1.0/me/messages?$top=25&$select=id,subject,body,bodyPreview,from,toRecipients,ccRecipients,receivedDateTime,hasAttachments,isRead,importance",
       {
         headers: { Authorization: `Bearer ${accessToken}` },
       },
     );
 
+    if (!resp.ok) throw new Error(`Microsoft 邮件接口返回 HTTP ${resp.status}`);
     if (resp.ok) {
       const data = await resp.json();
       for (let item of data.value || []) {
@@ -801,17 +854,25 @@ async function fetchMicrosoftMails(acc, accessToken) {
           account: acc.username,
           provider: "microsoft",
           sender: cleanSender,
+          recipient: (item.toRecipients || []).map((entry) => entry.emailAddress?.address).filter(Boolean).join(", "),
+          cc: (item.ccRecipients || []).map((entry) => entry.emailAddress?.address).filter(Boolean),
           subject: cleanSubject,
           content: cleanBody || "无正文内容",
           preview: item.bodyPreview || cleanBody.substr(0, 100),
           code: extracted.code,
           codeType: extracted.codeType,
           links: extracted.links,
+          hasAttachments: item.hasAttachments === true,
+          attachments: [],
+          isRead: item.isRead === true,
+          importance: item.importance || "normal",
           receivedAt: item.receivedDateTime || new Date().toISOString(),
         });
       }
     }
-  } catch (e) {}
+  } catch (error) {
+    throw new Error(`Microsoft 取件失败：${error.message}`);
+  }
   return mails;
 }
 
@@ -851,6 +912,8 @@ async function fetchGoogleMails(acc, accessToken) {
       const listResp = await smartProxyFetch(queryUrl, {
         headers: { Authorization: `Bearer ${accessToken}` },
       });
+      if (!listResp || !listResp.ok)
+        throw new Error(`Gmail 邮件接口返回 HTTP ${listResp?.status || "网络错误"}`);
 
       if (listResp && listResp.ok) {
         const listData = await listResp.json();
@@ -861,6 +924,8 @@ async function fetchGoogleMails(acc, accessToken) {
               headers: { Authorization: `Bearer ${accessToken}` },
             },
           );
+          if (!detailResp || !detailResp.ok)
+            throw new Error(`Gmail 邮件详情接口返回 HTTP ${detailResp?.status || "网络错误"}`);
 
           if (detailResp && detailResp.ok) {
             const item = await detailResp.json();
@@ -870,6 +935,8 @@ async function fetchGoogleMails(acc, accessToken) {
               "";
             const rawFrom =
               headers.find((h) => h.name.toLowerCase() === "from")?.value || "";
+            const rawTo = headers.find((h) => h.name.toLowerCase() === "to")?.value || "";
+            const rawCc = headers.find((h) => h.name.toLowerCase() === "cc")?.value || "";
             const dateHeader = headers.find(
               (h) => h.name.toLowerCase() === "date",
             );
@@ -903,20 +970,25 @@ async function fetchGoogleMails(acc, accessToken) {
               account: acc.username,
               provider: "google",
               sender: cleanSender,
+              recipient: decodeMimeHeader(rawTo),
+              cc: decodeMimeHeader(rawCc).split(",").map((value) => value.trim()).filter(Boolean),
               subject: prefix + cleanSubject,
               content: cleanBody || snippet || "无正文内容",
               preview: snippet.substr(0, 100),
               code: extracted.code,
               codeType: extracted.codeType,
               links: extracted.links,
+              hasAttachments: (item.payload?.parts || []).some((part) => Boolean(part.filename)),
+              attachments: (item.payload?.parts || []).filter((part) => part.filename).map((part) => ({ name: part.filename, mimeType: part.mimeType || "application/octet-stream", size: part.body?.size || 0 })),
+              isRead: !(item.labelIds || []).includes("UNREAD"),
               receivedAt: validTime,
             });
           }
         }
       }
       return mails;
-    } catch (e) {
-      // Silent auto-recovery
+    } catch (error) {
+      throw new Error(`Google 取件失败：${error.message}`);
     }
   }
 
@@ -1143,7 +1215,7 @@ app.post("/api/auth/microsoft/poll-device-token", async (req, res) => {
             userEmail = payload.preferred_username;
           else if (payload.email) userEmail = payload.email;
           else if (payload.upn) userEmail = payload.upn;
-        } catch (e) {}
+        } catch {}
       }
 
       // Try 2: Fetch /v1.0/me API
@@ -1465,6 +1537,14 @@ app.put("/api/accounts/:id/permissions", (req, res) => {
     account.readEnabled = req.body.readEnabled;
   if (typeof req.body.sendEnabled === "boolean")
     account.sendEnabled = req.body.sendEnabled;
+  if (typeof req.body.syncEnabled === "boolean")
+    account.syncEnabled = req.body.syncEnabled;
+  if (req.body.pollIntervalSeconds !== undefined) {
+    const interval = Number(req.body.pollIntervalSeconds);
+    if (!Number.isFinite(interval) || interval < 30 || interval > 3600)
+      return res.status(400).json({ success: false, message: "同步间隔必须为 30–3600 秒" });
+    account.pollIntervalSeconds = Math.round(interval);
+  }
   saveDataToDisk();
   res.json({
     success: true,
@@ -1554,7 +1634,8 @@ app.put("/api/v1/notifications", (req, res) => {
       };
     });
     gData.notificationConfig = {
-      includeFullBody: req.body.includeFullBody !== false,
+      includeFullBody: false,
+      shareLinkDays: Math.min(365, Math.max(1, Number(req.body.shareLinkDays) || 30)),
       channels,
     };
     saveDataToDisk();
@@ -1705,6 +1786,13 @@ app.post("/api/accounts/add", (req, res) => {
     status: "pending",
     readEnabled: true,
     sendEnabled: false,
+    syncEnabled: true,
+    syncStatus: "pending",
+    syncFailures: 0,
+    pollIntervalSeconds: 60,
+    nextSyncAt: null,
+    lastSyncAt: null,
+    lastSyncError: null,
     mailCount: 0,
     lastChecked: new Date().toISOString(),
     createdAt: new Date().toISOString(),
@@ -1732,6 +1820,7 @@ app.post("/api/accounts/update-password", (req, res) => {
 
 app.delete("/api/accounts/:id", (req, res) => {
   const { id } = req.params;
+  gData.accounts.filter((account) => account.id === id).forEach(clearOAuthSecrets);
   gData.accounts = gData.accounts.filter((a) => a.id !== id);
   saveDataToDisk();
   res.json({ success: true });
@@ -1741,6 +1830,7 @@ app.post("/api/accounts/batch-delete", (req, res) => {
   const { ids } = req.body;
   if (!Array.isArray(ids)) return res.status(400).json({ success: false });
 
+  gData.accounts.filter((account) => ids.includes(account.id)).forEach(clearOAuthSecrets);
   gData.accounts = gData.accounts.filter((a) => !ids.includes(a.id));
   saveDataToDisk();
   res.json({ success: true });
@@ -1787,12 +1877,16 @@ app.post("/api/accounts/check-status", async (req, res) => {
 });
 
 // Single Mail Fetcher Core Logic (Strict TOP 10 recent messages)
-async function processSingleAccountFetch(acc, dataStore) {
-  if (acc.readEnabled === false) return [];
+async function processSingleAccountFetchCore(acc, dataStore) {
+  if (acc.readEnabled === false || acc.syncEnabled === false) return [];
+  acc.syncStatus = "syncing";
+  acc.lastSyncError = null;
   if (!supportsOAuth(acc.provider)) {
     acc.status = "unsupported";
     acc.errorDetail = "该服务商连接器暂未接入";
     acc.lastChecked = new Date().toISOString();
+    acc.syncStatus = "failed";
+    acc.lastSyncError = acc.errorDetail;
     return [];
   }
   let verify =
@@ -1805,6 +1899,7 @@ async function processSingleAccountFetch(acc, dataStore) {
 
   const newMails = [];
   if (verify.status === "active") {
+    try {
     let fetched =
       acc.provider === "google"
         ? await fetchGoogleMails(acc, verify.accessToken)
@@ -1837,9 +1932,34 @@ async function processSingleAccountFetch(acc, dataStore) {
     if (dataStore.mails.length > 200) {
       dataStore.mails = dataStore.mails.slice(0, 200);
     }
-    acc.mailCount = (acc.mailCount || 0) + newMails.length;
+      acc.mailCount = (acc.mailCount || 0) + newMails.length;
+      acc.syncStatus = "idle";
+      acc.syncFailures = 0;
+      acc.lastSyncAt = new Date().toISOString();
+      acc.syncCursor = fetched[0]?.id || acc.syncCursor || null;
+    } catch (error) {
+      acc.syncStatus = "failed";
+      acc.syncFailures = (acc.syncFailures || 0) + 1;
+      acc.lastSyncError = error.message || "同步失败";
+    }
+  } else {
+    acc.syncStatus = "failed";
+    acc.syncFailures = (acc.syncFailures || 0) + 1;
+    acc.lastSyncError = verify.error || "授权无效";
   }
+  const baseDelay = Math.max(30, Number(acc.pollIntervalSeconds) || 60);
+  const delay = Math.min(3600, baseDelay * 2 ** Math.min(acc.syncFailures || 0, 6));
+  acc.nextSyncAt = new Date(Date.now() + delay * 1000).toISOString();
   return newMails;
+}
+
+function processSingleAccountFetch(acc, dataStore) {
+  if (accountSyncFlights.has(acc.id)) return accountSyncFlights.get(acc.id);
+  const flight = processSingleAccountFetchCore(acc, dataStore).finally(() => {
+    if (accountSyncFlights.get(acc.id) === flight) accountSyncFlights.delete(acc.id);
+  });
+  accountSyncFlights.set(acc.id, flight);
+  return flight;
 }
 
 app.post("/api/accounts/fetch-mail", async (req, res) => {
@@ -1952,8 +2072,81 @@ app.post("/api/accounts/send-test-mail", async (req, res) => {
 });
 
 app.get("/api/mails", (req, res) => {
-  const mails = sortMailsNewestFirst(gData.mails.map(publicMail));
-  res.json({ success: true, mails });
+  const result = queryMails(gData.mails, req.query, gData.classificationRules);
+  res.json({ success: true, ...result });
+});
+
+app.patch("/api/mails/:id/category", (req, res) => {
+  const mail = gData.mails.find((item) => item.id === req.params.id);
+  if (!mail)
+    return res.status(404).json({ success: false, message: "邮件不存在" });
+  const category = String(req.body?.category || "").trim();
+  if (category && !MAIL_CATEGORIES.includes(category))
+    return res.status(400).json({ success: false, message: "无效的邮件分类" });
+  if (category) mail.categoryOverride = category;
+  else delete mail.categoryOverride;
+  saveDataToDisk();
+  res.json({
+    success: true,
+    mail: publicMail(mail, gData.classificationRules),
+  });
+});
+
+app.patch("/api/mails/:id/state", (req, res) => {
+  const mail = gData.mails.find((item) => item.id === req.params.id);
+  if (!mail)
+    return res.status(404).json({ success: false, message: "邮件不存在" });
+  for (const field of ["isRead", "isStarred", "isPinned"]) {
+    if (typeof req.body?.[field] === "boolean") mail[field] = req.body[field];
+  }
+  saveDataToDisk();
+  res.json({ success: true, mail: publicMail(mail, gData.classificationRules) });
+});
+
+app.get("/api/classification-rules", (req, res) => {
+  res.json({ success: true, rules: gData.classificationRules || [] });
+});
+
+app.post("/api/classification-rules", (req, res) => {
+  const type = String(req.body?.type || "").trim().toLowerCase();
+  const value = String(req.body?.value || "").trim().toLowerCase().replace(/^@/, "");
+  const category = String(req.body?.category || "").trim();
+  if (!["sender", "domain"].includes(type) || !value || !MAIL_CATEGORIES.includes(category))
+    return res.status(400).json({ success: false, message: "请提供有效的规则类型、匹配值和分类" });
+  if (type === "sender" && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(value))
+    return res.status(400).json({ success: false, message: "发件人地址格式无效" });
+  if (type === "domain" && !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$/i.test(value))
+    return res.status(400).json({ success: false, message: "发件人域名格式无效" });
+  const existing = (gData.classificationRules || []).find(
+    (rule) => rule.type === type && String(rule.value).toLowerCase() === value,
+  );
+  if (existing) {
+    existing.category = category;
+    existing.createdAt = new Date().toISOString();
+    saveDataToDisk();
+    return res.json({ success: true, rule: existing });
+  }
+  const rule = {
+    id: crypto.randomUUID(),
+    type,
+    value,
+    category,
+    createdAt: new Date().toISOString(),
+  };
+  gData.classificationRules = [...(gData.classificationRules || []), rule];
+  saveDataToDisk();
+  res.status(201).json({ success: true, rule });
+});
+
+app.delete("/api/classification-rules/:id", (req, res) => {
+  const before = (gData.classificationRules || []).length;
+  gData.classificationRules = (gData.classificationRules || []).filter(
+    (rule) => rule.id !== req.params.id,
+  );
+  if (gData.classificationRules.length === before)
+    return res.status(404).json({ success: false, message: "分类规则不存在" });
+  saveDataToDisk();
+  res.json({ success: true });
 });
 
 app.post("/api/mails/send", async (req, res) => {
@@ -2099,8 +2292,12 @@ setInterval(async () => {
 
   isPolling = true;
   try {
+    const now = Date.now();
     const allAccounts = (gData.accounts || []).filter(
-      (acc) => acc.readEnabled !== false,
+      (acc) =>
+        acc.readEnabled !== false &&
+        acc.syncEnabled !== false &&
+        (!acc.nextSyncAt || new Date(acc.nextSyncAt).getTime() <= now),
     );
     if (allAccounts.length > 0) {
       // True full concurrency across all accounts simultaneously for sub-second scan!
@@ -2113,15 +2310,18 @@ setInterval(async () => {
 
       if (newMailsAll.length > 0) {
         await checkAndPushNewMailsToTelegram(newMailsAll);
-        await pushConfiguredNotifications(newMailsAll);
       }
+      await pushConfiguredNotifications(newMailsAll);
+    } else {
+      // Notification retries must not depend on a mailbox being due for sync.
+      await pushConfiguredNotifications([]);
     }
   } catch (err) {
     // Silent recovery
   } finally {
     isPolling = false;
   }
-}, 1000); // 1s ultra-fast real-time polling
+}, 5000);
 
 // Seed initial memory set from disk
 loadDataFromDisk();

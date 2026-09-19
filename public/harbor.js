@@ -2,7 +2,7 @@
   const root = document.getElementById("harbor-ui");
   let token = sessionStorage.getItem("inboxharbor-token") || "";
   let catalog = {};
-  let config = { includeFullBody: true, channels: [] };
+  let config = { includeFullBody: false, shareLinkDays: 30, channels: [] };
   let mailState = {
     mails: [],
     accounts: [],
@@ -10,6 +10,10 @@
     account: "全部",
     query: "",
     selectedId: "",
+    page: 1,
+    pageSize: 50,
+    pagination: { page: 1, pageSize: 50, total: 0, totalPages: 1 },
+    facets: {},
   };
   const esc = (value) => String(value || "");
   function request(url, opts = {}) {
@@ -150,24 +154,26 @@
     s.innerHTML = `<div class="ih-mail-head"><div><h1>邮件中心</h1><p>聚合查看所有账户的重要邮件与验证码。</p></div><div class="ih-mail-head-actions"><span id="ih-mail-summary">0 封邮件</span><button id="ih-mail-refresh" class="ih-button ih-button-quiet">刷新列表</button><button id="ih-compose" class="ih-button">写邮件</button></div></div>
       <div class="ih-mail-categories" id="ih-mail-categories" aria-label="邮件分类"></div>
       <div class="ih-mail-tools"><label class="ih-mail-search"><span>搜索</span><input id="ih-mail-search" placeholder="搜索主题、发件人或正文"></label><label><span>邮箱账户</span><select id="ih-mail-account"><option value="全部">全部账户</option></select></label></div>
-      <div class="ih-mail-workspace"><div class="ih-mail-list" id="ih-mail-list"></div><article class="ih-mail-reader" id="ih-mail-reader"><div class="ih-mail-empty"><b>选择一封邮件</b><span>正文会在这里清晰呈现。</span></div></article></div>`;
+      <div class="ih-mail-workspace"><div class="ih-mail-list" id="ih-mail-list"></div><article class="ih-mail-reader" id="ih-mail-reader"><div class="ih-mail-empty"><b>选择一封邮件</b><span>正文会在这里清晰呈现。</span></div></article></div><div class="ih-mail-pager" id="ih-mail-pager"></div>`;
     s.querySelector("#ih-mail-refresh").onclick = async () => {
       const button = s.querySelector("#ih-mail-refresh");
       button.disabled = true; button.textContent = "刷新中…";
       try {
-        const [accounts, mails] = await Promise.all([request("/api/accounts"), request("/api/mails")]);
-        renderMailCenter(mails.mails || [], accounts.accounts || []);
+        const accounts = await request("/api/accounts");
+        mailState.accounts = accounts.accounts || [];
+        await loadMailPage(mailState.page || 1);
       } catch (error) { alert(error.message); }
       finally { button.disabled = false; button.textContent = "刷新列表"; }
     };
     s.querySelector("#ih-compose").onclick = openCompose;
     s.querySelector("#ih-mail-search").oninput = (event) => {
       mailState.query = event.target.value.trim().toLowerCase();
-      renderMailCenter();
+      clearTimeout(mailState.searchTimer);
+      mailState.searchTimer = setTimeout(() => loadMailPage(1), 250);
     };
     s.querySelector("#ih-mail-account").onchange = (event) => {
       mailState.account = event.target.value;
-      renderMailCenter();
+      loadMailPage(1);
     };
     return s;
   }
@@ -217,10 +223,7 @@
     const categories = document.getElementById("ih-mail-categories");
     categories.replaceChildren();
     mailCategories.forEach((category) => {
-      const count =
-        category === "全部"
-          ? mailState.mails.filter((mail) => mail.direction !== "sent").length
-          : mailState.mails.filter((mail) => mail.category === category).length;
+      const count = mailState.facets[category] ?? (category === "全部" ? mailState.mails.filter((mail) => mail.direction !== "sent").length : mailState.mails.filter((mail) => mail.category === category).length);
       const button = element(
         "button",
         category === mailState.category ? "active" : "",
@@ -229,7 +232,7 @@
       button.onclick = () => {
         mailState.category = category;
         mailState.selectedId = "";
-        renderMailCenter();
+        loadMailPage(1);
       };
       categories.append(button);
     });
@@ -248,6 +251,7 @@
       empty.append(element("b", "", "没有符合条件的邮件"), element("span", "", "换个分类或搜索词试试。"));
       list.append(empty);
       renderMailReader(null);
+      renderMailPager();
       return;
     }
     if (!filtered.some((mail) => mail.id === mailState.selectedId))
@@ -285,6 +289,42 @@
       list.append(button);
     });
     renderMailReader(filtered.find((mail) => mail.id === mailState.selectedId));
+    renderMailPager();
+  }
+
+  function renderMailPager() {
+    const pager = document.getElementById("ih-mail-pager");
+    if (!pager) return;
+    pager.replaceChildren();
+    const { page = 1, total = 0, totalPages = 1 } = mailState.pagination || {};
+    const previous = element("button", "ih-button ih-button-quiet", "上一页");
+    const next = element("button", "ih-button ih-button-quiet", "下一页");
+    previous.disabled = page <= 1;
+    next.disabled = page >= totalPages;
+    previous.onclick = () => loadMailPage(page - 1);
+    next.onclick = () => loadMailPage(page + 1);
+    pager.append(previous, element("span", "", `第 ${page} / ${totalPages} 页 · 共 ${total} 封`), next);
+  }
+
+  async function loadMailPage(page) {
+    try {
+      const params = new URLSearchParams({ page: String(page), pageSize: String(mailState.pageSize) });
+      if (mailState.query) params.set("q", mailState.query);
+      if (mailState.account !== "全部") params.set("account", mailState.account);
+      if (mailState.category === "已发送") params.set("direction", "sent");
+      else {
+        params.set("direction", "received");
+        if (mailState.category !== "全部") params.set("category", mailState.category);
+      }
+      const result = await request(`/api/mails?${params}`);
+      mailState.page = result.pagination?.page || page;
+      mailState.pagination = result.pagination || mailState.pagination;
+      mailState.facets = result.facets || mailState.facets;
+      mailState.selectedId = "";
+      renderMailCenter(result.mails || []);
+    } catch (error) {
+      alert(error.message);
+    }
   }
 
   function renderMailReader(mail) {
@@ -300,9 +340,30 @@
     const tag = element("span", `ih-mail-tag ih-mail-tag-${mail.category}`, mail.category || "其他");
     const readerTop = element("div", "ih-reader-top");
     const title = element("h2", "", mail.subject || "无主题");
+    const actions = element("div", "ih-reader-actions");
+    const category = document.createElement("select");
+    category.setAttribute("aria-label", "修改邮件分类");
+    ["验证码", "通知", "账单", "社交", "推广", "其他"].forEach((value) =>
+      category.add(new Option(value, value)),
+    );
+    category.value = mail.category === "已发送" ? "其他" : mail.category;
+    category.disabled = mail.direction === "sent";
+    category.onchange = async () => {
+      const result = await request(`/api/mails/${encodeURIComponent(mail.id)}/category`, {
+        method: "PATCH",
+        body: JSON.stringify({ category: category.value }),
+      });
+      Object.assign(mail, result.mail);
+      renderMailCenter();
+    };
+    const star = element("button", "ih-button ih-button-quiet", mail.isStarred ? "取消收藏" : "收藏");
+    star.onclick = () => updateMailState(mail, { isStarred: !mail.isStarred });
+    const pin = element("button", "ih-button ih-button-quiet", mail.isPinned ? "取消置顶" : "置顶");
+    pin.onclick = () => updateMailState(mail, { isPinned: !mail.isPinned });
     const remove = element("button", "ih-button ih-button-danger", "删除邮件");
     remove.onclick = () => deleteMail(mail);
-    readerTop.append(tag, remove);
+    actions.append(category, star, pin, remove);
+    readerTop.append(tag, actions);
     const meta = element("div", "ih-reader-meta");
     const sender = element("div");
     sender.append(
@@ -323,6 +384,12 @@
     );
     meta.append(sender, element("time", "", formatMailTime(mail.receivedAt)));
     reader.append(readerTop, title, meta);
+    if (mail.recipient || (mail.cc && mail.cc.length)) {
+      const recipients = element("div", "ih-mail-recipients");
+      if (mail.recipient) recipients.append(element("span", "", `收件人：${mail.recipient}`));
+      if (mail.cc?.length) recipients.append(element("span", "", `抄送：${mail.cc.join(", ")}`));
+      reader.append(recipients);
+    }
     if (mail.code && mail.code !== "未发现验证码") {
       const codeBox = element("div", "ih-code-box");
       const copy = element("button", "ih-button ih-button-quiet", "复制验证码");
@@ -335,6 +402,29 @@
     }
     const body = element("div", "ih-mail-body", mail.content || "无正文内容");
     reader.append(body);
+    if (mail.hasAttachments) {
+      const attachments = element("div", "ih-attachments");
+      attachments.append(element("b", "", "附件"));
+      for (const item of mail.attachments || [])
+        attachments.append(element("span", "", `${item.name} · ${Math.ceil((item.size || 0) / 1024)} KB`));
+      if (!(mail.attachments || []).length)
+        attachments.append(element("span", "", "此邮件包含附件，当前版本仅展示附件信息。"));
+      reader.append(attachments);
+    }
+    if (!mail.isRead) updateMailState(mail, { isRead: true }, false);
+  }
+
+  async function updateMailState(mail, changes, rerender = true) {
+    try {
+      const result = await request(`/api/mails/${encodeURIComponent(mail.id)}/state`, {
+        method: "PATCH",
+        body: JSON.stringify(changes),
+      });
+      Object.assign(mail, result.mail);
+      if (rerender) renderMailCenter();
+    } catch (error) {
+      alert(error.message);
+    }
   }
 
   async function deleteMail(mail) {
@@ -344,6 +434,9 @@
         method: "DELETE",
       });
       mailState.mails = mailState.mails.filter((item) => item.id !== mail.id);
+      mailState.facets[mail.category] = Math.max(0, (mailState.facets[mail.category] || 1) - 1);
+      if (mail.direction !== "sent")
+        mailState.facets["全部"] = Math.max(0, (mailState.facets["全部"] || 1) - 1);
       mailState.selectedId = "";
       renderMailCenter();
     } catch (error) {
@@ -398,6 +491,7 @@
         });
         if (result.mail) {
           mailState.mails = [result.mail, ...mailState.mails];
+          mailState.facets["已发送"] = (mailState.facets["已发送"] || 0) + 1;
           mailState.category = "已发送";
           mailState.selectedId = result.mail.id;
           renderMailCenter();
@@ -427,7 +521,7 @@
     const s = element("section", "ih-page");
     s.id = "ih-notifications";
     s.innerHTML =
-      '<div class="ih-section-head"><div><p class="ih-eyebrow">FULL BODY DELIVERY</p><h2>通知渠道</h2></div><label>完整正文 <input id="ih-full" type="checkbox" checked></label></div><div class="ih-layout"><div><div class="ih-channels" id="ih-channel-list"></div><button id="ih-save" class="ih-button">保存通知设置</button></div><aside class="ih-card ih-guide" id="ih-channel-guide"><p class="ih-eyebrow">CONFIGURATION</p><h3>选择一个渠道</h3><p>Telegram、Bark、微信、钉钉和 Webhook 都在这里配置；凭据不会回显。</p></aside></div>';
+      '<div class="ih-section-head"><div><p class="ih-eyebrow">SUMMARY DELIVERY</p><h2>通知渠道</h2></div><label>查看链接有效期（天） <input id="ih-share-days" type="number" min="1" max="365" value="30"></label></div><div class="ih-layout"><div><div class="ih-channels" id="ih-channel-list"></div><button id="ih-save" class="ih-button">保存通知设置</button></div><aside class="ih-card ih-guide" id="ih-channel-guide"><p class="ih-eyebrow">CONFIGURATION</p><h3>选择一个渠道</h3><p>所有渠道只推送摘要与免登录只读链接；凭据不会回显。</p></aside></div>';
     return s;
   }
   function connectors() {
@@ -572,9 +666,11 @@
         request("/api/stats"),
         request("/api/accounts"),
         request("/api/v1/notifications").catch(() => null),
-        request("/api/mails"),
+        request("/api/mails?direction=received&page=1&pageSize=50"),
       ]);
       renderAccounts(accounts.accounts);
+      mailState.pagination = mails.pagination || mailState.pagination;
+      mailState.facets = mails.facets || mailState.facets;
       renderMailCenter(mails.mails || [], accounts.accounts || []);
       loadConnectors().catch(() => {});
       if (notices) {
@@ -730,8 +826,7 @@
       card.dataset.type = type;
       list.append(card);
     });
-    document.getElementById("ih-full").checked =
-      config.includeFullBody !== false;
+    document.getElementById("ih-share-days").value = config.shareLinkDays || 30;
     document.getElementById("ih-save").onclick = saveChannels;
   }
   async function saveChannels() {
@@ -749,7 +844,8 @@
       await request("/api/v1/notifications", {
         method: "PUT",
         body: JSON.stringify({
-          includeFullBody: document.getElementById("ih-full").checked,
+          includeFullBody: false,
+          shareLinkDays: Number(document.getElementById("ih-share-days").value) || 30,
           channels,
         }),
       });
@@ -970,6 +1066,7 @@
         permissions.append(
           createSwitch(a, "readEnabled", "读取"),
           createSwitch(a, "sendEnabled", "发信"),
+          createSwitch(a, "syncEnabled", "同步"),
         );
       } else {
         permissions.append(element("span", "ih-muted", "仅可清理"));
@@ -977,7 +1074,9 @@
       const checked = element(
         "div",
         "ih-last-checked",
-        a.lastChecked ? new Date(a.lastChecked).toLocaleString() : "尚未检查",
+        a.lastSyncAt
+          ? `${new Date(a.lastSyncAt).toLocaleString()} · ${a.syncStatus === "failed" ? "失败" : "正常"}`
+          : a.lastSyncError || "尚未同步",
       );
       const actions = element("div", "ih-account-actions");
       const fetchButton = element("button", "ih-button ih-button-quiet", "取件");

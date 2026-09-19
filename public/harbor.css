@@ -507,6 +507,8 @@ body.dark-theme {
   justify-content: space-between;
   gap: 14px;
 }
+.ih-reader-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.ih-reader-actions select { min-height: 38px; border: 1px solid #ccdce4; border-radius: 8px; background: #fff; padding: 0 10px; }
 .ih-mail-reader h2 {
   margin: 14px 0 20px;
   color: #10223b;
@@ -523,6 +525,8 @@ body.dark-theme {
 }
 .ih-reader-meta b { color: #18354a; font-size: 13px; }
 .ih-reader-meta span { color: #7b8d98; font-size: 12px; }
+.ih-mail-recipients { display: grid; gap: 4px; margin-top: 12px; color: #718692; font-size: 12px; }
+.ih-attachments { display: grid; gap: 8px; margin-top: 22px; padding: 16px; border: 1px solid #dce7ec; border-radius: 10px; background: #f8fbfc; color: #526a79; font-size: 12px; }
 .ih-code-box {
   display: grid;
   grid-template-columns: 1fr auto;
@@ -560,6 +564,7 @@ body.dark-theme {
 }
 .ih-mail-empty b { color: #385265; font-size: 14px; }
 .ih-mail-empty span { font-size: 12px; }
+.ih-mail-pager { display: flex; align-items: center; justify-content: center; gap: 14px; padding: 16px 0 0; color: #6c8190; font-size: 12px; }
 .ih-compose-dialog { width: min(620px, calc(100% - 28px)); }
 .ih-compose-card { width: 100%; }
 .ih-compose-card textarea { resize: vertical; line-height: 1.65; }

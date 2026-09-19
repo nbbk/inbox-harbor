@@ -25,7 +25,7 @@ test("desktop notification settings render and expose channel guidance", async (
   await expect(page.getByText("电子邮件（SMTP）")).toBeVisible();
   await page.locator(".ih-channel").filter({ hasText: "Bark (iOS)" }).click();
   await expect(page.locator("#ih-channel-guide")).toContainText("Device Key");
-  await expect(page.getByLabel("完整正文")).toBeChecked();
+  await expect(page.getByLabel("查看链接有效期（天）")).toHaveValue("30");
   await page.screenshot({
     path: "../qa/inboxharbor-desktop.png",
     fullPage: true,
@@ -366,8 +366,18 @@ test("mail center filters, reads verification codes, and sends composed mail", a
   await page.route("**/api/accounts", (route) =>
     route.fulfill({ json: { success: true, accounts } }),
   );
+  await page.route("**/api/mails?*", (route) => {
+    const url = new URL(route.request().url());
+    const category = url.searchParams.get("category");
+    const direction = url.searchParams.get("direction");
+    const filtered = mails.filter((mail) =>
+      (!category || mail.category === category) &&
+      (!direction || direction === "all" || (direction === "sent") === (mail.direction === "sent")),
+    );
+    return route.fulfill({ json: { success: true, mails: filtered, pagination: { page: 1, pageSize: 50, total: filtered.length, totalPages: 1 }, facets: { 全部: 3, 验证码: 1, 账单: 1, 推广: 1, 已发送: 0 } } });
+  });
   await page.route("**/api/mails", (route) =>
-    route.fulfill({ json: { success: true, mails } }),
+    route.fulfill({ json: { success: true, mails, pagination: { page: 1, pageSize: 50, total: mails.length, totalPages: 1 }, facets: { 全部: 3, 验证码: 1, 账单: 1, 推广: 1, 已发送: 0 } } }),
   );
   await page.route("**/api/mails/send", async (route) => {
     const body = route.request().postDataJSON();

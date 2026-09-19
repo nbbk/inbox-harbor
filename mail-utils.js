@@ -80,8 +80,41 @@ function cleanMailText(value) {
     .trim();
 }
 
-function classifyMail(mail = {}) {
+const MAIL_CATEGORIES = ["验证码", "通知", "账单", "社交", "推广", "其他"];
+
+function normalizeEmail(value) {
+  const text = String(value || "").trim().toLowerCase();
+  const angleMatch = text.match(/<([^<>\s]+@[^<>\s]+)>/);
+  if (angleMatch) return angleMatch[1];
+  const plainMatch = text.match(/[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+/i);
+  return plainMatch ? plainMatch[0].toLowerCase() : text;
+}
+
+function categoryFromRules(mail, rules = []) {
+  if (mail.direction === "sent") return "";
+  const sender = normalizeEmail(mail.sender);
+  const domain = sender.includes("@") ? sender.split("@").pop() : "";
+  const matches = [...rules]
+    .filter((rule) => rule && MAIL_CATEGORIES.includes(rule.category))
+    .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+  const exact = matches.find(
+    (rule) => rule.type === "sender" && normalizeEmail(rule.value) === sender,
+  );
+  if (exact) return exact.category;
+  const byDomain = matches.find(
+    (rule) =>
+      rule.type === "domain" &&
+      domain &&
+      String(rule.value || "").trim().toLowerCase().replace(/^@/, "") === domain,
+  );
+  return byDomain?.category || "";
+}
+
+function classifyMail(mail = {}, rules = []) {
   if (mail.direction === "sent") return "已发送";
+  if (MAIL_CATEGORIES.includes(mail.categoryOverride)) return mail.categoryOverride;
+  const ruleCategory = categoryFromRules(mail, rules);
+  if (ruleCategory) return ruleCategory;
   const text = `${mail.subject || ""} ${mail.sender || ""} ${mail.content || ""}`.toLowerCase();
   const subject = String(mail.subject || "").toLowerCase();
   if (/账单|发票|invoice|receipt|payment|付款|支付|扣款|续费|amount due|due date/.test(text))
@@ -105,13 +138,76 @@ function classifyMail(mail = {}) {
   return "其他";
 }
 
-function publicMail(mail) {
+function publicMail(mail, rules = []) {
   const content = cleanMailText(mail.content);
   return {
     ...mail,
     content: content || "无正文内容",
     preview: cleanMailText(mail.preview || content).slice(0, 220),
-    category: classifyMail({ ...mail, content }),
+    category: classifyMail({ ...mail, content }, rules),
+  };
+}
+
+function includesText(value, query) {
+  return String(value || "").toLowerCase().includes(query);
+}
+
+function queryMails(mails, query = {}, rules = []) {
+  const positiveInt = (value, fallback, max) => {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, max) : fallback;
+  };
+  const page = positiveInt(query.page, 1, Number.MAX_SAFE_INTEGER);
+  const pageSize = positiveInt(query.pageSize || query.limit, 50, 100);
+  const q = String(query.q || "").trim().toLowerCase();
+  const from = String(query.from || "").trim().toLowerCase();
+  const to = String(query.to || "").trim().toLowerCase();
+  const account = String(query.account || "").trim().toLowerCase();
+  const category = String(query.category || "").trim();
+  const direction = String(query.direction || "").trim().toLowerCase();
+  const dateFrom = query.dateFrom ? new Date(query.dateFrom) : null;
+  const dateTo = query.dateTo
+    ? new Date(
+        /^\d{4}-\d{2}-\d{2}$/.test(String(query.dateTo))
+          ? `${query.dateTo}T23:59:59.999`
+          : query.dateTo,
+      )
+    : null;
+  const hasCode = ["true", "1"].includes(String(query.hasCode).toLowerCase())
+    ? true
+    : ["false", "0"].includes(String(query.hasCode).toLowerCase())
+      ? false
+      : null;
+  const prepared = sortMailsNewestFirst(mails.map((mail) => publicMail(mail, rules))).sort(
+    (a, b) => Number(Boolean(b.isPinned)) - Number(Boolean(a.isPinned)),
+  );
+  const facets = { 全部: prepared.filter((mail) => mail.direction !== "sent").length };
+  for (const mail of prepared) facets[mail.category] = (facets[mail.category] || 0) + 1;
+  const normalizedDirection = ["inbox", "inbound"].includes(direction)
+    ? "received"
+    : direction;
+  const filtered = prepared.filter((mail) => {
+    const mailDirection = mail.direction === "sent" ? "sent" : "received";
+    const receivedAt = new Date(mail.receivedAt || 0);
+    const mailHasCode = Boolean(mail.code && mail.code !== "未发现验证码");
+    if (q && ![mail.subject, mail.sender, mail.recipient, mail.account, mail.content, mail.preview, mail.code].some((v) => includesText(v, q))) return false;
+    if (from && !includesText(mail.sender, from)) return false;
+    if (to && !includesText(mail.recipient, to)) return false;
+    if (account && !includesText(mail.account, account)) return false;
+    if (category && mail.category !== category) return false;
+    if (normalizedDirection && normalizedDirection !== "all" && mailDirection !== normalizedDirection) return false;
+    if (hasCode !== null && mailHasCode !== hasCode) return false;
+    if (dateFrom && !Number.isNaN(dateFrom.valueOf()) && receivedAt < dateFrom) return false;
+    if (dateTo && !Number.isNaN(dateTo.valueOf()) && receivedAt > dateTo) return false;
+    return true;
+  });
+  const total = filtered.length;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const start = (page - 1) * pageSize;
+  return {
+    mails: filtered.slice(start, start + pageSize),
+    pagination: { page, pageSize, total, totalPages },
+    facets,
   };
 }
 
@@ -156,10 +252,13 @@ function sortMailsNewestFirst(mails) {
 }
 
 module.exports = {
+  MAIL_CATEGORIES,
+  categoryFromRules,
   cleanMailText,
   classifyMail,
   getGmailBody,
   isNakedCssBlock,
   publicMail,
+  queryMails,
   sortMailsNewestFirst,
 };
