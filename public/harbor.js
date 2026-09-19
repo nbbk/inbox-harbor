@@ -1115,8 +1115,16 @@
           alert(error.message);
         }
       };
+      const revoke = element("button", "ih-button ih-button-quiet", "撤销授权");
+      revoke.type = "button";
+      revoke.disabled = a.status !== "active";
+      revoke.onclick = async () => {
+        if (!confirm(`撤销 ${a.username} 的 OAuth 授权？之后需要重新授权才能取件。`)) return;
+        await request(`/api/accounts/${encodeURIComponent(a.id)}/revoke`, { method: "POST" });
+        await load();
+      };
       actions.append(fetchButton);
-      if (isSupported) actions.append(auth);
+      if (isSupported) actions.append(auth, revoke);
       actions.append(del);
       row.append(identity, provider, state, permissions, checked, actions);
       table.append(row);

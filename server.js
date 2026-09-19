@@ -1521,6 +1521,9 @@ app.get("/api/stats", (req, res) => {
     totalMails: gData.mails.length,
     totalCodes: gData.mails.filter((m) => m.code && m.code !== "未发现验证码")
       .length,
+    syncFailures: gData.accounts.filter((account) => account.syncStatus === "failed").length,
+    notificationFailures: (gData.notificationDeliveries || []).filter((item) => item.status === "failed").length,
+    lastSuccessfulSyncAt: gData.accounts.map((account) => account.lastSyncAt).filter(Boolean).sort().at(-1) || null,
   });
 });
 
@@ -1551,6 +1554,19 @@ app.put("/api/accounts/:id/permissions", (req, res) => {
     account: publicAccount(account),
     message: "权限已保存；变更发信权限后请重新授权。",
   });
+});
+
+app.post("/api/accounts/:id/revoke", (req, res) => {
+  const account = gData.accounts.find((item) => item.id === req.params.id);
+  if (!account)
+    return res.status(404).json({ success: false, message: "账号不存在" });
+  clearOAuthSecrets(account);
+  account.status = "pending";
+  account.syncStatus = "pending";
+  account.lastSyncError = "授权已由用户撤销";
+  account.nextSyncAt = null;
+  saveDataToDisk();
+  res.json({ success: true, account: publicAccount(account) });
 });
 
 app.get("/api/v1/notifications", (req, res) => {
