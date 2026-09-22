@@ -86,10 +86,11 @@ app.use("/api", (req, res, next) => {
   // The emergency token is deliberately not a normal-business credential.
   if(req.path.startsWith('/v1/recovery/')&&supplied&&left.length===right.length&&crypto.timingSafeEqual(left,right))return next();
   const session=authService?.session(readSessionToken(req));
-  if(session){if(!req.path.startsWith('/auth/')&&session.role!=='owner')return res.status(403).json({success:false,message:'多用户迁移期间，仅 Owner 可以访问旧业务数据'});req.user=session;return next();}
+  if(session){req.user=session;return next();}
   res.status(401).json({ success: false, message: "请输入本机访问口令" });
 });
-app.get("/shared/mail/:id", (req, res) => {
+app.get("/shared/legacy/:id", (req, res) => {
+  return res.status(410).send('旧共享链接已停用，请创建新的安全共享链接。');
   const mail = gData.mails.find((item) => item.id === req.params.id);
   if (!mail || !verifyShareToken(ADMIN_TOKEN, req.params.id, req.query.expires, req.query.token)) return res.status(404).send("共享邮件不存在或链接已失效");
   const safe = publicMail(mail);
@@ -183,63 +184,19 @@ let gData = {
   classificationRules: [],
 };
 
-async function pushConfiguredNotifications(mails) {
-  const now = Date.now();
-  const deliveries = Array.isArray(gData.notificationDeliveries)
-    ? gData.notificationDeliveries
-    : (gData.notificationDeliveries = []);
-  const mailById = new Map((gData.mails || []).map((mail) => [mail.id, mail]));
-  for (const mail of mails || []) if (mail?.id) mailById.set(mail.id, mail);
-  const dueMailIds = deliveries
-    .filter((item) => item.status === "failed" && item.attempts < 3 && Number(item.nextRetryAt || 0) <= now)
-    .map((item) => item.mailId);
-  const candidates = [...new Map([...(mails || []).map((mail) => [mail.id, mail]), ...dueMailIds.map((id) => [id, mailById.get(id)])]).values()].filter(Boolean);
-  if (candidates.length === 0) return;
-  for (const mail of candidates) {
-    // Telegram's legacy settings are kept only for migration. A new Telegram
-    // channel owns delivery once configured, avoiding a double send.
-    const hasNewTelegram = (gData.notificationConfig.channels || []).some(
-      (c) => c.enabled && c.type === "telegram",
-    );
-    const config = hasNewTelegram
-      ? {
-          ...gData.notificationConfig,
-          channels: gData.notificationConfig.channels.filter(
-            (c) => c.type !== "telegram" || c.enabled,
-          ),
-        }
-      : gData.notificationConfig;
-    const shareLinkDays = Math.min(365, Math.max(1, Number(gData.notificationConfig.shareLinkDays) || 30));
-    const expires = now + shareLinkDays * 24 * 60 * 60 * 1000;
-    const appUrl = PUBLIC_BASE_URL + "/shared/mail/" + encodeURIComponent(mail.id) + "?expires=" + expires + "&token=" + createShareToken(ADMIN_TOKEN, mail.id, expires);
-    const message = messageFor({ ...mail, appUrl });
-    for (const channel of (config.channels || []).filter((item) => item.enabled)) {
-      const key = notificationDeliveryKey(mail.id, channel);
-      let delivery = deliveries.find((item) => item.key === key);
-      if (delivery?.status === "delivered" || (delivery?.status === "failed" && (delivery.attempts >= 3 || Number(delivery.nextRetryAt || 0) > now))) continue;
-      if (!delivery) {
-        delivery = { key, mailId: mail.id, channelId: channel.id || null, channelType: channel.type, status: "pending", attempts: 0 };
-        deliveries.push(delivery);
-      }
-      delivery.attempts += 1;
-      delivery.lastAttemptAt = new Date(now).toISOString();
-      try {
-        await send(channel, message);
-        delivery.status = "delivered";
-        delivery.deliveredAt = new Date().toISOString();
-        delivery.error = null;
-        delivery.nextRetryAt = null;
-      } catch (error) {
-        delivery.status = "failed";
-        delivery.error = String(error?.message || error);
-        delivery.nextRetryAt = now + Math.min(15 * 60 * 1000, 30 * 1000 * 2 ** (delivery.attempts - 1));
-        console.warn(`Notification channel ${channel.type} failed: ${delivery.error}`);
-      }
-      saveDataToDisk();
+async function pushTenantNotifications(events, deps = {}) {
+  const now = deps.now || Date.now(), sendFn = deps.sendFn || send, messageFn = deps.messageForFn || messageFor;
+  for (const { userId, mail } of events || []) { if (!userId || !mail?.id) continue; const tenant = loadTenantState(storage, userId);
+    for (const channel of tenant.channels.filter((c) => c.enabled && (!mail.__retryChannelId || c.id === mail.__retryChannelId))) {
+      const row = storage.db.prepare('SELECT * FROM notification_deliveries WHERE user_id=? AND channel_id=? AND message_id=?').get(userId, channel.id, mail.id); let meta = row ? JSON.parse(row.status || '{}') : { state:'pending', attempts:0 };
+      if (meta.state==='delivered' || (meta.state==='failed' && (meta.attempts>=3 || Number(meta.nextRetryAt)>now))) continue; meta.attempts++;
+      const share = getOrCreateShare(userId, mail.id, Number(storage.db.prepare('SELECT value FROM instance_settings WHERE key=?').get(`user:${userId}:shareLinkDays`)?.value) || 30);
+      try { await sendFn(channel,messageFn({ ...mail, appUrl: `${PUBLIC_BASE_URL}/shared/mail/${share.token}` })); meta.state='delivered'; meta.nextRetryAt=null; } catch(e) { meta.state='failed'; meta.nextRetryAt=now+Math.min(900000,30000*2**(meta.attempts-1)); }
+      if(row) storage.db.prepare('UPDATE notification_deliveries SET status=? WHERE id=? AND user_id=?').run(JSON.stringify(meta),row.id,userId); else storage.db.prepare('INSERT INTO notification_deliveries VALUES (?,?,?,?,?,?)').run(crypto.randomUUID(),userId,channel.id,mail.id,JSON.stringify(meta),new Date().toISOString());
     }
   }
 }
-
+async function retryTenantNotifications(deps={}) { const rows=storage.db.prepare('SELECT d.user_id,d.channel_id,d.message_id,d.status,m.payload FROM notification_deliveries d JOIN mail_messages m ON m.id=d.message_id AND m.user_id=d.user_id').all(); const events=[]; for(const row of rows){let meta;try{meta=JSON.parse(row.status)}catch{continue}if(meta.state==='failed'&&meta.attempts<3&&Number(meta.nextRetryAt||0)<=Date.now())events.push({userId:row.user_id,mail:{...storage.decrypt(row.payload),id:row.message_id,__retryChannelId:row.channel_id}})} await pushTenantNotifications(events,deps); }
 function loadDataFromDisk() {
   try {
     const parsed = storage.load(gData, DATA_FILE);
@@ -1496,88 +1453,34 @@ function publicAccount(account) {
   return safe;
 }
 
-app.get("/api/tg/config", (req, res) => {
-  res.json({
-    success: true,
-    tgConfig: {
-      enabled: !!gData.tgConfig.enabled,
-      autoPollInterval: gData.tgConfig.autoPollInterval,
-      configured: {
-        token: !!gData.tgConfig.token,
-        chatId: !!gData.tgConfig.chatId,
-      },
-    },
-  });
-});
+app.get("/api/tg/config", (req, res) => res.status(410).json({ success: false, message: "旧 Telegram 配置接口已停用，请使用通知渠道设置。" }));
 
-app.post("/api/tg/config", (req, res) => {
-  const { token, chatId, enabled, autoPollInterval } = req.body;
-  gData.tgConfig = {
-    token: token !== undefined ? token : gData.tgConfig.token,
-    chatId: chatId !== undefined ? chatId : gData.tgConfig.chatId,
-    enabled: enabled !== undefined ? enabled : gData.tgConfig.enabled,
-    autoPollInterval: autoPollInterval ? parseInt(autoPollInterval) : 1,
-  };
-  saveDataToDisk();
-  res.json({
-    success: true,
-    tgConfig: {
-      enabled: !!gData.tgConfig.enabled,
-      autoPollInterval: gData.tgConfig.autoPollInterval,
-      configured: {
-        token: !!gData.tgConfig.token,
-        chatId: !!gData.tgConfig.chatId,
-      },
-    },
-  });
-});
+app.post("/api/tg/config", (req, res) => res.status(410).json({ success: false, message: "旧 Telegram 配置接口已停用，请使用通知渠道设置。" }));
 
-app.post("/api/tg/test", async (req, res) => {
-  const { token, chatId } = req.body;
-  const msg =
-    `🔑 *验证码*： \`742651\`  *(点击数字复制)*\n` +
-    `━━━━━━━━━━━━━━━━━━\n` +
-    `👤 *接收账号*: \`demo_user@gmail.com\` (🔴 谷歌 Gmail)\n` +
-    `📩 *发 件 人*: \`Microsoft 帐户团队\`\n` +
-    `📋 *邮件主题*: *个人 Microsoft 帐户安全代码*\n` +
-    `⏰ *接收时间*: ${new Date().toLocaleString()}\n` +
-    `🔗 *快捷链接*: 无`;
+app.post("/api/tg/test", (req, res) => res.status(410).json({ success: false, message: "旧 Telegram 测试接口已停用，请使用通知渠道测试。" }));
 
-  const result = await sendTelegramMessage(msg, token, chatId);
-  if (result.ok) {
-    res.json({ success: true, message: "测试消息已成功发送至您的 Telegram！" });
-  } else {
-    res.status(400).json({ success: false, message: result.error });
-  }
-});
-
-// Mail-center handlers are still legacy gData code in this transition. Do not
-// expose them to non-owners until their relation-store rewrite lands.
-app.use('/api', (req, res, next) => {
-  if ((req.path === '/stats' || req.path.startsWith('/mails') || req.path.startsWith('/rules') || req.path.startsWith('/classification-rules')) && req.user?.role !== 'owner') return res.status(403).json({ success: false, message: '邮件中心正在迁移为多用户存储' });
-  next();
-});
 app.get("/api/stats", (req, res) => {
-  const msCount = gData.accounts.filter(
+  const tenant = loadTenantState(storage, req.user.id), accounts = tenant.accounts, mails = tenant.mails;
+  const msCount = accounts.filter(
     (a) => (a.provider || detectProvider(a.username)) === "microsoft",
   ).length;
-  const ggCount = gData.accounts.filter(
+  const ggCount = accounts.filter(
     (a) => (a.provider || detectProvider(a.username)) === "google",
   ).length;
 
   res.json({
-    totalAccounts: gData.accounts.length,
-    activeAccounts: gData.accounts.filter((a) => a.status === "active").length,
-    invalidAccounts: gData.accounts.filter((a) => a.status === "invalid")
+    totalAccounts: accounts.length,
+    activeAccounts: accounts.filter((a) => a.status === "active").length,
+    invalidAccounts: accounts.filter((a) => a.status === "invalid")
       .length,
     microsoftAccounts: msCount,
     googleAccounts: ggCount,
-    totalMails: gData.mails.length,
-    totalCodes: gData.mails.filter((m) => m.code && m.code !== "未发现验证码")
+    totalMails: mails.length,
+    totalCodes: mails.filter((m) => m.code && m.code !== "未发现验证码")
       .length,
-    syncFailures: gData.accounts.filter((account) => account.syncStatus === "failed").length,
-    notificationFailures: (gData.notificationDeliveries || []).filter((item) => item.status === "failed").length,
-    lastSuccessfulSyncAt: gData.accounts.map((account) => account.lastSyncAt).filter(Boolean).sort().at(-1) || null,
+    syncFailures: accounts.filter((account) => account.syncStatus === "failed").length,
+    notificationFailures: storage.db.prepare("SELECT count(*) AS count FROM notification_deliveries WHERE user_id=? AND status LIKE '%\"state\":\"failed\"%'").get(req.user.id).count,
+    lastSuccessfulSyncAt: accounts.map((account) => account.lastSyncAt).filter(Boolean).sort().at(-1) || null,
   });
 });
 
@@ -1620,14 +1523,18 @@ app.post("/api/accounts/:id/revoke", (req, res) => {
   account.lastSyncError = "授权已由用户撤销";
   account.nextSyncAt = null;
   tenant.repo.update('accounts', account.id, account, { provider: account.provider, address: account.username });
+  authService.audit(req.user, 'account.oauth.revoked', 'mail_account', account.id, {});
   res.json({ success: true, account: publicAccount(account) });
 });
 
 app.get("/api/v1/notifications", (req, res) => {
+  const tenant = loadTenantState(storage, req.user.id);
+  const setting = storage.db.prepare('SELECT value FROM instance_settings WHERE key=?').get(`user:${req.user.id}:shareLinkDays`);
+  const shareLinkDays = setting ? Math.min(365, Math.max(1, Number(setting.value) || 30)) : 30;
   res.json({
     success: true,
     catalog: CHANNELS,
-    configuration: publicConfig(gData.notificationConfig),
+    configuration: publicConfig({ includeFullBody: true, shareLinkDays, channels: tenant.channels }),
   });
 });
 
@@ -1635,6 +1542,7 @@ app.get("/api/v1/connectors", (req, res) =>
   res.json({ success: true, configuration: publicConnectorConfig() }),
 );
 app.put("/api/v1/connectors", (req, res) => {
+  if (req.user?.role !== 'owner') return res.status(403).json({ success: false, message: '仅 Owner 可以修改连接器配置' });
   try {
     const previous = gData.connectorConfig;
     const candidate = updateStoredConnectorConfig(
@@ -1686,10 +1594,9 @@ app.post("/api/v1/connectors/check", (req, res) => {
 
 app.put("/api/v1/notifications", (req, res) => {
   try {
+    const tenant = loadTenantState(storage, req.user.id);
     const incoming = Array.isArray(req.body.channels) ? req.body.channels : [];
-    const previous = Array.isArray(gData.notificationConfig.channels)
-      ? gData.notificationConfig.channels
-      : [];
+    const previous = tenant.channels;
     const channels = incoming.map((channel, index) => {
       if (!CHANNELS[channel.type])
         throw new Error(`未知通知渠道: ${channel.type}`);
@@ -1703,15 +1610,17 @@ app.put("/api/v1/notifications", (req, res) => {
         config: { ...(old?.config || {}), ...(channel.config || {}) },
       };
     });
-    gData.notificationConfig = {
-      includeFullBody: false,
-      shareLinkDays: Math.min(365, Math.max(1, Number(req.body.shareLinkDays) || 30)),
-      channels,
-    };
-    saveDataToDisk();
+    const shareLinkDays = Math.min(365, Math.max(1, Number(req.body.shareLinkDays) || 30));
+    const quota = storage.db.prepare('SELECT notification_limit FROM quotas WHERE user_id=?').get(req.user.id)?.notification_limit;
+    const additions = channels.filter((channel) => !previous.some((old) => old.id === channel.id)).length;
+    if (Number.isInteger(quota) && quota >= 0 && previous.length + additions > quota) throw new Error('已达到当前账户配额');
+    for (const channel of channels) { const old = previous.find((item) => item.id === channel.id); if (old) tenant.repo.update('channels', old.id, channel, { type: channel.type }); else channel.id = tenant.repo.insert('channels', channel, { type: channel.type }); }
+    for (const old of previous) if (!channels.some((item) => item.id === old.id)) tenant.repo.delete('channels', old.id);
+    storage.db.prepare('INSERT OR REPLACE INTO instance_settings (key,value) VALUES (?,?)').run(`user:${req.user.id}:shareLinkDays`, String(shareLinkDays));
+    authService.audit(req.user, 'notification.channels.updated', 'notification_channel', null, { count: channels.length });
     res.json({
       success: true,
-      configuration: publicConfig(gData.notificationConfig),
+      configuration: publicConfig({ includeFullBody: true, shareLinkDays, channels }),
     });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });
@@ -1722,7 +1631,7 @@ app.post("/api/v1/notifications/:type/test", async (req, res) => {
   const type = req.params.type;
   if (!CHANNELS[type])
     return res.status(404).json({ success: false, message: "通知渠道不存在" });
-  const saved = (gData.notificationConfig.channels || []).find(
+  const tenant = loadTenantState(storage, req.user.id); const saved = tenant.channels.find(
     (item) => item.type === type,
   );
   const channel = {
@@ -1739,6 +1648,7 @@ app.post("/api/v1/notifications/:type/test", async (req, res) => {
         content: "渠道连接正常。之后的新邮件可按当前设置发送完整正文。",
       }),
     );
+    authService.audit(req.user, 'notification.channel.tested', 'notification_channel', saved?.id || null, { type });
     res.json({ success: true, message: `${CHANNELS[type].name} 测试成功` });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });
@@ -2045,9 +1955,10 @@ function syncAndPersistAccount(userId, accountId) {
     const before = new Set(tenant.mails.map((mail) => mail.id));
     const notifiableMails = await syncCoreForTest(account, { userId, mails: tenant.mails, clearedMailIds: tenant.tombstones });
     const persistedNewMails = tenant.mails.filter((mail) => !before.has(mail.id));
-    for (const mail of persistedNewMails) tenant.repo.insert('messages', mail, { account_id: account.id });
+    const storedBySourceId = new Map();
+    for (const mail of persistedNewMails) { const sourceId = mail.id; const storedId = tenant.repo.insert('messages', mail, { account_id: account.id }); mail.id = storedId; storedBySourceId.set(sourceId, mail); }
     tenant.repo.update('accounts', account.id, account, { provider: account.provider, address: account.username });
-    return { persistedNewMails, notifiableMails, account };
+    return { persistedNewMails, notifiableMails: notifiableMails.map((mail) => storedBySourceId.get(mail.id) || mail), account };
   })().finally(() => { if (accountSyncFlights.get(flightKey) === flight) accountSyncFlights.delete(flightKey); });
   accountSyncFlights.set(flightKey, flight); return flight;
 }
@@ -2075,7 +1986,7 @@ app.post("/api/accounts/fetch-mail", async (req, res) => {
 
   // Directly trigger Telegram Push for new mails!
   if (newMailsAll.length > 0) {
-    // Notification delivery moves to the tenant notification stage.
+    await pushTenantNotifications(newMailsAll.map((mail) => ({ userId: req.user.id, mail })));
   }
 
   res.json({
@@ -2162,12 +2073,12 @@ app.post("/api/accounts/send-test-mail", async (req, res) => {
 });
 
 app.get("/api/mails", (req, res) => {
-  const result = queryMails(gData.mails, req.query, gData.classificationRules);
+  const tenant = loadTenantState(storage, req.user.id); const result = queryMails(tenant.mails, req.query, tenant.rules);
   res.json({ success: true, ...result });
 });
 
 app.patch("/api/mails/:id/category", (req, res) => {
-  const mail = gData.mails.find((item) => item.id === req.params.id);
+  const tenant = loadTenantState(storage, req.user.id); const mail = tenant.mails.find((item) => item.id === req.params.id);
   if (!mail)
     return res.status(404).json({ success: false, message: "邮件不存在" });
   const category = String(req.body?.category || "").trim();
@@ -2175,29 +2086,32 @@ app.patch("/api/mails/:id/category", (req, res) => {
     return res.status(400).json({ success: false, message: "无效的邮件分类" });
   if (category) mail.categoryOverride = category;
   else delete mail.categoryOverride;
-  saveDataToDisk();
+  tenant.repo.update('messages', mail.id, mail, { account_id: mail.accountId || null });
+  authService.audit(req.user, 'mail.category.updated', 'mail', mail.id, { category: category || null });
   res.json({
     success: true,
-    mail: publicMail(mail, gData.classificationRules),
+    mail: publicMail(mail, tenant.rules),
   });
 });
 
 app.patch("/api/mails/:id/state", (req, res) => {
-  const mail = gData.mails.find((item) => item.id === req.params.id);
+  const tenant = loadTenantState(storage, req.user.id); const mail = tenant.mails.find((item) => item.id === req.params.id);
   if (!mail)
     return res.status(404).json({ success: false, message: "邮件不存在" });
   for (const field of ["isRead", "isStarred", "isPinned"]) {
     if (typeof req.body?.[field] === "boolean") mail[field] = req.body[field];
   }
-  saveDataToDisk();
-  res.json({ success: true, mail: publicMail(mail, gData.classificationRules) });
+  tenant.repo.update('messages', mail.id, mail, { account_id: mail.accountId || null });
+  authService.audit(req.user, 'mail.state.updated', 'mail', mail.id, {});
+  res.json({ success: true, mail: publicMail(mail, tenant.rules) });
 });
 
 app.get("/api/classification-rules", (req, res) => {
-  res.json({ success: true, rules: gData.classificationRules || [] });
+  res.json({ success: true, rules: loadTenantState(storage, req.user.id).rules });
 });
 
 app.post("/api/classification-rules", (req, res) => {
+  const tenant = loadTenantState(storage, req.user.id);
   const type = String(req.body?.type || "").trim().toLowerCase();
   const value = String(req.body?.value || "").trim().toLowerCase().replace(/^@/, "");
   const category = String(req.body?.category || "").trim();
@@ -2207,13 +2121,14 @@ app.post("/api/classification-rules", (req, res) => {
     return res.status(400).json({ success: false, message: "发件人地址格式无效" });
   if (type === "domain" && !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$/i.test(value))
     return res.status(400).json({ success: false, message: "发件人域名格式无效" });
-  const existing = (gData.classificationRules || []).find(
+  const existing = tenant.rules.find(
     (rule) => rule.type === type && String(rule.value).toLowerCase() === value,
   );
   if (existing) {
     existing.category = category;
     existing.createdAt = new Date().toISOString();
-    saveDataToDisk();
+    tenant.repo.update('rules', existing.id, existing);
+    authService.audit(req.user, 'rule.updated', 'classification_rule', existing.id, { type, category });
     return res.json({ success: true, rule: existing });
   }
   const rule = {
@@ -2223,28 +2138,27 @@ app.post("/api/classification-rules", (req, res) => {
     category,
     createdAt: new Date().toISOString(),
   };
-  gData.classificationRules = [...(gData.classificationRules || []), rule];
-  saveDataToDisk();
+  rule.id = tenant.repo.insert('rules', rule);
+  authService.audit(req.user, 'rule.created', 'classification_rule', rule.id, { type, category });
   res.status(201).json({ success: true, rule });
 });
 
 app.delete("/api/classification-rules/:id", (req, res) => {
-  const before = (gData.classificationRules || []).length;
-  gData.classificationRules = (gData.classificationRules || []).filter(
-    (rule) => rule.id !== req.params.id,
-  );
-  if (gData.classificationRules.length === before)
+  const tenant = loadTenantState(storage, req.user.id);
+  if (!tenant.repo.delete('rules', req.params.id))
     return res.status(404).json({ success: false, message: "分类规则不存在" });
+  authService.audit(req.user, 'rule.deleted', 'classification_rule', req.params.id, {});
   saveDataToDisk();
   res.json({ success: true });
 });
 
 app.post("/api/mails/send", async (req, res) => {
+  const tenant = loadTenantState(storage, req.user.id);
   const { accountId, to, subject, body } = req.body || {};
   const recipient = String(to || "").trim();
   const mailSubject = String(subject || "").trim();
   const mailBody = String(body || "").trim();
-  const account = gData.accounts.find((item) => item.id === accountId);
+  const account = tenant.accounts.find((item) => item.id === accountId);
   if (!account || !supportsOAuth(account.provider))
     return res
       .status(400)
@@ -2335,39 +2249,42 @@ app.post("/api/mails/send", async (req, res) => {
     links: [],
     receivedAt: new Date().toISOString(),
   };
-  gData.mails = sortMailsNewestFirst([sentMail, ...gData.mails]).slice(0, 200);
-  saveDataToDisk();
+  sentMail.id = tenant.repo.insert('messages', sentMail, { account_id: account.id });
+  authService.audit(req.user, 'mail.sent', 'mail_account', account.id, { provider: account.provider });
   res.json({ success: true, message: "邮件已发送", mail: publicMail(sentMail) });
 });
 
 app.delete("/api/mails/:id", (req, res) => {
+  const tenant = loadTenantState(storage, req.user.id);
   const id = String(req.params.id || "");
-  const index = gData.mails.findIndex((mail) => mail.id === id);
-  if (index < 0)
+  const removed = tenant.mails.find((mail) => mail.id === id);
+  if (!removed)
     return res.status(404).json({ success: false, message: "邮件不存在或已删除" });
-  const [removed] = gData.mails.splice(index, 1);
-  const cleared = new Set(gData.clearedMailIds || []);
-  cleared.add(id);
+  tenant.repo.delete('messages', id);
+  storage.db.prepare('UPDATE share_links SET revoked_at=? WHERE user_id=? AND mail_id=? AND revoked_at IS NULL').run(new Date().toISOString(), req.user.id, id);
+  tenant.repo.insert('tombstones', {}, { mail_id: id });
   const fingerprint = getMailFingerprint(removed);
-  if (fingerprint) cleared.add(fingerprint);
-  gData.clearedMailIds = [...cleared];
-  saveDataToDisk();
+  if (fingerprint) tenant.repo.insert('tombstones', {}, { mail_id: fingerprint });
+  authService.audit(req.user, 'mail.deleted', 'mail', id, {});
   res.json({ success: true, message: "邮件已从本地归档删除" });
 });
 
+function getOrCreateShare(userId,mailId,days=30){const now=new Date().toISOString();storage.db.exec('BEGIN IMMEDIATE');try{let row=storage.db.prepare('SELECT * FROM share_links WHERE user_id=? AND mail_id=? AND revoked_at IS NULL AND expires_at>? AND token_ciphertext IS NOT NULL ORDER BY created_at DESC LIMIT 1').get(userId,mailId,now);if(row){const token=storage.decrypt(row.token_ciphertext);storage.db.exec('COMMIT');return {id:row.id,token,expiresAt:row.expires_at};}const token=crypto.randomBytes(32).toString('base64url'),id=crypto.randomUUID(),expiresAt=new Date(Date.now()+days*86400000).toISOString();storage.db.prepare('INSERT INTO share_links (id,user_id,mail_id,token_hash,payload,expires_at,access_count,created_at,token_ciphertext) VALUES (?,?,?,?,?,?,?,?,?)').run(id,userId,mailId,crypto.createHash('sha256').update(token).digest('hex'),storage.encrypt({}),expiresAt,0,new Date().toISOString(),storage.encrypt(token));storage.db.exec('COMMIT');return{id,token,expiresAt};}catch(e){storage.db.exec('ROLLBACK');throw e;}}
+app.post('/api/mails/:id/share-links',(req,res)=>{const tenant=loadTenantState(storage,req.user.id),mail=tenant.mails.find(m=>m.id===req.params.id);if(!mail)return res.status(404).json({success:false});const days=Math.min(365,Math.max(1,Number(req.body?.days)||30)),share=getOrCreateShare(req.user.id,mail.id,days);authService.audit(req.user,'share.created','mail',mail.id,{days});res.status(201).json({success:true,id:share.id,url:`${PUBLIC_BASE_URL}/shared/mail/${share.token}`,expiresAt:share.expiresAt});});
+app.get('/api/share-links',(req,res)=>res.json({success:true,links:storage.db.prepare('SELECT id,mail_id,expires_at,revoked_at,last_accessed_at,access_count,max_accesses,created_at FROM share_links WHERE user_id=?').all(req.user.id)}));
+app.post('/api/share-links/:id/revoke',(req,res)=>{const changed=storage.db.prepare('UPDATE share_links SET revoked_at=? WHERE id=? AND user_id=? AND revoked_at IS NULL').run(new Date().toISOString(),req.params.id,req.user.id).changes;if(!changed)return res.status(404).json({success:false});authService.audit(req.user,'share.revoked','share_link',req.params.id,{});res.json({success:true});});
+app.delete('/api/share-links/:id',(req,res)=>{const changed=storage.db.prepare('DELETE FROM share_links WHERE id=? AND user_id=?').run(req.params.id,req.user.id).changes;if(!changed)return res.status(404).json({success:false});authService.audit(req.user,'share.deleted','share_link',req.params.id,{});res.json({success:true});});
+app.get('/shared/mail/:token',(req,res)=>{const hash=crypto.createHash('sha256').update(String(req.params.token)).digest('hex'),now=new Date().toISOString();storage.db.exec('BEGIN IMMEDIATE');try{const row=storage.db.prepare("SELECT s.*,m.payload,u.enabled FROM share_links s JOIN mail_messages m ON m.id=s.mail_id AND m.user_id=s.user_id JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.revoked_at IS NULL AND s.expires_at>? AND u.enabled=1").get(hash,now);if(!row|| (row.max_accesses!==null&&row.access_count>=row.max_accesses)){storage.db.exec('ROLLBACK');return res.status(404).send('Not found');}storage.db.prepare('UPDATE share_links SET access_count=access_count+1,last_accessed_at=? WHERE id=?').run(now,row.id);storage.db.exec('COMMIT');const mail=storage.decrypt(row.payload);res.set({'X-Robots-Tag':'noindex','Cache-Control':'no-store','Referrer-Policy':'no-referrer'}).send(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>InboxHarbor</title><main style="max-width:760px;margin:24px auto;font-family:system-ui"><h1>${escapeHtml(mail.subject||'邮件')}</h1><p>${escapeHtml(mail.sender||'')}</p><article style="white-space:pre-wrap">${escapeHtml(mail.content||'')}</article></main>`);}catch(e){try{storage.db.exec('ROLLBACK')}catch{}res.status(404).send('Not found');}});
+
 app.post("/api/mails/clear", (req, res) => {
-  if (!gData.clearedMailIds) gData.clearedMailIds = [];
-  const clearedSet = new Set(gData.clearedMailIds);
-
-  for (let m of gData.mails) {
-    if (m.id) clearedSet.add(m.id);
+  const tenant = loadTenantState(storage, req.user.id);
+  for (let m of tenant.mails) {
+    if (m.id) tenant.repo.insert('tombstones', {}, { mail_id: m.id });
     const fp = getMailFingerprint(m);
-    if (fp) clearedSet.add(fp);
+    if (fp) tenant.repo.insert('tombstones', {}, { mail_id: fp });
   }
-
-  gData.clearedMailIds = Array.from(clearedSet);
-  gData.mails = [];
-  saveDataToDisk();
+  for (const mail of tenant.mails) { storage.db.prepare('UPDATE share_links SET revoked_at=? WHERE user_id=? AND mail_id=? AND revoked_at IS NULL').run(new Date().toISOString(), req.user.id, mail.id); tenant.repo.delete('messages', mail.id); }
+  authService.audit(req.user, 'mail.cleared', 'mail', null, { count: tenant.mails.length });
   res.json({ success: true });
 });
 
@@ -2392,9 +2309,9 @@ setInterval(async () => {
         const result = await syncAndPersistAccount(userId, account.id);
         return result.notifiableMails.map((mail) => ({ userId, mail }));
       }));
-      // Notification dispatch is intentionally deferred to the tenant notification stage.
-      void results.flat();
+      await pushTenantNotifications(results.flat());
     }
+    await retryTenantNotifications();
   } catch (err) {
     // Silent recovery
   } finally {
@@ -2428,4 +2345,4 @@ function shutdown(server, done = () => {}) {
   server.close(() => { clearTimeout(timer); finish(); });
 }
 if(require.main===module)startServer();
-module.exports={app,startServer,shutdown,syncAndPersistAccount,setSyncCoreForTest:(fn)=>{syncCoreForTest=fn||processSingleAccountFetchCore;},__storage:storage,closeStorage:()=>{storage.close();instanceLock?.release();}};
+module.exports={app,startServer,shutdown,syncAndPersistAccount,pushTenantNotifications,retryTenantNotifications,getOrCreateShare,setSyncCoreForTest:(fn)=>{syncCoreForTest=fn||processSingleAccountFetchCore;},__storage:storage,__auth:authService,closeStorage:()=>{storage.close();instanceLock?.release();}};

@@ -69,6 +69,14 @@ class Storage {
     }
     if (!this.db.prepare('SELECT 1 FROM schema_migrations WHERE version=4').get()) this.rebuildBusinessSchemaV4();
     if (!this.db.prepare('SELECT 1 FROM schema_migrations WHERE version=5').get()) this.rebuildBusinessSchemaV5();
+    if (!this.db.prepare('SELECT 1 FROM schema_migrations WHERE version=6').get()) this.db.exec('BEGIN IMMEDIATE');
+    if (!this.db.prepare('SELECT 1 FROM schema_migrations WHERE version=6').get()) {
+      try { this.db.exec(`CREATE TABLE share_links_v6 (id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,mail_id TEXT NOT NULL,token_hash TEXT UNIQUE NOT NULL,payload TEXT NOT NULL,expires_at TEXT NOT NULL,revoked_at TEXT,last_accessed_at TEXT,access_count INTEGER NOT NULL DEFAULT 0,max_accesses INTEGER,created_at TEXT NOT NULL,FOREIGN KEY(mail_id,user_id) REFERENCES mail_messages(id,user_id) ON DELETE CASCADE);
+        -- Legacy v5 links were HMAC links without a relational mail_id. They are
+        -- intentionally discarded: preserving them would create an unscoped link.
+        DROP TABLE share_links; ALTER TABLE share_links_v6 RENAME TO share_links; CREATE INDEX idx_share_links_user_mail ON share_links(user_id,mail_id);`); this.db.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?,?)').run(6,new Date().toISOString()); this.db.exec('COMMIT'); } catch(error){this.db.exec('ROLLBACK');throw error;}
+    }
+    if (!this.db.prepare('SELECT 1 FROM schema_migrations WHERE version=7').get()) { this.db.exec('BEGIN IMMEDIATE'); try { this.db.exec('ALTER TABLE share_links ADD COLUMN token_ciphertext TEXT'); this.db.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?,?)').run(7,new Date().toISOString()); this.db.exec('COMMIT'); } catch(error){this.db.exec('ROLLBACK');throw error;} }
   }
   rebuildBusinessSchemaV4() {
     const dirty = this.db.prepare(`SELECT 'mail_messages.account_id' AS relation FROM mail_messages m LEFT JOIN mail_accounts a ON a.id=m.account_id AND a.user_id=m.user_id WHERE m.account_id IS NOT NULL AND a.id IS NULL

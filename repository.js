@@ -26,7 +26,7 @@ class UserRepository {
     else if (kind === 'deliveries') { sql = `INSERT INTO ${table} VALUES (?,?,?,?,?,?)`; params = [id, this.userId, ...named, time]; }
     else if (kind === 'rules') { sql = `INSERT INTO ${table} VALUES (?,?,?,?,?)`; params = [id, this.userId, this.storage.encrypt(payload), time, time]; }
     else if (kind === 'shares') { sql = `INSERT INTO ${table} VALUES (?,?,?,?,?,?,?)`; params = [id, this.userId, ...named, this.storage.encrypt(payload), time]; }
-    else { sql = `INSERT INTO ${table} VALUES (?,?,?,?)`; params = [id, this.userId, ...named, time]; }
+    else { sql = `INSERT OR IGNORE INTO ${table} VALUES (?,?,?,?)`; params = [id, this.userId, ...named, time]; }
     this.db.prepare(sql).run(...params); return id;
   }
   list(kind) { const { table } = this.schema(kind); return this.db.prepare(`SELECT * FROM ${table} WHERE user_id=? ORDER BY created_at DESC`).all(this.userId).map((row) => this.decode(kind, row)); }
