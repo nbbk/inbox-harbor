@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "credentials": "node scripts/credentials.js",
+    "migrate:legacy": "node scripts/migrate-legacy.js",
     "test": "node --test test/*.test.js",
     "test:ui": "playwright test test/ui.spec.js --reporter=line"
   },

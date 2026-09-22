@@ -17,7 +17,11 @@ const {
   clearOAuthSecrets,
 } = require("./notifications");
 const { Storage } = require("./storage");
+const { AuthService } = require("./auth");
+const { BoundedAuthRateLimiter } = require("./auth-rate-limiter");
 const { loadOrCreateAdminToken } = require("./instance-config");
+const { acquireInstanceLock, dataDirectory } = require("./instance-lock");
+const { recoverInterruptedRestore } = require("./migration-service");
 const {
   detectProvider,
   normalizeProvider,
@@ -46,12 +50,20 @@ const {
 } = require("./mail-sync");
 
 const app = express();
+if(process.env.TRUST_PROXY==='true')app.set('trust proxy',1);
 const PORT = process.env.PORT || 5555;
 const HOST = process.env.HOST || "127.0.0.1";
-const DATA_DIR = process.env.DATA_DIR || __dirname;
-fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+const DATA_DIR = dataDirectory(process.env.DATA_DIR || __dirname);
+// The executable path must claim ownership before reading keys, opening SQLite or
+// migrating schema. Requiring this module for tests deliberately stays lock-free.
+let instanceLock = require.main === module ? acquireInstanceLock(DATA_DIR) : null;
+if (instanceLock) recoverInterruptedRestore(DATA_DIR);
 const adminCredential = loadOrCreateAdminToken(DATA_DIR);
 const ADMIN_TOKEN = adminCredential.token;
+let authService;
+function readSessionToken(req){return (req.get('cookie')||'').match(/(?:^|;\s*)inboxharbor_session=([^;]+)/)?.[1]||'';}
+const authLimiter=new BoundedAuthRateLimiter();
+function authWait(req,scope,identity){return authLimiter.consume(scope,req.ip,identity).retryAfter;}
 if (adminCredential.created) {
   console.log("\n🔑 首次启动已生成管理口令（已持久保存）：");
   console.log(`   ${ADMIN_TOKEN}`);
@@ -61,16 +73,18 @@ if (adminCredential.created) {
 // InboxHarbor is deliberately local-first. Do not expose this service to a LAN.
 app.use(express.json({ limit: "512kb" }));
 app.use(express.urlencoded({ extended: true, limit: "512kb" }));
+app.post('/api/auth/bootstrap', async (req,res) => { try { if ((req.get('authorization')||'').replace(/^Bearer\s+/i,'') !== ADMIN_TOKEN) return res.status(403).json({success:false,message:'需要紧急恢复口令'}); const user=await authService.bootstrapOwner(req.body.email,req.body.password);res.json({success:true,user}); } catch(e){res.status(400).json({success:false,message:e.message});} });
+app.post('/api/auth/login', async (req,res) => { const wait=authWait(req,'login',req.body.email);if(wait){res.set('Retry-After',String(wait));return res.status(429).json({success:false,message:'尝试过于频繁'});}try { const result=await authService.login(req.body.email,req.body.password);res.cookie('inboxharbor_session',result.token,{httpOnly:true,sameSite:'lax',secure:process.env.NODE_ENV==='production',path:'/'});res.json({success:true,user:result.user}); }catch(e){if(e.code==='KDF_BUSY')return res.status(429).json({success:false,message:e.message});res.status(401).json({success:false,message:e.message});} });
+app.post('/api/auth/logout',(req,res)=>{authService.logout(readSessionToken(req));res.clearCookie('inboxharbor_session',{path:'/'});res.json({success:true});});
 app.use("/api", (req, res, next) => {
+  if(['/auth/register','/auth/invitations/accept'].includes(req.path))return next();
   const supplied = (req.get("authorization") || "").replace(/^Bearer\s+/i, "");
   const left = Buffer.from(supplied);
   const right = Buffer.from(ADMIN_TOKEN);
-  if (
-    supplied &&
-    left.length === right.length &&
-    crypto.timingSafeEqual(left, right)
-  )
-    return next();
+  // The emergency token is deliberately not a normal-business credential.
+  if(req.path.startsWith('/v1/recovery/')&&supplied&&left.length===right.length&&crypto.timingSafeEqual(left,right))return next();
+  const session=authService?.session(readSessionToken(req));
+  if(session){if(!req.path.startsWith('/auth/')&&session.role!=='owner')return res.status(403).json({success:false,message:'多用户迁移期间，仅 Owner 可以访问旧业务数据'});req.user=session;return next();}
   res.status(401).json({ success: false, message: "请输入本机访问口令" });
 });
 app.get("/shared/mail/:id", (req, res) => {
@@ -83,6 +97,18 @@ app.use(express.static(path.join(__dirname, "public")));
 
 const DATA_FILE = path.join(DATA_DIR, "data.json");
 const storage = new Storage(DATA_DIR);
+authService = new AuthService(storage);
+app.get('/api/auth/me',(req,res)=>{if(!req.user)return res.status(401).json({success:false,message:'未登录'});res.json({success:true,user:req.user});});
+app.post('/api/auth/change-password',async(req,res)=>{if(!req.user)return res.status(401).json({success:false});try{await authService.changePassword(req.user.id,req.body.currentPassword,req.body.newPassword);res.clearCookie('inboxharbor_session',{path:'/'});res.json({success:true,message:'密码已更新，请重新登录'});}catch(e){res.status(400).json({success:false,message:e.message});}});
+app.post('/api/auth/register',async(req,res)=>{const wait=authWait(req,'register',req.body.email);if(wait){res.set('Retry-After',String(wait));return res.status(429).json({success:false});}try{const user=await authService.register(req.body.email,req.body.password);res.json({success:true,user});}catch(e){res.status(e.code==='KDF_BUSY'?429:400).json({success:false,message:e.message});}});
+app.post('/api/auth/invitations/accept',async(req,res)=>{const wait=authWait(req,'invite',req.body.token||req.body.email);if(wait){res.set('Retry-After',String(wait));return res.status(429).json({success:false});}try{const user=await authService.acceptInvitation(req.body.token,req.body.email,req.body.password);res.json({success:true,user});}catch(e){res.status(e.code==='KDF_BUSY'?429:400).json({success:false,message:e.message});}});
+app.get('/api/auth/users',(req,res)=>{if(!req.user||!['owner','admin'].includes(req.user.role))return res.status(403).json({success:false});res.json({success:true,users:authService.listUsers()});});
+app.post('/api/auth/invitations',(req,res)=>{if(!req.user||!['owner','admin'].includes(req.user.role))return res.status(403).json({success:false});if(req.user.role!=='owner'&&req.body.role==='admin')return res.status(403).json({success:false,message:'只有 Owner 可邀请管理员'});try{const token=authService.createInvitation(req.user,req.body.email,req.body.role||'user',req.body.ttlHours);res.json({success:true,token});}catch(e){res.status(400).json({success:false,message:e.message});}});
+app.delete('/api/auth/invitations/:id',(req,res)=>{if(!req.user||!['owner','admin'].includes(req.user.role))return res.status(403).json({success:false});try{authService.revokeInvitation(req.user,req.params.id);res.json({success:true});}catch(e){res.status(400).json({success:false,message:e.message});}});
+app.patch('/api/auth/users/:id',(req,res)=>{if(!req.user||!['owner','admin'].includes(req.user.role))return res.status(403).json({success:false});try{authService.setUser(req.user,req.params.id,req.body);res.json({success:true});}catch(e){res.status(400).json({success:false,message:e.message});}});
+app.get('/api/auth/users/:id/quota',(req,res)=>{if(!req.user||!['owner','admin'].includes(req.user.role))return res.status(403).json({success:false});res.json({success:true,quota:authService.quota(req.params.id)});});
+app.put('/api/auth/users/:id/quota',(req,res)=>{if(!req.user||req.user.role!=='owner')return res.status(403).json({success:false});authService.setQuota(req.user,req.params.id,req.body||{});res.json({success:true,quota:authService.quota(req.params.id)});});
+app.post('/api/auth/logout-all',(req,res)=>{if(!req.user)return res.status(401).json({success:false});authService.logoutAll(req.user.id);res.clearCookie('inboxharbor_session',{path:'/'});res.json({success:true});});
 
 // Default Credentials & Telegram Defaults
 let GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
@@ -2354,14 +2380,32 @@ setInterval(async () => {
   } finally {
     isPolling = false;
   }
-}, 5000);
+}, 5000).unref();
 
 // Seed initial memory set from disk
 loadDataFromDisk();
 
-app.listen(PORT, HOST, () => {
+function startServer() {
+  instanceLock ||= acquireInstanceLock(DATA_DIR);
+  const server = app.listen(PORT, HOST, () => {
   console.log(`====================================================`);
   console.log(` ⚓ InboxHarbor（收件港）- 本机邮箱管理台`);
   console.log(` 🚀 访问地址: http://${HOST}:${PORT}`);
   console.log(`====================================================`);
-});
+  });
+  const close = () => shutdown(server);
+  process.once('SIGINT', close); process.once('SIGTERM', close);
+  return server;
+}
+let shuttingDown = false;
+function shutdown(server, done = () => {}) {
+  if (shuttingDown) return done();
+  shuttingDown = true;
+  const finish = () => { try { storage.close(); } finally { try { instanceLock?.release(); } finally { done(); } } };
+  if (!server) return finish();
+  // stop accepting first; force-close only after a bounded drain period.
+  const timer = setTimeout(() => { try { server.closeAllConnections?.(); } catch {} finish(); }, 5000).unref();
+  server.close(() => { clearTimeout(timer); finish(); });
+}
+if(require.main===module)startServer();
+module.exports={app,startServer,shutdown,closeStorage:()=>{storage.close();instanceLock?.release();}};
