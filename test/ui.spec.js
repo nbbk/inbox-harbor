@@ -137,6 +137,48 @@ test("account page exposes read and send permission switches", async ({
   expect(additions.every((item) => item.provider === "microsoft")).toBe(true);
 });
 
+for (const width of [900, 1024, 1280, 1366]) {
+  test(`account actions stay visible with unwrapped labels at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await page.route("**/api/accounts", (route) =>
+      route.fulfill({
+        json: {
+          success: true,
+          accounts: [{
+            id: "responsive-account",
+            username: "responsive@gmail.com",
+            provider: "google",
+            status: "active",
+            readEnabled: true,
+            sendEnabled: true,
+            syncEnabled: true,
+            lastSyncAt: "2026-09-22T08:00:00.000Z",
+          }],
+        },
+      }),
+    );
+    await unlock(page);
+    await page.getByRole("button", { name: "邮箱账户" }).click();
+    const row = page.locator(".ih-account-row:not(.ih-account-row-head)").first();
+    const actions = row.locator(".ih-account-actions");
+    await expect(actions).toBeInViewport();
+    for (const button of await actions.getByRole("button").all()) {
+      await expect(button).toBeInViewport();
+      const metrics = await button.evaluate((node) => ({
+        scrollWidth: node.scrollWidth,
+        clientWidth: node.clientWidth,
+        height: node.getBoundingClientRect().height,
+      }));
+      expect(metrics.scrollWidth).toBeLessThanOrEqual(metrics.clientWidth + 1);
+      expect(metrics.height).toBeLessThanOrEqual(46);
+    }
+    const overflows = await page.evaluate(
+      () => document.documentElement.scrollWidth > document.documentElement.clientWidth,
+    );
+    expect(overflows).toBe(false);
+  });
+}
+
 test("account authorization errors are visible and mobile account layout does not overflow", async ({
   page,
 }) => {
@@ -173,7 +215,7 @@ test("account authorization errors are visible and mobile account layout does no
     expect(dialog.message()).toContain("尚未配置 Google OAuth");
     await dialog.dismiss();
   });
-  await page.getByRole("button", { name: "授权" }).click();
+  await page.getByRole("button", { name: "授权", exact: true }).click();
   await expect(
     page.locator(".ih-account-row:not(.ih-account-row-head)"),
   ).toHaveCount(1);

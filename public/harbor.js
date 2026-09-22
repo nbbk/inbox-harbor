@@ -521,7 +521,7 @@
     const s = element("section", "ih-page");
     s.id = "ih-notifications";
     s.innerHTML =
-      '<div class="ih-section-head"><div><p class="ih-eyebrow">SUMMARY DELIVERY</p><h2>通知渠道</h2></div><label>查看链接有效期（天） <input id="ih-share-days" type="number" min="1" max="365" value="30"></label></div><div class="ih-layout"><div><div class="ih-channels" id="ih-channel-list"></div><button id="ih-save" class="ih-button">保存通知设置</button></div><aside class="ih-card ih-guide" id="ih-channel-guide"><p class="ih-eyebrow">CONFIGURATION</p><h3>选择一个渠道</h3><p>所有渠道只推送摘要与免登录只读链接；凭据不会回显。</p></aside></div>';
+      '<div class="ih-section-head"><div><p class="ih-eyebrow">SUMMARY DELIVERY</p><h2>通知渠道</h2><p class="ih-section-copy">配置推送渠道与共享阅读规则。</p></div></div><div class="ih-layout"><div><section class="ih-share-settings" aria-labelledby="ih-share-title"><div class="ih-share-icon" aria-hidden="true">🔗</div><div class="ih-share-copy"><h3 id="ih-share-title">共享阅读链接</h3><p>通知中的“查看邮件”链接免登录、只读，过期后自动失效。</p></div><label class="ih-share-field" for="ih-share-days"><span>有效期</span><span class="ih-share-input"><input id="ih-share-days" type="number" min="1" max="365" value="30" inputmode="numeric" aria-label="查看链接有效期（天）" aria-describedby="ih-share-hint"><b>天</b></span><small id="ih-share-hint">1–365 天，默认 30 天</small></label></section><div class="ih-channels" id="ih-channel-list"></div><div class="ih-save-row"><button id="ih-save" class="ih-button">保存通知设置</button><span>保存后对新生成的链接生效</span></div></div><aside class="ih-card ih-guide" id="ih-channel-guide"><p class="ih-eyebrow">CONFIGURATION</p><h3>选择一个渠道</h3><p>所有渠道只推送摘要与免登录只读链接；凭据不会回显。</p></aside></div>';
     return s;
   }
   function connectors() {
