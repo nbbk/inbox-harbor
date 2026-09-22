@@ -35,7 +35,23 @@ body.dark-theme,
 }
 .ih-guide-close { display: none; }
 
+.ih-user-menu { display:flex; align-items:center; gap:9px; min-width:0; color:#28465a; }
+.ih-user-email { font-weight:650; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:260px; }
+.ih-role { color:#5c7b8e; border:1px solid #dbe6eb; border-radius:999px; padding:3px 8px; font-size:12px; }
+.ih-profile-grid,.ih-admin-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; margin:16px 0; }
+.ih-profile-grid .ih-card,.ih-admin-grid .ih-card,.ih-page > .ih-card { padding:22px; margin:16px 0; }
+.ih-card h2 { margin-top:0; font-size:17px; }
+.ih-simple-list { display:grid; gap:8px; margin-top:14px; }
+.ih-simple-row { display:flex; align-items:center; justify-content:space-between; gap:10px; min-width:0; padding:10px 0; border-bottom:1px solid #e7eef1; color:#385567; font-size:13px; }
+.ih-simple-row > span { overflow-wrap:anywhere; }
+.ih-simple-row select { max-width:110px; }
+.ih-invite-result { overflow-wrap:anywhere; margin:12px 0; font:12px/1.5 ui-monospace,monospace; color:#176584; }
+.ih-quota { color:#567082; font-size:14px; }
+
 @media (max-width: 768px) {
+  .ih-profile-grid,.ih-admin-grid { grid-template-columns:1fr; }
+  .ih-user-email { max-width:145px; }
+  .ih-user-menu { gap:6px; }
   .ih-channel { padding: 15px 14px; }
   .ih-channel-top { min-height: 34px; }
   .ih-test { min-height: 40px; padding-inline: 14px; }

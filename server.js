@@ -64,8 +64,9 @@ const adminCredential = loadOrCreateAdminToken(DATA_DIR);
 const ADMIN_TOKEN = adminCredential.token;
 let authService;
 function readSessionToken(req){return (req.get('cookie')||'').match(/(?:^|;\s*)inboxharbor_session=([^;]+)/)?.[1]||'';}
-const authLimiter=new BoundedAuthRateLimiter();
+const authLimiter=new BoundedAuthRateLimiter({limit:Math.max(1,Number(process.env.AUTH_RATE_LIMIT)||5)});
 function authWait(req,scope,identity){return authLimiter.consume(scope,req.ip,identity).retryAfter;}
+function sameOrigin(req){const origin=req.get('origin');if(!origin)return true;const hostOrigin=`${req.protocol}://${req.get('host')}`;try{return origin===hostOrigin||origin===new URL(PUBLIC_BASE_URL||hostOrigin).origin;}catch{return origin===hostOrigin;}}
 if (adminCredential.created) {
   console.log("\n🔑 首次启动已生成管理口令（已持久保存）：");
   console.log(`   ${ADMIN_TOKEN}`);
@@ -76,10 +77,10 @@ if (adminCredential.created) {
 app.use(express.json({ limit: "512kb" }));
 app.use(express.urlencoded({ extended: true, limit: "512kb" }));
 app.post('/api/auth/bootstrap', async (req,res) => { try { if ((req.get('authorization')||'').replace(/^Bearer\s+/i,'') !== ADMIN_TOKEN) return res.status(403).json({success:false,message:'需要紧急恢复口令'}); const user=await authService.bootstrapOwner(req.body.email,req.body.password);res.json({success:true,user}); } catch(e){res.status(400).json({success:false,message:e.message});} });
-app.post('/api/auth/login', async (req,res) => { const wait=authWait(req,'login',req.body.email);if(wait){res.set('Retry-After',String(wait));return res.status(429).json({success:false,message:'尝试过于频繁'});}try { const result=await authService.login(req.body.email,req.body.password);res.cookie('inboxharbor_session',result.token,{httpOnly:true,sameSite:'lax',secure:process.env.NODE_ENV==='production',path:'/'});res.json({success:true,user:result.user}); }catch(e){if(e.code==='KDF_BUSY')return res.status(429).json({success:false,message:e.message});res.status(401).json({success:false,message:e.message});} });
-app.post('/api/auth/logout',(req,res)=>{authService.logout(readSessionToken(req));res.clearCookie('inboxharbor_session',{path:'/'});res.json({success:true});});
+app.post('/api/auth/login', async (req,res) => { if(!sameOrigin(req))return res.status(403).json({success:false,message:'跨站写操作已被拒绝'});const wait=authWait(req,'login',req.body.email);if(wait){res.set('Retry-After',String(wait));return res.status(429).json({success:false,message:'尝试过于频繁'});}try { const result=await authService.login(req.body.email,req.body.password);res.cookie('inboxharbor_session',result.token,{httpOnly:true,sameSite:'lax',secure:process.env.NODE_ENV==='production',path:'/'});res.json({success:true,user:result.user}); }catch(e){if(e.code==='KDF_BUSY')return res.status(429).json({success:false,message:e.message});res.status(401).json({success:false,message:e.message});} });
+app.post('/api/auth/logout',(req,res)=>{if(!sameOrigin(req))return res.status(403).json({success:false,message:'跨站写操作已被拒绝'});authService.logout(readSessionToken(req));res.clearCookie('inboxharbor_session',{path:'/'});res.json({success:true});});
 app.use("/api", (req, res, next) => {
-  if(['/auth/register','/auth/invitations/accept'].includes(req.path))return next();
+  if(['/auth/config','/auth/register','/auth/invitations/accept'].includes(req.path))return next();
   const supplied = (req.get("authorization") || "").replace(/^Bearer\s+/i, "");
   const left = Buffer.from(supplied);
   const right = Buffer.from(ADMIN_TOKEN);
@@ -89,6 +90,7 @@ app.use("/api", (req, res, next) => {
   if(session){req.user=session;return next();}
   res.status(401).json({ success: false, message: "请输入本机访问口令" });
 });
+app.use('/api',(req,res,next)=>{if(['GET','HEAD','OPTIONS'].includes(req.method)||!req.user||sameOrigin(req))return next();return res.status(403).json({success:false,message:'跨站写操作已被拒绝'});});
 app.get("/shared/legacy/:id", (req, res) => {
   return res.status(410).send('旧共享链接已停用，请创建新的安全共享链接。');
   const mail = gData.mails.find((item) => item.id === req.params.id);
@@ -101,15 +103,19 @@ app.use(express.static(path.join(__dirname, "public")));
 const DATA_FILE = path.join(DATA_DIR, "data.json");
 const storage = new Storage(DATA_DIR);
 authService = new AuthService(storage);
+app.get('/api/auth/config',(req,res)=>res.json({success:true,ownerInitialized:authService.setting('owner_initialized','0')==='1',allowPublicRegistration:authService.setting('allow_public_registration','false')==='true',user:authService.session(readSessionToken(req))}));
 app.get('/api/auth/me',(req,res)=>{if(!req.user)return res.status(401).json({success:false,message:'未登录'});res.json({success:true,user:req.user});});
 app.post('/api/auth/change-password',async(req,res)=>{if(!req.user)return res.status(401).json({success:false});try{await authService.changePassword(req.user.id,req.body.currentPassword,req.body.newPassword);res.clearCookie('inboxharbor_session',{path:'/'});res.json({success:true,message:'密码已更新，请重新登录'});}catch(e){res.status(400).json({success:false,message:e.message});}});
 app.post('/api/auth/register',async(req,res)=>{const wait=authWait(req,'register',req.body.email);if(wait){res.set('Retry-After',String(wait));return res.status(429).json({success:false});}try{const user=await authService.register(req.body.email,req.body.password);res.json({success:true,user});}catch(e){res.status(e.code==='KDF_BUSY'?429:400).json({success:false,message:e.message});}});
 app.post('/api/auth/invitations/accept',async(req,res)=>{const wait=authWait(req,'invite',req.body.token||req.body.email);if(wait){res.set('Retry-After',String(wait));return res.status(429).json({success:false});}try{const user=await authService.acceptInvitation(req.body.token,req.body.email,req.body.password);res.json({success:true,user});}catch(e){res.status(e.code==='KDF_BUSY'?429:400).json({success:false,message:e.message});}});
 app.get('/api/auth/users',(req,res)=>{if(!req.user||!['owner','admin'].includes(req.user.role))return res.status(403).json({success:false});res.json({success:true,users:authService.listUsers()});});
+app.get('/api/auth/invitations',(req,res)=>{if(!req.user||!['owner','admin'].includes(req.user.role))return res.status(403).json({success:false});res.json({success:true,invitations:authService.listInvitations()});});
+app.get('/api/auth/audit',(req,res)=>{if(!req.user||!['owner','admin'].includes(req.user.role))return res.status(403).json({success:false});res.json({success:true,events:authService.listAudit(req.query.limit)});});
+app.put('/api/auth/settings/public-registration',(req,res)=>{if(!req.user||req.user.role!=='owner')return res.status(403).json({success:false});const enabled=!!req.body?.enabled;authService.setSetting('allow_public_registration',enabled?'true':'false');authService.audit(req.user,'instance.public_registration.updated','instance',null,{enabled});res.json({success:true,enabled});});
 app.post('/api/auth/invitations',(req,res)=>{if(!req.user||!['owner','admin'].includes(req.user.role))return res.status(403).json({success:false});if(req.user.role!=='owner'&&req.body.role==='admin')return res.status(403).json({success:false,message:'只有 Owner 可邀请管理员'});try{const token=authService.createInvitation(req.user,req.body.email,req.body.role||'user',req.body.ttlHours);res.json({success:true,token});}catch(e){res.status(400).json({success:false,message:e.message});}});
 app.delete('/api/auth/invitations/:id',(req,res)=>{if(!req.user||!['owner','admin'].includes(req.user.role))return res.status(403).json({success:false});try{authService.revokeInvitation(req.user,req.params.id);res.json({success:true});}catch(e){res.status(400).json({success:false,message:e.message});}});
 app.patch('/api/auth/users/:id',(req,res)=>{if(!req.user||!['owner','admin'].includes(req.user.role))return res.status(403).json({success:false});try{authService.setUser(req.user,req.params.id,req.body);res.json({success:true});}catch(e){res.status(400).json({success:false,message:e.message});}});
-app.get('/api/auth/users/:id/quota',(req,res)=>{if(!req.user||!['owner','admin'].includes(req.user.role))return res.status(403).json({success:false});res.json({success:true,quota:authService.quota(req.params.id)});});
+app.get('/api/auth/users/:id/quota',(req,res)=>{if(!req.user||(!['owner','admin'].includes(req.user.role)&&req.user.id!==req.params.id))return res.status(403).json({success:false});res.json({success:true,quota:authService.quota(req.params.id)});});
 app.put('/api/auth/users/:id/quota',(req,res)=>{if(!req.user||req.user.role!=='owner')return res.status(403).json({success:false});authService.setQuota(req.user,req.params.id,req.body||{});res.json({success:true,quota:authService.quota(req.params.id)});});
 app.post('/api/auth/logout-all',(req,res)=>{if(!req.user)return res.status(401).json({success:false});authService.logoutAll(req.user.id);res.clearCookie('inboxharbor_session',{path:'/'});res.json({success:true});});
 

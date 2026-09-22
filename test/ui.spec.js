@@ -6,10 +6,43 @@ const token = process.env.INBOXHARBOR_ADMIN_TOKEN || "qa-local-token";
 async function unlock(page) {
   await page.goto(baseURL);
   await expect(page).toHaveTitle(/InboxHarbor/);
-  await page.getByPlaceholder("本机访问口令").fill(token);
-  await page.getByRole("button", { name: "进入收件港" }).click();
+  const bootstrap = page.getByRole("button", { name: "首次设置 Owner" });
+  if (await bootstrap.isVisible().catch(() => false)) {
+    await bootstrap.click();
+    await page.getByPlaceholder("邮箱地址").fill("qa-owner@example.com");
+    await page.getByPlaceholder("至少 12 位密码").fill("qa safe password");
+    await page.getByPlaceholder("本机管理口令（仅首次使用）").fill(token);
+    await page.getByRole("button", { name: "继续" }).click();
+  } else {
+    await page.getByPlaceholder("邮箱地址").fill("qa-owner@example.com");
+    await page.locator('#harbor-ui input[placeholder="密码"]').fill("qa safe password");
+    await page.getByRole("button", { name: "登录" }).click();
+  }
   await expect(page.getByRole("heading", { name: "邮件中心" })).toBeVisible();
 }
+
+test("owner creates an invitation and a member has no management entry on mobile", async ({ page }) => {
+  await unlock(page);
+  await page.getByRole("button", { name: "管理后台" }).click();
+  await expect(page.locator('#ih-users')).not.toBeEmpty();
+  await page.locator('#ih-invite-form input[name="email"]').fill("invited-ui@example.com");
+  await page.locator('#ih-invite-form').getByRole("button", { name: "生成邀请链接" }).click();
+  await expect(page.locator('#ih-invite-result')).toContainText("?invite=");
+  const inviteUrl = await page.locator('#ih-invite-result').textContent();
+  expect(inviteUrl).toContain("?invite=");
+  await page.getByRole("button", { name: "退出" }).click();
+  await page.goto(inviteUrl);
+  await page.getByRole("button", { name: "接受邀请" }).click();
+  await page.getByPlaceholder("邮箱地址").fill("invited-ui@example.com");
+  await page.getByPlaceholder("至少 12 位密码").fill("invited safe password");
+  await page.getByRole("button", { name: "继续" }).click();
+  await expect(page.getByRole("heading", { name: "邮件中心" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "管理后台" })).toHaveCount(0);
+  expect(await page.evaluate(() => fetch('/api/auth/users').then(response => response.status))).toBe(403);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.locator('.ih-mobile').getByRole('button',{name:'我的'})).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)).toBe(false);
+});
 
 test("desktop notification settings render and expose channel guidance", async ({
   page,
