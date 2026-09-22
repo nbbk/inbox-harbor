@@ -21,6 +21,8 @@ const { AuthService } = require("./auth");
 const { BoundedAuthRateLimiter } = require("./auth-rate-limiter");
 const { loadOrCreateAdminToken } = require("./instance-config");
 const { acquireInstanceLock, dataDirectory } = require("./instance-lock");
+const { loadTenantState, enforceQuota } = require("./tenant-state");
+const { listAllAccountsWithUser } = require("./repository");
 const { recoverInterruptedRestore } = require("./migration-service");
 const {
   detectProvider,
@@ -1138,7 +1140,7 @@ app.post("/api/auth/microsoft/device-code", async (req, res) => {
       success: false,
       message: "未配置 MICROSOFT_CLIENT_ID，无法发起 Microsoft OAuth。",
     });
-  const requested = gData.accounts.find((a) => a.id === req.body.accountId);
+  const tenant = loadTenantState(storage, req.user.id); const requested = tenant.accounts.find((a) => a.id === req.body.accountId);
   if (!requested)
     return res.status(404).json({ success: false, message: "账号不存在" });
   if (requested.provider !== "microsoft")
@@ -1167,6 +1169,7 @@ app.post("/api/auth/microsoft/device-code", async (req, res) => {
     const data = await resp.json();
     if (resp.ok && data.user_code && data.device_code) {
       microsoftOAuthTransactions.set(data.device_code, {
+        userId: req.user.id, sessionHash: crypto.createHash('sha256').update(readSessionToken(req)).digest('hex'),
         accountId: requested.id,
         clientId,
         expiresAt: Date.now() + Number(data.expires_in || 600) * 1000,
@@ -1207,7 +1210,8 @@ app.post("/api/auth/microsoft/poll-device-token", async (req, res) => {
       .status(400)
       .json({ success: false, message: "Microsoft 授权事务已过期。" });
   }
-  const targetAcc = gData.accounts.find(
+  if (transaction.userId !== req.user.id || transaction.sessionHash !== crypto.createHash('sha256').update(readSessionToken(req)).digest('hex')) return res.status(403).json({success:false,message:'OAuth 事务不属于当前会话'});
+  const tenant = loadTenantState(storage, req.user.id); const targetAcc = tenant.accounts.find(
     (account) => account.id === transaction.accountId,
   );
   if (!targetAcc || targetAcc.provider !== "microsoft") {
@@ -1272,7 +1276,7 @@ app.post("/api/auth/microsoft/poll-device-token", async (req, res) => {
       }
 
       const identity = validateOAuthIdentity(
-        gData.accounts,
+        tenant.accounts,
         targetAcc,
         userEmail,
       );
@@ -1293,7 +1297,7 @@ app.post("/api/auth/microsoft/poll-device-token", async (req, res) => {
       targetAcc.lastChecked = new Date().toISOString();
 
       microsoftOAuthTransactions.delete(deviceCode);
-      saveDataToDisk();
+      tenant.repo.update('accounts', targetAcc.id, targetAcc, { provider: targetAcc.provider, address: targetAcc.username });
       res.json({
         success: true,
         status: "completed",
@@ -1327,7 +1331,7 @@ app.get("/api/auth/google/url", (req, res) => {
         "未配置 GOOGLE_CLIENT_ID 或 GOOGLE_CLIENT_SECRET，无法发起 Google OAuth。",
     });
   const accountId = String(req.query.id || "");
-  const account = gData.accounts.find((item) => item.id === accountId);
+  const tenant = loadTenantState(storage, req.user.id); const account = tenant.accounts.find((item) => item.id === accountId);
   if (!account)
     return res.status(404).json({ success: false, message: "账号不存在" });
   if (account.provider !== "google")
@@ -1343,6 +1347,7 @@ app.get("/api/auth/google/url", (req, res) => {
   const scope = `https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/userinfo.email${account.sendEnabled ? " https://www.googleapis.com/auth/gmail.send" : ""}`;
   const redirectUri = `${PUBLIC_BASE_URL}/auth/google/callback`;
   googleOAuthTransactions.set(state, {
+    userId: req.user.id, sessionHash: crypto.createHash('sha256').update(readSessionToken(req)).digest('hex'),
     accountId,
     verifier,
     clientId: GOOGLE_CLIENT_ID,
@@ -1369,6 +1374,9 @@ app.get("/auth/google/callback", async (req, res) => {
     return res
       .status(400)
       .send("这里是 Google OAuth 回调地址，不是登录页面。请勿直接打开；请把它复制到 Google 控制台的 Authorized redirect URIs。需要授权邮箱时，请回到 InboxHarbor 的邮箱账户并点击“授权”。");
+  const callbackSession = readSessionToken(req);
+  const callbackUser = callbackSession && authService.session(callbackSession);
+  if (!callbackSession || !callbackUser || callbackUser.id !== transaction.userId || transaction.sessionHash !== crypto.createHash('sha256').update(callbackSession).digest('hex')) return res.status(403).send('OAuth 授权会话不匹配。');
 
   if (error || !code) {
     return res.send(`
@@ -1413,7 +1421,7 @@ app.get("/auth/google/callback", async (req, res) => {
         if (userData.email) userEmail = userData.email;
       } catch (e) {}
 
-      const targetAcc = gData.accounts.find(
+      const tenant = loadTenantState(storage, transaction.userId); const targetAcc = tenant.accounts.find(
         (a) => a.id === transaction.accountId,
       );
       if (!targetAcc || targetAcc.provider !== "google") {
@@ -1425,7 +1433,7 @@ app.get("/auth/google/callback", async (req, res) => {
       }
 
       const identity = validateOAuthIdentity(
-        gData.accounts,
+        tenant.accounts,
         targetAcc,
         userEmail,
       );
@@ -1441,7 +1449,7 @@ app.get("/auth/google/callback", async (req, res) => {
         tokenData.scope || targetAcc.providerScopes || "";
       targetAcc.lastChecked = new Date().toISOString();
 
-      saveDataToDisk();
+      tenant.repo.update('accounts', targetAcc.id, targetAcc, { provider: targetAcc.provider, address: targetAcc.username });
 
       res.send(`
         <div style="font-family: sans-serif; text-align: center; padding: 50px; background: #0f172a; color: #10b981;">
@@ -1543,6 +1551,12 @@ app.post("/api/tg/test", async (req, res) => {
   }
 });
 
+// Mail-center handlers are still legacy gData code in this transition. Do not
+// expose them to non-owners until their relation-store rewrite lands.
+app.use('/api', (req, res, next) => {
+  if ((req.path === '/stats' || req.path.startsWith('/mails') || req.path.startsWith('/rules') || req.path.startsWith('/classification-rules')) && req.user?.role !== 'owner') return res.status(403).json({ success: false, message: '邮件中心正在迁移为多用户存储' });
+  next();
+});
 app.get("/api/stats", (req, res) => {
   const msCount = gData.accounts.filter(
     (a) => (a.provider || detectProvider(a.username)) === "microsoft",
@@ -1568,12 +1582,12 @@ app.get("/api/stats", (req, res) => {
 });
 
 app.get("/api/accounts", (req, res) => {
-  const accounts = gData.accounts.map(publicAccount);
+  const accounts = loadTenantState(storage, req.user.id).accounts.map(publicAccount);
   res.json({ success: true, accounts });
 });
 
 app.put("/api/accounts/:id/permissions", (req, res) => {
-  const account = gData.accounts.find((a) => a.id === req.params.id);
+  const tenant = loadTenantState(storage, req.user.id); const account = tenant.accounts.find((a) => a.id === req.params.id);
   if (!account)
     return res.status(404).json({ success: false, message: "账号不存在" });
   if (typeof req.body.readEnabled === "boolean")
@@ -1588,7 +1602,7 @@ app.put("/api/accounts/:id/permissions", (req, res) => {
       return res.status(400).json({ success: false, message: "同步间隔必须为 30–3600 秒" });
     account.pollIntervalSeconds = Math.round(interval);
   }
-  saveDataToDisk();
+  tenant.repo.update('accounts', account.id, account, { provider: account.provider, address: account.username });
   res.json({
     success: true,
     account: publicAccount(account),
@@ -1597,7 +1611,7 @@ app.put("/api/accounts/:id/permissions", (req, res) => {
 });
 
 app.post("/api/accounts/:id/revoke", (req, res) => {
-  const account = gData.accounts.find((item) => item.id === req.params.id);
+  const tenant = loadTenantState(storage, req.user.id); const account = tenant.accounts.find((item) => item.id === req.params.id);
   if (!account)
     return res.status(404).json({ success: false, message: "账号不存在" });
   clearOAuthSecrets(account);
@@ -1605,7 +1619,7 @@ app.post("/api/accounts/:id/revoke", (req, res) => {
   account.syncStatus = "pending";
   account.lastSyncError = "授权已由用户撤销";
   account.nextSyncAt = null;
-  saveDataToDisk();
+  tenant.repo.update('accounts', account.id, account, { provider: account.provider, address: account.username });
   res.json({ success: true, account: publicAccount(account) });
 });
 
@@ -1733,6 +1747,7 @@ app.post("/api/v1/notifications/:type/test", async (req, res) => {
 
 // Single Account & Verification Code Fast Lookup API
 app.get("/api/accounts/lookup", (req, res) => {
+  const tenant = loadTenantState(storage, req.user.id);
   const query = (req.query.username || req.query.email || "")
     .toLowerCase()
     .trim();
@@ -1741,7 +1756,7 @@ app.get("/api/accounts/lookup", (req, res) => {
       .status(400)
       .json({ success: false, message: "缺失 username 参数" });
 
-  let acc = gData.accounts.find(
+  let acc = tenant.accounts.find(
     (a) =>
       a.username.toLowerCase().trim() === query ||
       a.username.toLowerCase().split("@")[0] === query,
@@ -1755,8 +1770,8 @@ app.get("/api/accounts/lookup", (req, res) => {
     });
   }
 
-  const clearedSet = new Set(gData.clearedMailIds || []);
-  const latestMail = gData.mails.find((m) => {
+  const clearedSet = new Set(tenant.tombstones || []);
+  const latestMail = tenant.mails.find((m) => {
     if (!m || !m.code || m.code === "未发现验证码" || m.code === "707070")
       return false;
     if (clearedSet.has(m.id) || clearedSet.has(m.code)) return false;
@@ -1810,6 +1825,7 @@ app.post("/api/accounts/add-outlook-tool", (req, res) =>
 );
 
 app.post("/api/accounts/add", (req, res) => {
+  const tenant = loadTenantState(storage, req.user.id);
   const username = String(req.body.username || "")
     .trim()
     .toLowerCase();
@@ -1817,7 +1833,7 @@ app.post("/api/accounts/add", (req, res) => {
     return res
       .status(400)
       .json({ success: false, message: "请输入有效邮箱地址" });
-  const existing = gData.accounts.find(
+  const existing = tenant.accounts.find(
     (item) => item.username.toLowerCase() === username,
   );
   if (existing)
@@ -1836,7 +1852,6 @@ app.post("/api/accounts/add", (req, res) => {
       message: "当前版本仅支持 Google 与 Microsoft 邮箱。",
     });
   const account = {
-    id: `acc_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`,
     username,
     provider,
     status: "pending",
@@ -1855,8 +1870,7 @@ app.post("/api/accounts/add", (req, res) => {
     password: "",
     note: "",
   };
-  gData.accounts.unshift(account);
-  saveDataToDisk();
+  try { enforceQuota(storage, req.user.id, 'accounts'); account.id = tenant.repo.insert('accounts', account, { provider, address: username }); } catch (error) { return res.status(400).json({ success: false, message: error.message }); }
   res.json({ success: true, account: publicAccount(account) });
 });
 
@@ -1875,28 +1889,24 @@ app.post("/api/accounts/update-password", (req, res) => {
 });
 
 app.delete("/api/accounts/:id", (req, res) => {
-  const { id } = req.params;
-  gData.accounts.filter((account) => account.id === id).forEach(clearOAuthSecrets);
-  gData.accounts = gData.accounts.filter((a) => a.id !== id);
-  saveDataToDisk();
-  res.json({ success: true });
+  const tenant = loadTenantState(storage, req.user.id); const account = tenant.accounts.find((item) => item.id === req.params.id);
+  if (!account) return res.status(404).json({ success: false, message: '账号不存在' }); clearOAuthSecrets(account); tenant.repo.update('accounts', account.id, account, { provider: account.provider, address: account.username }); tenant.repo.delete('accounts', account.id); res.json({ success: true });
 });
 
 app.post("/api/accounts/batch-delete", (req, res) => {
   const { ids } = req.body;
   if (!Array.isArray(ids)) return res.status(400).json({ success: false });
 
-  gData.accounts.filter((account) => ids.includes(account.id)).forEach(clearOAuthSecrets);
-  gData.accounts = gData.accounts.filter((a) => !ids.includes(a.id));
-  saveDataToDisk();
+  const tenant = loadTenantState(storage, req.user.id); tenant.accounts.filter((account) => ids.includes(account.id)).forEach((account) => { clearOAuthSecrets(account); tenant.repo.update('accounts', account.id, account, { provider: account.provider, address: account.username }); tenant.repo.delete('accounts', account.id); });
   res.json({ success: true });
 });
 
 app.post("/api/accounts/check-status", async (req, res) => {
+  const tenant = loadTenantState(storage, req.user.id);
   const { ids } = req.body;
   const now = new Date().toISOString();
 
-  const targetAccounts = gData.accounts.filter(
+  const targetAccounts = tenant.accounts.filter(
     (acc) =>
       acc.readEnabled !== false &&
       (!ids || ids.length === 0 || ids.includes(acc.id)),
@@ -1924,11 +1934,11 @@ app.post("/api/accounts/check-status", async (req, res) => {
     checkedCount++;
   }
 
-  saveDataToDisk();
+  for (const account of targetAccounts) tenant.repo.update('accounts', account.id, account, { provider: account.provider, address: account.username });
   res.json({
     success: true,
     checkedCount,
-    accounts: gData.accounts.map(publicAccount),
+    accounts: tenant.accounts.map(publicAccount),
   });
 });
 
@@ -2013,17 +2023,39 @@ async function processSingleAccountFetchCore(acc, dataStore) {
 }
 
 function processSingleAccountFetch(acc, dataStore) {
-  if (accountSyncFlights.has(acc.id)) return accountSyncFlights.get(acc.id);
+  const flightKey = `${dataStore.userId || 'legacy'}:${acc.id}`;
+  if (accountSyncFlights.has(flightKey)) return accountSyncFlights.get(flightKey);
   const flight = processSingleAccountFetchCore(acc, dataStore).finally(() => {
-    if (accountSyncFlights.get(acc.id) === flight) accountSyncFlights.delete(acc.id);
+    if (accountSyncFlights.get(flightKey) === flight) accountSyncFlights.delete(flightKey);
   });
-  accountSyncFlights.set(acc.id, flight);
+  accountSyncFlights.set(flightKey, flight);
   return flight;
+}
+let syncCoreForTest = processSingleAccountFetchCore;
+
+// The only tenant sync write path. Followers share this promise and never apply a
+// second write, which prevents cursor rollback and duplicate bootstrap records.
+function syncAndPersistAccount(userId, accountId) {
+  const flightKey = `${userId}:${accountId}`;
+  if (accountSyncFlights.has(flightKey)) return accountSyncFlights.get(flightKey);
+  const flight = (async () => {
+    const tenant = loadTenantState(storage, userId);
+    const account = tenant.accounts.find((item) => item.id === accountId);
+    if (!account) throw new Error('账号不存在或不属于当前用户');
+    const before = new Set(tenant.mails.map((mail) => mail.id));
+    const notifiableMails = await syncCoreForTest(account, { userId, mails: tenant.mails, clearedMailIds: tenant.tombstones });
+    const persistedNewMails = tenant.mails.filter((mail) => !before.has(mail.id));
+    for (const mail of persistedNewMails) tenant.repo.insert('messages', mail, { account_id: account.id });
+    tenant.repo.update('accounts', account.id, account, { provider: account.provider, address: account.username });
+    return { persistedNewMails, notifiableMails, account };
+  })().finally(() => { if (accountSyncFlights.get(flightKey) === flight) accountSyncFlights.delete(flightKey); });
+  accountSyncFlights.set(flightKey, flight); return flight;
 }
 
 app.post("/api/accounts/fetch-mail", async (req, res) => {
+  const tenant = loadTenantState(storage, req.user.id);
   const { ids } = req.body;
-  const targetAccounts = gData.accounts.filter(
+  const targetAccounts = tenant.accounts.filter(
     (acc) =>
       acc.readEnabled !== false &&
       (!ids || ids.length === 0 || ids.includes(acc.id)),
@@ -2035,17 +2067,15 @@ app.post("/api/accounts/fetch-mail", async (req, res) => {
   for (let i = 0; i < targetAccounts.length; i += batchSize) {
     const batch = targetAccounts.slice(i, i + batchSize);
     const batchResults = await Promise.all(
-      batch.map((acc) => processSingleAccountFetch(acc, gData)),
+      batch.map((acc) => syncAndPersistAccount(req.user.id, acc.id)),
     );
-    batchResults.forEach((mList) => newMailsAll.push(...mList));
+    batchResults.forEach((result) => newMailsAll.push(...result.notifiableMails));
   }
 
-  saveDataToDisk();
 
   // Directly trigger Telegram Push for new mails!
   if (newMailsAll.length > 0) {
-    await checkAndPushNewMailsToTelegram(newMailsAll);
-    await pushConfiguredNotifications(newMailsAll);
+    // Notification delivery moves to the tenant notification stage.
   }
 
   res.json({
@@ -2056,14 +2086,15 @@ app.post("/api/accounts/fetch-mail", async (req, res) => {
 });
 
 app.post("/api/accounts/send-test-mail", async (req, res) => {
+  const tenant = loadTenantState(storage, req.user.id);
   const { fromId, targetEmail } = req.body;
 
-  let senderAcc = gData.accounts.find(
+  let senderAcc = tenant.accounts.find(
     (a) => a.id === fromId || a.username === fromId,
   );
   if (!senderAcc) {
     senderAcc =
-      gData.accounts.find((a) => a.status === "active") || gData.accounts[0];
+      tenant.accounts.find((a) => a.status === "active") || tenant.accounts[0];
   }
 
   if (!senderAcc) {
@@ -2344,36 +2375,25 @@ app.post("/api/mails/clear", (req, res) => {
 let isPolling = false;
 setInterval(async () => {
   if (isPolling) return;
-  const notificationEnabled = (gData.notificationConfig.channels || []).some(
-    (c) => c.enabled,
-  );
   // Poll mailboxes continuously so the mail center stays current even when notifications are disabled.
 
   isPolling = true;
   try {
     const now = Date.now();
-    const allAccounts = (gData.accounts || []).filter(
-      (acc) =>
+    const allAccounts = listAllAccountsWithUser(storage).filter(
+      ({ account: acc }) =>
         acc.readEnabled !== false &&
         acc.syncEnabled !== false &&
         (!acc.nextSyncAt || new Date(acc.nextSyncAt).getTime() <= now),
     );
     if (allAccounts.length > 0) {
       // True full concurrency across all accounts simultaneously for sub-second scan!
-      const batchResults = await Promise.all(
-        allAccounts.map((acc) => processSingleAccountFetch(acc, gData)),
-      );
-      const newMailsAll = batchResults.flat();
-
-      saveDataToDisk();
-
-      if (newMailsAll.length > 0) {
-        await checkAndPushNewMailsToTelegram(newMailsAll);
-      }
-      await pushConfiguredNotifications(newMailsAll);
-    } else {
-      // Notification retries must not depend on a mailbox being due for sync.
-      await pushConfiguredNotifications([]);
+      const results = await Promise.all(allAccounts.map(async ({ userId, account }) => {
+        const result = await syncAndPersistAccount(userId, account.id);
+        return result.notifiableMails.map((mail) => ({ userId, mail }));
+      }));
+      // Notification dispatch is intentionally deferred to the tenant notification stage.
+      void results.flat();
     }
   } catch (err) {
     // Silent recovery
@@ -2408,4 +2428,4 @@ function shutdown(server, done = () => {}) {
   server.close(() => { clearTimeout(timer); finish(); });
 }
 if(require.main===module)startServer();
-module.exports={app,startServer,shutdown,closeStorage:()=>{storage.close();instanceLock?.release();}};
+module.exports={app,startServer,shutdown,syncAndPersistAccount,setSyncCoreForTest:(fn)=>{syncCoreForTest=fn||processSingleAccountFetchCore;},__storage:storage,closeStorage:()=>{storage.close();instanceLock?.release();}};

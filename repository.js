@@ -56,4 +56,5 @@ class UserRepository {
   }
   decode(kind, row) { if (!row) return null; return ('payload' in row) ? { ...row, payload: this.storage.decrypt(row.payload) } : row; }
 }
-module.exports = { UserRepository };
+function listAllAccountsWithUser(storage) { return storage.db.prepare('SELECT id,user_id,provider,address,payload FROM mail_accounts').all().map((row) => ({ userId: row.user_id, account: { ...storage.decrypt(row.payload), id: row.id, provider: row.provider, username: row.address } })); }
+module.exports = { UserRepository, listAllAccountsWithUser };
