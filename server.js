@@ -15,6 +15,7 @@ const {
   verifyShareToken,
   notificationDeliveryKey,
   clearOAuthSecrets,
+  validateChannelPolicy,
 } = require("./notifications");
 const { Storage } = require("./storage");
 const { AuthService } = require("./auth");
@@ -58,13 +59,17 @@ const HOST = process.env.HOST || "127.0.0.1";
 const DATA_DIR = dataDirectory(process.env.DATA_DIR || __dirname);
 // The executable path must claim ownership before reading keys, opening SQLite or
 // migrating schema. Requiring this module for tests deliberately stays lock-free.
-let instanceLock = require.main === module ? acquireInstanceLock(DATA_DIR) : null;
+let activeServer = null;
+let leaseExitHandler = (code) => process.exit(code), leaseLossStopping = false;
+function lockOptions(options = {}) { return { ...options, onLost: stopAfterLeaseLoss }; }
+function stopAfterLeaseLoss(error) { if (leaseLossStopping) return; leaseLossStopping = true; console.error(`InboxHarbor 已失去 DATA_DIR 租约：${error.message}`); clearInterval(backgroundPollTimer); shutdown(activeServer, () => leaseExitHandler(1)); }
+let instanceLock = require.main === module ? acquireInstanceLock(DATA_DIR, lockOptions()) : null;
 if (instanceLock) recoverInterruptedRestore(DATA_DIR);
 const adminCredential = loadOrCreateAdminToken(DATA_DIR);
 const ADMIN_TOKEN = adminCredential.token;
 let authService;
 function readSessionToken(req){return (req.get('cookie')||'').match(/(?:^|;\s*)inboxharbor_session=([^;]+)/)?.[1]||'';}
-const authLimiter=new BoundedAuthRateLimiter({limit:Math.max(1,Number(process.env.AUTH_RATE_LIMIT)||5)});
+const authLimiter=new BoundedAuthRateLimiter({limit:Math.max(1,Number(process.env.AUTH_RATE_LIMIT)||5),globalLimit:Math.max(20,Number(process.env.AUTH_RATE_LIMIT)||5)});
 function authWait(req,scope,identity){return authLimiter.consume(scope,req.ip,identity).retryAfter;}
 function sameOrigin(req){const origin=req.get('origin');if(!origin)return true;const hostOrigin=`${req.protocol}://${req.get('host')}`;try{return origin===hostOrigin||origin===new URL(PUBLIC_BASE_URL||hostOrigin).origin;}catch{return origin===hostOrigin;}}
 if (adminCredential.created) {
@@ -77,10 +82,10 @@ if (adminCredential.created) {
 app.use(express.json({ limit: "512kb" }));
 app.use(express.urlencoded({ extended: true, limit: "512kb" }));
 app.post('/api/auth/bootstrap', async (req,res) => { try { if ((req.get('authorization')||'').replace(/^Bearer\s+/i,'') !== ADMIN_TOKEN) return res.status(403).json({success:false,message:'需要紧急恢复口令'}); const user=await authService.bootstrapOwner(req.body.email,req.body.password);res.json({success:true,user}); } catch(e){res.status(400).json({success:false,message:e.message});} });
-app.post('/api/auth/login', async (req,res) => { if(!sameOrigin(req))return res.status(403).json({success:false,message:'跨站写操作已被拒绝'});const wait=authWait(req,'login',req.body.email);if(wait){res.set('Retry-After',String(wait));return res.status(429).json({success:false,message:'尝试过于频繁'});}try { const result=await authService.login(req.body.email,req.body.password);res.cookie('inboxharbor_session',result.token,{httpOnly:true,sameSite:'lax',secure:process.env.NODE_ENV==='production',path:'/'});res.json({success:true,user:result.user}); }catch(e){if(e.code==='KDF_BUSY')return res.status(429).json({success:false,message:e.message});res.status(401).json({success:false,message:e.message});} });
+app.post('/api/auth/login', async (req,res) => { if(!sameOrigin(req))return res.status(403).json({success:false,message:'跨站写操作已被拒绝'});const wait=authWait(req,'login',req.body.email);if(wait){res.set('Retry-After',String(wait));return res.status(429).json({success:false,message:'尝试过于频繁'});}try { const result=await authService.login(req.body.email,req.body.password);authLimiter.clearIdentity('login',req.ip,req.body.email);res.cookie('inboxharbor_session',result.token,{httpOnly:true,sameSite:'lax',secure:process.env.NODE_ENV==='production',path:'/'});res.json({success:true,user:result.user}); }catch(e){if(e.code==='KDF_BUSY')return res.status(429).json({success:false,message:e.message});res.status(401).json({success:false,message:e.message});} });
 app.post('/api/auth/logout',(req,res)=>{if(!sameOrigin(req))return res.status(403).json({success:false,message:'跨站写操作已被拒绝'});authService.logout(readSessionToken(req));res.clearCookie('inboxharbor_session',{path:'/'});res.json({success:true});});
 app.use("/api", (req, res, next) => {
-  if(['/auth/config','/auth/register','/auth/invitations/accept'].includes(req.path))return next();
+  if(['/auth/config','/auth/register','/auth/invitations/accept','/auth/recovery/reset'].includes(req.path))return next();
   const supplied = (req.get("authorization") || "").replace(/^Bearer\s+/i, "");
   const left = Buffer.from(supplied);
   const right = Buffer.from(ADMIN_TOKEN);
@@ -106,6 +111,8 @@ authService = new AuthService(storage);
 app.get('/api/auth/config',(req,res)=>res.json({success:true,ownerInitialized:authService.setting('owner_initialized','0')==='1',allowPublicRegistration:authService.setting('allow_public_registration','false')==='true',user:authService.session(readSessionToken(req))}));
 app.get('/api/auth/me',(req,res)=>{if(!req.user)return res.status(401).json({success:false,message:'未登录'});res.json({success:true,user:req.user});});
 app.post('/api/auth/change-password',async(req,res)=>{if(!req.user)return res.status(401).json({success:false});try{await authService.changePassword(req.user.id,req.body.currentPassword,req.body.newPassword);res.clearCookie('inboxharbor_session',{path:'/'});res.json({success:true,message:'密码已更新，请重新登录'});}catch(e){res.status(400).json({success:false,message:e.message});}});
+app.post('/api/auth/recovery/reset',async(req,res)=>{if(!sameOrigin(req))return res.status(403).json({success:false,message:'跨站写操作已被拒绝'});const wait=authWait(req,'recovery',req.body.email);if(wait){res.set('Retry-After',String(wait));return res.status(429).json({success:false,message:'请求过于频繁'});}try{await authService.resetWithRecoveryCode(req.body.email,req.body.code,req.body.newPassword);res.json({success:true,message:'密码已重置，请登录'});}catch(e){res.status(e.code==='KDF_BUSY'?429:400).json({success:false,message:e.code==='KDF_BUSY'?e.message:'邮箱或恢复码错误'});}});
+app.post('/api/auth/recovery/regenerate',async(req,res)=>{if(!req.user)return res.status(401).json({success:false});try{const codes=await authService.regenerateRecoveryCodes(req.user.id,req.body.currentPassword);res.json({success:true,recoveryCodes:codes});}catch(e){res.status(400).json({success:false,message:e.message});}});
 app.post('/api/auth/register',async(req,res)=>{const wait=authWait(req,'register',req.body.email);if(wait){res.set('Retry-After',String(wait));return res.status(429).json({success:false});}try{const user=await authService.register(req.body.email,req.body.password);res.json({success:true,user});}catch(e){res.status(e.code==='KDF_BUSY'?429:400).json({success:false,message:e.message});}});
 app.post('/api/auth/invitations/accept',async(req,res)=>{const wait=authWait(req,'invite',req.body.token||req.body.email);if(wait){res.set('Retry-After',String(wait));return res.status(429).json({success:false});}try{const user=await authService.acceptInvitation(req.body.token,req.body.email,req.body.password);res.json({success:true,user});}catch(e){res.status(e.code==='KDF_BUSY'?429:400).json({success:false,message:e.message});}});
 app.get('/api/auth/users',(req,res)=>{if(!req.user||!['owner','admin'].includes(req.user.role))return res.status(403).json({success:false});res.json({success:true,users:authService.listUsers()});});
@@ -115,9 +122,11 @@ app.put('/api/auth/settings/public-registration',(req,res)=>{if(!req.user||req.u
 app.post('/api/auth/invitations',(req,res)=>{if(!req.user||!['owner','admin'].includes(req.user.role))return res.status(403).json({success:false});if(req.user.role!=='owner'&&req.body.role==='admin')return res.status(403).json({success:false,message:'只有 Owner 可邀请管理员'});try{const token=authService.createInvitation(req.user,req.body.email,req.body.role||'user',req.body.ttlHours);res.json({success:true,token});}catch(e){res.status(400).json({success:false,message:e.message});}});
 app.delete('/api/auth/invitations/:id',(req,res)=>{if(!req.user||!['owner','admin'].includes(req.user.role))return res.status(403).json({success:false});try{authService.revokeInvitation(req.user,req.params.id);res.json({success:true});}catch(e){res.status(400).json({success:false,message:e.message});}});
 app.patch('/api/auth/users/:id',(req,res)=>{if(!req.user||!['owner','admin'].includes(req.user.role))return res.status(403).json({success:false});try{authService.setUser(req.user,req.params.id,req.body);res.json({success:true});}catch(e){res.status(400).json({success:false,message:e.message});}});
+app.delete('/api/auth/users/:id',async(req,res)=>{if(!req.user||req.user.role!=='owner')return res.status(403).json({success:false});try{await authService.deleteUser(req.user,req.params.id,req.body.currentPassword);res.json({success:true});}catch(e){res.status(400).json({success:false,message:e.message});}});
 app.get('/api/auth/users/:id/quota',(req,res)=>{if(!req.user||(!['owner','admin'].includes(req.user.role)&&req.user.id!==req.params.id))return res.status(403).json({success:false});res.json({success:true,quota:authService.quota(req.params.id)});});
 app.put('/api/auth/users/:id/quota',(req,res)=>{if(!req.user||req.user.role!=='owner')return res.status(403).json({success:false});authService.setQuota(req.user,req.params.id,req.body||{});res.json({success:true,quota:authService.quota(req.params.id)});});
 app.post('/api/auth/logout-all',(req,res)=>{if(!req.user)return res.status(401).json({success:false});authService.logoutAll(req.user.id);res.clearCookie('inboxharbor_session',{path:'/'});res.json({success:true});});
+app.delete('/api/auth/me',async(req,res)=>{if(!req.user)return res.status(401).json({success:false});try{await authService.deleteOwnAccount(req.user.id,req.body.currentPassword);res.clearCookie('inboxharbor_session',{path:'/'});res.json({success:true});}catch(e){res.status(400).json({success:false,message:e.message});}});
 
 // Default Credentials & Telegram Defaults
 let GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
@@ -192,17 +201,17 @@ let gData = {
 
 async function pushTenantNotifications(events, deps = {}) {
   const now = deps.now || Date.now(), sendFn = deps.sendFn || send, messageFn = deps.messageForFn || messageFor;
-  for (const { userId, mail } of events || []) { if (!userId || !mail?.id) continue; const tenant = loadTenantState(storage, userId);
+  for (const { userId, mail } of events || []) { if (!userId || !mail?.id) continue; const user = storage.db.prepare('SELECT id,role,enabled FROM users WHERE id=?').get(userId); if (!user?.enabled) continue; const tenant = loadTenantState(storage, userId);
     for (const channel of tenant.channels.filter((c) => c.enabled && (!mail.__retryChannelId || c.id === mail.__retryChannelId))) {
       const row = storage.db.prepare('SELECT * FROM notification_deliveries WHERE user_id=? AND channel_id=? AND message_id=?').get(userId, channel.id, mail.id); let meta = row ? JSON.parse(row.status || '{}') : { state:'pending', attempts:0 };
       if (meta.state==='delivered' || (meta.state==='failed' && (meta.attempts>=3 || Number(meta.nextRetryAt)>now))) continue; meta.attempts++;
       const share = getOrCreateShare(userId, mail.id, Number(storage.db.prepare('SELECT value FROM instance_settings WHERE key=?').get(`user:${userId}:shareLinkDays`)?.value) || 30);
-      try { await sendFn(channel,messageFn({ ...mail, appUrl: `${PUBLIC_BASE_URL}/shared/mail/${share.token}` })); meta.state='delivered'; meta.nextRetryAt=null; } catch(e) { meta.state='failed'; meta.nextRetryAt=now+Math.min(900000,30000*2**(meta.attempts-1)); }
+      try { validateChannelPolicy(channel, user.role); await sendFn(channel,messageFn({ ...mail, appUrl: `${PUBLIC_BASE_URL}/shared/mail/${share.token}` }),user.role); meta.state='delivered'; meta.nextRetryAt=null; } catch(e) { meta.state='failed'; meta.nextRetryAt=now+Math.min(900000,30000*2**(meta.attempts-1)); authService.audit(userId,'notification.delivery.failed','notification_channel',channel.id,{type:channel.type}); }
       if(row) storage.db.prepare('UPDATE notification_deliveries SET status=? WHERE id=? AND user_id=?').run(JSON.stringify(meta),row.id,userId); else storage.db.prepare('INSERT INTO notification_deliveries VALUES (?,?,?,?,?,?)').run(crypto.randomUUID(),userId,channel.id,mail.id,JSON.stringify(meta),new Date().toISOString());
     }
   }
 }
-async function retryTenantNotifications(deps={}) { const rows=storage.db.prepare('SELECT d.user_id,d.channel_id,d.message_id,d.status,m.payload FROM notification_deliveries d JOIN mail_messages m ON m.id=d.message_id AND m.user_id=d.user_id').all(); const events=[]; for(const row of rows){let meta;try{meta=JSON.parse(row.status)}catch{continue}if(meta.state==='failed'&&meta.attempts<3&&Number(meta.nextRetryAt||0)<=Date.now())events.push({userId:row.user_id,mail:{...storage.decrypt(row.payload),id:row.message_id,__retryChannelId:row.channel_id}})} await pushTenantNotifications(events,deps); }
+async function retryTenantNotifications(deps={}) { const rows=storage.db.prepare('SELECT d.user_id,d.channel_id,d.message_id,d.status,m.payload FROM notification_deliveries d JOIN mail_messages m ON m.id=d.message_id AND m.user_id=d.user_id JOIN users u ON u.id=d.user_id AND u.enabled=1').all(); const events=[]; for(const row of rows){let meta;try{meta=JSON.parse(row.status)}catch{continue}if(meta.state==='failed'&&meta.attempts<3&&Number(meta.nextRetryAt||0)<=Date.now())events.push({userId:row.user_id,mail:{...storage.decrypt(row.payload),id:row.message_id,__retryChannelId:row.channel_id}})} await pushTenantNotifications(events,deps); }
 function loadDataFromDisk() {
   try {
     const parsed = storage.load(gData, DATA_FILE);
@@ -1604,17 +1613,17 @@ app.put("/api/v1/notifications", (req, res) => {
     const incoming = Array.isArray(req.body.channels) ? req.body.channels : [];
     const previous = tenant.channels;
     const channels = incoming.map((channel, index) => {
-      if (!CHANNELS[channel.type])
+      if (!Object.hasOwn(CHANNELS, channel.type))
         throw new Error(`未知通知渠道: ${channel.type}`);
       const old = previous.find(
         (item) => item.id === channel.id || item.type === channel.type,
       );
-      return {
+      return validateChannelPolicy({
         id: old?.id || channel.id || `${channel.type}_${Date.now()}_${index}`,
         type: channel.type,
         enabled: channel.enabled === true,
         config: { ...(old?.config || {}), ...(channel.config || {}) },
-      };
+      }, req.user.role);
     });
     const shareLinkDays = Math.min(365, Math.max(1, Number(req.body.shareLinkDays) || 30));
     const quota = storage.db.prepare('SELECT notification_limit FROM quotas WHERE user_id=?').get(req.user.id)?.notification_limit;
@@ -1635,24 +1644,26 @@ app.put("/api/v1/notifications", (req, res) => {
 
 app.post("/api/v1/notifications/:type/test", async (req, res) => {
   const type = req.params.type;
-  if (!CHANNELS[type])
+  if (!Object.hasOwn(CHANNELS, type))
     return res.status(404).json({ success: false, message: "通知渠道不存在" });
   const tenant = loadTenantState(storage, req.user.id); const saved = tenant.channels.find(
     (item) => item.type === type,
   );
   const channel = {
     type,
+    enabled: true,
     config: { ...(saved?.config || {}), ...(req.body.config || {}) },
   };
   try {
+    const validatedChannel = validateChannelPolicy(channel, req.user.role);
     await send(
-      channel,
+      validatedChannel,
       messageFor({
         subject: "InboxHarbor 通知测试",
         account: "local@inboxharbor.app",
         sender: "InboxHarbor",
         content: "渠道连接正常。之后的新邮件可按当前设置发送完整正文。",
-      }),
+      }), req.user.role,
     );
     authService.audit(req.user, 'notification.channel.tested', 'notification_channel', saved?.id || null, { type });
     res.json({ success: true, message: `${CHANNELS[type].name} 测试成功` });
@@ -2296,7 +2307,7 @@ app.post("/api/mails/clear", (req, res) => {
 
 // --- PARALLEL ULTRA HIGH-SPEED BACKGROUND POLLING LOOP (1-SECOND REAL-TIME INTERVAL) ---
 let isPolling = false;
-setInterval(async () => {
+const backgroundPollTimer = setInterval(async () => {
   if (isPolling) return;
   // Poll mailboxes continuously so the mail center stays current even when notifications are disabled.
 
@@ -2328,14 +2339,16 @@ setInterval(async () => {
 // Seed initial memory set from disk
 loadDataFromDisk();
 
-function startServer() {
-  instanceLock ||= acquireInstanceLock(DATA_DIR);
+function startServer(options = {}) {
+  if (options.exit) leaseExitHandler = options.exit;
+  instanceLock ||= acquireInstanceLock(DATA_DIR, lockOptions(options.lockOptions));
   const server = app.listen(PORT, HOST, () => {
   console.log(`====================================================`);
   console.log(` ⚓ InboxHarbor（收件港）- 本机邮箱管理台`);
   console.log(` 🚀 访问地址: http://${HOST}:${PORT}`);
   console.log(`====================================================`);
   });
+  activeServer = server;
   const close = () => shutdown(server);
   process.once('SIGINT', close); process.once('SIGTERM', close);
   return server;
@@ -2344,11 +2357,11 @@ let shuttingDown = false;
 function shutdown(server, done = () => {}) {
   if (shuttingDown) return done();
   shuttingDown = true;
-  const finish = () => { try { storage.close(); } finally { try { instanceLock?.release(); } finally { done(); } } };
+  const finish = () => { clearInterval(backgroundPollTimer); try { storage.close(); } finally { try { instanceLock?.release(); } finally { activeServer=null; done(); } } };
   if (!server) return finish();
   // stop accepting first; force-close only after a bounded drain period.
   const timer = setTimeout(() => { try { server.closeAllConnections?.(); } catch {} finish(); }, 5000).unref();
   server.close(() => { clearTimeout(timer); finish(); });
 }
 if(require.main===module)startServer();
-module.exports={app,startServer,shutdown,syncAndPersistAccount,pushTenantNotifications,retryTenantNotifications,getOrCreateShare,setSyncCoreForTest:(fn)=>{syncCoreForTest=fn||processSingleAccountFetchCore;},__storage:storage,__auth:authService,closeStorage:()=>{storage.close();instanceLock?.release();}};
+module.exports={app,startServer,shutdown,syncAndPersistAccount,pushTenantNotifications,retryTenantNotifications,getOrCreateShare,setSyncCoreForTest:(fn)=>{syncCoreForTest=fn||processSingleAccountFetchCore;},__storage:storage,__auth:authService,__instanceLock:()=>instanceLock,closeStorage:()=>{clearInterval(backgroundPollTimer);storage.close();instanceLock?.release();}};

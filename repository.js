@@ -56,5 +56,5 @@ class UserRepository {
   }
   decode(kind, row) { if (!row) return null; return ('payload' in row) ? { ...row, payload: this.storage.decrypt(row.payload) } : row; }
 }
-function listAllAccountsWithUser(storage) { return storage.db.prepare('SELECT id,user_id,provider,address,payload FROM mail_accounts').all().map((row) => ({ userId: row.user_id, account: { ...storage.decrypt(row.payload), id: row.id, provider: row.provider, username: row.address } })); }
+function listAllAccountsWithUser(storage) { return storage.db.prepare('SELECT a.id,a.user_id,a.provider,a.address,a.payload FROM mail_accounts a JOIN users u ON u.id=a.user_id AND u.enabled=1').all().map((row) => ({ userId: row.user_id, account: { ...storage.decrypt(row.payload), id: row.id, provider: row.provider, username: row.address } })); }
 module.exports = { UserRepository, listAllAccountsWithUser };

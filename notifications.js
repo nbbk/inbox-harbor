@@ -36,7 +36,7 @@ function messageFor(mail = {}) {
   return { title, content, html };
 }
 async function postJson(url, payload, headers = {}) {
-  const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(payload), signal: AbortSignal.timeout(10000) });
+  const response = await fetch(url, { method: 'POST', redirect: 'error', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(payload), signal: AbortSignal.timeout(10000) });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response;
 }
@@ -66,9 +66,67 @@ function validateEmailConfig(config = {}) {
   const port = Number(config.port); if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('SMTP 端口无效');
   return { host: config.host, port, secure: String(config.secure).toLowerCase() === 'true', auth: { user: config.username, pass: config.password }, from: config.from, to: config.to };
 }
-async function send(channel, message) {
-  const c = channel.config || {};
-  switch (channel.type) {
+
+// Notification targets are an outbound network boundary.  Do not rely on the
+// browser catalog for this: saved configuration and "test" requests use this
+// same policy so a crafted request cannot turn a normal member into an SSRF
+// proxy.
+const MEMBER_FIXED_CHANNELS = new Set(['telegram', 'bark', 'wxpusher', 'pushplus', 'serverchan', 'wecom', 'dingtalk']);
+const OFFICIAL_WEBHOOK_HOSTS = {
+  wecom: new Set(['qyapi.weixin.qq.com']),
+  dingtalk: new Set(['oapi.dingtalk.com']),
+};
+function isPrivateOrLocalHost(hostname) {
+  const host = String(hostname || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host || host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host === '::1') return true;
+  // URL normalizes IPv4-mapped forms such as ::ffff:127.0.0.1 to their
+  // hexadecimal representation.  No mapped IPv6 literal is an acceptable
+  // notification target, so reject both spellings before any request.
+  if (/(^|:)ffff:/i.test(host)) return true;
+  if (/^127\./.test(host) || /^0\./.test(host) || /^10\./.test(host) || /^169\.254\./.test(host) || /^192\.168\./.test(host)) return true;
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(host)) return true;
+  return /^(?:fc|fd|fe8|fe9|fea|feb)/.test(host);
+}
+function validateExternalUrl(value, { allowedHosts, label = 'URL' } = {}) {
+  let parsed;
+  try { parsed = new URL(String(value || '').trim()); } catch { throw new Error(`${label} 必须是有效的 http(s) 地址`); }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') throw new Error(`${label} 仅允许 http(s) 地址`);
+  if (parsed.username || parsed.password) throw new Error(`${label} 不允许包含用户信息`);
+  if (isPrivateOrLocalHost(parsed.hostname)) throw new Error(`${label} 不允许指向本机、内网或链路本地地址`);
+  if (allowedHosts && !allowedHosts.has(parsed.hostname.toLowerCase())) throw new Error(`${label} 必须使用官方地址`);
+  return parsed.toString();
+}
+function validateSmtpHost(host) {
+  const normalized = String(host || '').trim();
+  if (!normalized || /[\s/@]/.test(normalized) || isPrivateOrLocalHost(normalized)) throw new Error('SMTP Host 不允许使用本机或内网地址');
+  return normalized;
+}
+function validateChannelPolicy(channel = {}, role = 'user') {
+  const type = String(channel.type || '').toLowerCase();
+  if (!Object.hasOwn(CHANNELS, type)) throw new Error(`未知通知渠道: ${type || '未提供'}`);
+  if (role !== 'owner' && !MEMBER_FIXED_CHANNELS.has(type)) throw new Error('此通知渠道仅 Owner 可配置');
+  const config = { ...(channel.config || {}) };
+  if (type === 'bark' && config.serverUrl) {
+    config.serverUrl = validateExternalUrl(config.serverUrl, {
+      allowedHosts: role === 'owner' ? undefined : new Set(['api.day.app']),
+      label: 'Bark Server URL',
+    }).replace(/\/$/, '');
+  }
+  if (type === 'wecom' || type === 'dingtalk') {
+    if (config.webhookUrl) config.webhookUrl = validateExternalUrl(config.webhookUrl, { allowedHosts: OFFICIAL_WEBHOOK_HOSTS[type], label: `${CHANNELS[type].name} Webhook` });
+    else if (channel.enabled) throw new Error(`${CHANNELS[type].name} 缺少 Webhook URL`);
+  }
+  if (type === 'webhook') {
+    if (config.url) config.url = validateExternalUrl(config.url, { label: 'Webhook URL' });
+    else if (channel.enabled) throw new Error('Webhook 缺少 URL');
+  }
+  if (type === 'email' && config.host) config.host = validateSmtpHost(config.host);
+  return { ...channel, type, config };
+}
+async function send(channel, message, role) {
+  if (!role) throw new Error('通知发送缺少用户角色上下文');
+  const checked = validateChannelPolicy(channel, role), c = checked.config || {};
+  switch (checked.type) {
     case 'telegram': return postJson(`https://api.telegram.org/bot${c.token}/sendMessage`, { chat_id: c.chatId, text: `${message.title}\n\n${message.content}` });
     case 'bark': return postJson(`${(c.serverUrl || 'https://api.day.app').replace(/\/$/, '')}/push`, { device_key: c.deviceKey, title: message.title, body: message.content });
     case 'wxpusher': return postJson('https://wxpusher.zjiecode.com/api/send/message', { appToken: c.appToken, content: `${message.title}\n\n${message.content}`, summary: message.title, contentType: 1, uids: String(c.uids || '').split(',').map(x => x.trim()).filter(Boolean) });
@@ -92,8 +150,8 @@ async function send(channel, message) {
     default: throw new Error('未知通知渠道');
   }
 }
-async function sendAll(config, mail) {
+async function sendAll(config, mail, role) {
   const message = messageFor(mail);
-  return Promise.allSettled((config.channels || []).filter(c => c.enabled).map(c => send(c, message)));
+  return Promise.allSettled((config.channels || []).filter(c => c.enabled).map(c => send(c, message, role)));
 }
-module.exports = { CHANNELS, publicConfig, send, sendAll, messageFor, dingtalkSignedUrl, validateEmailConfig, createShareToken, verifyShareToken, notificationDeliveryKey, clearOAuthSecrets };
+module.exports = { CHANNELS, publicConfig, send, sendAll, messageFor, postJson, dingtalkSignedUrl, validateEmailConfig, validateChannelPolicy, validateExternalUrl, isPrivateOrLocalHost, createShareToken, verifyShareToken, notificationDeliveryKey, clearOAuthSecrets };

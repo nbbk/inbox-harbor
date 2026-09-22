@@ -39,6 +39,12 @@
 
 ## 🚀 快速开始
 
+### 第一次进入与多用户
+
+访问站点后用终端 `npm run credentials` 显示的本机管理口令完成唯一 Owner 初始化；它只用于首次 bootstrap 初始化，不是日常登录密码。初始化会一次性展示恢复码，立即复制到离线密码管理器。随后所有人使用邮箱与密码登录；Owner 可邀请成员，或在管理后台显式开启公开注册。详见 [运维速查](docs/operations.md#多用户与恢复码)。
+
+不要手工填写 Google/Microsoft Client 环境变量：以 Owner 身份在“连接器设置”页面填写并加密保存。环境变量只适用于容器管理员强制托管配置。
+
 ### 默认方式：Docker Compose
 
 生产与宝塔部署请使用 Docker Compose，而不是直接运行 Node。仓库为公开仓库，无需 GitHub 账号、密码、Token 或 SSH Key，直接执行：

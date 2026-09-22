@@ -1,6 +1,7 @@
 (() => {
   const root = document.getElementById("harbor-ui");
   let currentUser = null;
+  let pendingRecoveryCodes = null;
   let authConfig = { ownerInitialized: true, allowPublicRegistration: false };
   const pendingInviteToken = new URLSearchParams(location.search).get("invite") || "";
   if (pendingInviteToken) history.replaceState({}, "", location.pathname);
@@ -76,11 +77,15 @@
     const invite = pendingInviteToken;
     if(invite){const accept=element("button","ih-button ih-button-quiet","接受邀请");accept.type="button";accept.onclick=()=>renderRegistration(invite);form.append(accept);}
     card.append(form);
+    const forgot=element("button","ih-button ih-button-quiet","忘记密码");forgot.type="button";forgot.onclick=renderRecoveryReset;card.append(forgot);
     box.append(card);
     root.append(box);
   }
-  function renderBootstrap(){renderAuthForm("初始化收件港","用启动终端显示的本机管理口令，创建唯一 Owner。",async values=>{await request("/api/auth/bootstrap",{method:"POST",headers:{Authorization:`Bearer ${values.recovery}`},body:JSON.stringify({email:values.email,password:values.password})});const result=await request("/api/auth/login",{method:"POST",body:JSON.stringify({email:values.email,password:values.password})});currentUser=result.user;authConfig.ownerInitialized=true;render();},true);}
-  function renderRegistration(inviteToken=""){renderAuthForm(inviteToken?"接受邀请":"创建账号",inviteToken?"设置你的登录邮箱和密码。":"公开注册已由管理员开启。",async values=>{const endpoint=inviteToken?"/api/auth/invitations/accept":"/api/auth/register";await request(endpoint,{method:"POST",body:JSON.stringify(inviteToken?{token:inviteToken,email:values.email,password:values.password}:{email:values.email,password:values.password})});const result=await request("/api/auth/login",{method:"POST",body:JSON.stringify({email:values.email,password:values.password})});currentUser=result.user;render();});}
+  function displayRecoveryCodes(codes){pendingRecoveryCodes=Array.isArray(codes)?codes.filter(Boolean):[];}
+  function renderRecoveryNotice(){if(!pendingRecoveryCodes?.length)return;const box=element('section','ih-card ih-recovery-notice');box.setAttribute('role','status');box.append(element('h2','','请保存恢复码'),element('p','ih-section-copy','这些恢复码只显示这一次。请复制或下载到离线密码管理器。'),element('pre','ih-recovery-codes',pendingRecoveryCodes.join('\n')));const copy=element('button','ih-button ih-button-quiet','复制恢复码');copy.type='button';copy.onclick=async()=>{await navigator.clipboard?.writeText(pendingRecoveryCodes.join('\n'));copy.textContent='已复制';};const download=element('button','ih-button ih-button-quiet','下载恢复码');download.type='button';download.onclick=()=>{const link=document.createElement('a');link.href=URL.createObjectURL(new Blob([pendingRecoveryCodes.join('\n')+'\n'],{type:'text/plain'}));link.download='inboxharbor-recovery-codes.txt';link.click();URL.revokeObjectURL(link.href);};const close=element('button','ih-button','我已安全保存');close.type='button';close.onclick=()=>{pendingRecoveryCodes=null;box.remove();};box.append(copy,download,close);root.append(box);}
+  function renderBootstrap(){renderAuthForm("初始化收件港","用启动终端显示的本机管理口令，创建唯一 Owner。",async values=>{const created=await request("/api/auth/bootstrap",{method:"POST",headers:{Authorization:`Bearer ${values.recovery}`},body:JSON.stringify({email:values.email,password:values.password})});displayRecoveryCodes(created.user.recoveryCodes);const result=await request("/api/auth/login",{method:"POST",body:JSON.stringify({email:values.email,password:values.password})});currentUser=result.user;authConfig.ownerInitialized=true;render();},true);}
+  function renderRecoveryReset(){renderAuthForm("恢复访问","输入邮箱、一次性恢复码和新密码。使用后会退出所有设备。",async values=>{await request('/api/auth/recovery/reset',{method:'POST',body:JSON.stringify({email:values.email,code:values.recovery,newPassword:values.password})});alert('密码已重置，请登录');renderLock();},true);}
+  function renderRegistration(inviteToken=""){renderAuthForm(inviteToken?"接受邀请":"创建账号",inviteToken?"设置你的登录邮箱和密码。":"公开注册已由管理员开启。",async values=>{const endpoint=inviteToken?"/api/auth/invitations/accept":"/api/auth/register";const created=await request(endpoint,{method:"POST",body:JSON.stringify(inviteToken?{token:inviteToken,email:values.email,password:values.password}:{email:values.email,password:values.password})});displayRecoveryCodes(created.user.recoveryCodes);const result=await request("/api/auth/login",{method:"POST",body:JSON.stringify({email:values.email,password:values.password})});currentUser=result.user;render();});}
   function renderAuthForm(title,description,submit,needsRecovery=false){root.innerHTML="";const box=element("div","ih-lock"),card=element("div");card.append(element("span","ih-mark","IH"),element("h1","",title),element("p","",description));const form=element("form");const email=document.createElement("input");email.type="email";email.placeholder="邮箱地址";email.required=true;const password=document.createElement("input");password.type="password";password.placeholder="至少 12 位密码";password.minLength=12;password.required=true;form.append(email,password);let recovery;if(needsRecovery){recovery=document.createElement("input");recovery.type="password";recovery.placeholder="本机管理口令（仅首次使用）";recovery.required=true;form.append(recovery);}const button=element("button","ih-button","继续");form.append(button);form.onsubmit=async e=>{e.preventDefault();button.disabled=true;try{await submit({email:email.value,password:password.value,recovery:recovery?.value});}catch(error){alert(error.message);button.disabled=false;}};const back=element("button","ih-button ih-button-quiet","返回登录");back.type="button";back.onclick=renderLock;form.append(back);card.append(form);box.append(card);root.append(box);}
   function element(tag, cls, text) {
     const n = document.createElement(tag);
@@ -150,6 +155,7 @@
       .querySelectorAll("[data-page]")
       .forEach((b) => (b.onclick = () => show(b.dataset.page)));
     load();
+    renderRecoveryNotice();
   }
   function show(page) {
     root
@@ -544,15 +550,15 @@
   }
   function profile() {
     const s = element("section", "ih-page"); s.id="ih-profile";
-    s.innerHTML='<div class="ih-section-head"><div><h1>个人中心</h1><p class="ih-section-copy">管理你的登录安全、用量和邮件共享链接。</p></div></div><div class="ih-profile-grid"><section class="ih-card"><h2>账户信息</h2><p id="ih-profile-identity">正在读取…</p><div id="ih-profile-quota" class="ih-quota"></div></section><form id="ih-password-form" class="ih-card"><h2>修改密码</h2><label class="ih-field-label">当前密码<input name="currentPassword" type="password" required></label><label class="ih-field-label">新密码<input name="newPassword" type="password" minlength="12" required></label><div class="ih-section-actions"><button class="ih-button" type="submit">更新密码</button><button class="ih-button ih-button-quiet" type="button" id="ih-logout-all">退出全部设备</button></div></form></div><section class="ih-card"><div class="ih-section-head"><div><h2>我的共享链接</h2><p class="ih-section-copy">已撤销或过期链接不会再公开邮件内容。</p></div></div><div id="ih-shares" class="ih-simple-list"></div></section>';
-    s.querySelector('#ih-password-form').onsubmit=async e=>{e.preventDefault();try{await request('/api/auth/change-password',{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(e.currentTarget)))});alert('密码已更新，请重新登录');lock();}catch(error){alert(error.message);}};
+    s.innerHTML='<div class="ih-section-head"><div><h1>个人中心</h1><p class="ih-section-copy">管理你的登录安全、用量和邮件共享链接。</p></div></div><div class="ih-profile-grid"><section class="ih-card"><h2>账户信息</h2><p id="ih-profile-identity">正在读取…</p><div id="ih-profile-quota" class="ih-quota"></div><button id="ih-recovery" class="ih-button ih-button-quiet" type="button">重新生成恢复码</button></section><form id="ih-password-form" class="ih-card"><h2>修改密码</h2><label class="ih-field-label">当前密码<input name="currentPassword" type="password" required></label><label class="ih-field-label">新密码<input name="newPassword" type="password" minlength="12" required></label><div class="ih-section-actions"><button class="ih-button" type="submit">更新密码</button><button class="ih-button ih-button-quiet" type="button" id="ih-logout-all">退出全部设备</button></div></form></div><section class="ih-card"><div class="ih-section-head"><div><h2>我的共享链接</h2><p class="ih-section-copy">已撤销或过期链接不会再公开邮件内容。</p></div></div><div id="ih-shares" class="ih-simple-list"></div></section>';
+    if(currentUser?.role==='user'){const danger=element('button','ih-button ih-button-danger','永久删除我的账户');danger.id='ih-delete-account';danger.type='button';s.append(danger);}s.querySelector('#ih-password-form').onsubmit=async e=>{e.preventDefault();try{await request('/api/auth/change-password',{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(e.currentTarget)))});alert('密码已更新，请重新登录');lock();}catch(error){alert(error.message);}};
     s.querySelector('#ih-logout-all').onclick=async()=>{await request('/api/auth/logout-all',{method:'POST'});lock();}; return s;
   }
   function admin(){const s=element('section','ih-page');s.id='ih-admin';s.innerHTML='<div class="ih-section-head"><div><h1>管理后台</h1><p class="ih-section-copy">仅展示必要的成员、邀请与实例审计信息。</p></div></div><div class="ih-admin-grid"><section class="ih-card"><h2>成员</h2><div id="ih-users" class="ih-simple-list"></div></section><section class="ih-card"><h2>创建邀请</h2><form id="ih-invite-form"><label class="ih-field-label">邮箱（可留空）<input name="email" type="email" placeholder="member@example.com"></label><label class="ih-field-label">角色<select name="role"><option value="user">成员</option><option value="admin">管理员</option></select></label><label class="ih-field-label">有效期（小时）<input name="ttlHours" type="number" min="1" max="720" value="72"></label><button class="ih-button" type="submit">生成邀请链接</button></form><div id="ih-invite-result" class="ih-invite-result"></div><div id="ih-invites" class="ih-simple-list"></div></section></div><section class="ih-card ih-owner-only" id="ih-public-registration"><h2>公开注册</h2><p>关闭时仅可通过邀请创建成员。</p><label class="ih-switch"><input type="checkbox" id="ih-public-toggle"><span class="ih-switch-track"></span><span class="ih-switch-label">允许公开注册</span></label></section><section class="ih-card"><h2>审计日志</h2><div id="ih-audit" class="ih-simple-list"></div></section>';return s;}
   async function loadUserAreas(){
     const profileIdentity=document.getElementById('ih-profile-identity'); if(profileIdentity){profileIdentity.textContent=`${currentUser.email} · ${currentUser.role}`;const quota=await request(`/api/auth/users/${encodeURIComponent(currentUser.id)}/quota`).catch(()=>({quota:null}));const q=quota.quota||{};document.getElementById('ih-profile-quota').textContent=`邮箱账户：${q.mail_account_limit??'未限制'} · 通知渠道：${q.notification_limit??'未限制'}`;const links=await request('/api/share-links').catch(()=>({links:[]}));const box=document.getElementById('ih-shares');box.replaceChildren();(links.links||[]).forEach(link=>{const row=element('div','ih-simple-row');row.append(element('span','',`${link.mailSubject||'邮件'} · ${link.expiresAt||'无期限'}`));const revoke=element('button','ih-button ih-button-quiet','撤销');revoke.onclick=async()=>{await request(`/api/share-links/${link.id}/revoke`,{method:'POST'});loadUserAreas();};row.append(revoke);box.append(row);});if(!(links.links||[]).length)box.textContent='暂无共享链接。';}
     if(!(currentUser.role==='owner'||currentUser.role==='admin'))return;
-    const [users,invites,audit]=await Promise.all([request('/api/auth/users'),request('/api/auth/invitations'),request('/api/auth/audit')]);const userBox=document.getElementById('ih-users');if(!userBox)return;userBox.replaceChildren();users.users.forEach(user=>{const row=element('div','ih-simple-row');row.append(element('span','',`${user.email} · ${user.role} · ${user.enabled?'启用':'已停用'}`));if(user.role!=='owner'){const toggle=element('button','ih-button ih-button-quiet',user.enabled?'停用':'启用');toggle.onclick=async()=>{await request(`/api/auth/users/${user.id}`,{method:'PATCH',body:JSON.stringify({enabled:!user.enabled})});loadUserAreas();};row.append(toggle);if(currentUser.role==='owner'){const role=element('select');role.append(new Option('成员','user'),new Option('管理员','admin'));role.value=user.role;role.onchange=async()=>{await request(`/api/auth/users/${user.id}`,{method:'PATCH',body:JSON.stringify({role:role.value})});loadUserAreas();};row.append(role);}}userBox.append(row);});
+    const [users,invites,audit]=await Promise.all([request('/api/auth/users'),request('/api/auth/invitations'),request('/api/auth/audit')]);const userBox=document.getElementById('ih-users');if(!userBox)return;userBox.replaceChildren();users.users.forEach(user=>{const row=element('div','ih-simple-row');row.append(element('span','',`${user.email} · ${user.role} · ${user.enabled?'启用':'已停用'}`));if(user.role!=='owner'){const toggle=element('button','ih-button ih-button-quiet',user.enabled?'停用':'启用');toggle.onclick=async()=>{await request(`/api/auth/users/${user.id}`,{method:'PATCH',body:JSON.stringify({enabled:!user.enabled})});loadUserAreas();};row.append(toggle);if(currentUser.role==='owner'){const role=element('select');role.append(new Option('成员','user'),new Option('管理员','admin'));role.value=user.role;role.onchange=async()=>{await request(`/api/auth/users/${user.id}`,{method:'PATCH',body:JSON.stringify({role:role.value})});loadUserAreas();};const erase=element('button','ih-button ih-button-danger','删除');erase.onclick=async()=>{const currentPassword=prompt(`输入当前 Owner 密码以删除 ${user.email}`);if(!currentPassword||!confirm(`永久删除 ${user.email} 及其全部数据？`))return;try{await request(`/api/auth/users/${user.id}`,{method:'DELETE',body:JSON.stringify({currentPassword})});loadUserAreas();}catch(error){alert(error.message);}};row.append(role,erase);}}userBox.append(row);});
     const inviteBox=document.getElementById('ih-invites');inviteBox.replaceChildren();invites.invitations.forEach(invite=>{const row=element('div','ih-simple-row');row.append(element('span','',`${invite.email||'通用邀请'} · ${invite.role} · ${invite.accepted_at?'已接受':invite.revoked_at?'已撤销':'有效'}`));if(!invite.accepted_at&&!invite.revoked_at){const cancel=element('button','ih-button ih-button-quiet','撤销');cancel.onclick=async()=>{await request(`/api/auth/invitations/${invite.id}`,{method:'DELETE'});loadUserAreas();};row.append(cancel);}inviteBox.append(row);});
     const form=document.getElementById('ih-invite-form');form.onsubmit=async e=>{e.preventDefault();try{const values=Object.fromEntries(new FormData(form));const out=await request('/api/auth/invitations',{method:'POST',body:JSON.stringify(values)});const url=`${location.origin}${location.pathname}?invite=${encodeURIComponent(out.token)}`;const result=document.getElementById('ih-invite-result');result.textContent=url;await navigator.clipboard?.writeText(url);loadUserAreas();}catch(error){alert(error.message);}};
     const auditBox=document.getElementById('ih-audit');auditBox.replaceChildren();audit.events.forEach(event=>auditBox.append(element('div','ih-simple-row',`${event.created_at} · ${event.actor_email||'系统'} · ${event.action}`)));
@@ -713,6 +719,7 @@
         renderChannels();
       }
       loadUserAreas().catch(() => {});
+      setTimeout(()=>{const recovery=document.getElementById('ih-recovery');if(recovery)recovery.onclick=async()=>{const currentPassword=prompt('输入当前密码以生成新恢复码');if(!currentPassword)return;try{const result=await request('/api/auth/recovery/regenerate',{method:'POST',body:JSON.stringify({currentPassword})});alert(`请立即保存以下恢复码（仅显示一次）：\n${result.recoveryCodes.join('\n')}`);}catch(error){alert(error.message);}};const remove=document.getElementById('ih-delete-account');if(remove)remove.onclick=async()=>{const currentPassword=prompt('输入当前密码以永久删除账户');if(!currentPassword)return;if(!confirm('邮件、账户、通知和共享链接将被永久删除。'))return;try{await request('/api/auth/me',{method:'DELETE',body:JSON.stringify({currentPassword})});lock();}catch(error){alert(error.message);}};},0);
     } catch (err) {
       alert(err.message);
       if (/口令/.test(err.message)) lock();
@@ -785,6 +792,9 @@
     const list = document.getElementById("ih-channel-list");
     list.textContent = "";
     Object.entries(catalog).forEach(([type, meta]) => {
+      // Members can use only provider-controlled endpoints.  The server
+      // enforces the same rule; this is an intentionally clear UI affordance.
+      if (currentUser?.role !== "owner" && ["email", "webhook"].includes(type)) return;
       const saved = config.channels.find((c) => c.type === type);
       const card = element("div", "ih-channel");
       const top = element("div", "ih-channel-top");
@@ -809,6 +819,11 @@
           : f.placeholder;
         input.dataset.key = f.key;
         input.type = "password";
+        if (currentUser?.role !== "owner" && type === "bark" && f.key === "serverUrl") {
+          input.disabled = true;
+          input.placeholder = "成员仅可使用官方 api.day.app";
+          input.title = "成员不能配置自定义 Bark 服务地址";
+        }
         wrap.append(label, input);
         fields.append(wrap);
       });
@@ -861,6 +876,10 @@
       card.dataset.type = type;
       list.append(card);
     });
+    if (currentUser?.role !== "owner") {
+      const note = element("p", "ih-section-copy", "仅 Owner（宿主机运营者）可配置 SMTP、通用 Webhook 与自定义 Bark 服务地址；成员和管理员仅可使用官方推送服务。");
+      list.prepend(note);
+    }
     document.getElementById("ih-share-days").value = config.shareLinkDays || 30;
     document.getElementById("ih-save").onclick = saveChannels;
   }

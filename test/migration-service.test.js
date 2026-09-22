@@ -53,3 +53,28 @@ test('critical durability preflight changes no live files when unavailable', () 
   setDirectorySync((_dir, options) => { if (options?.critical && options?.preflight) { const error = new Error('no durable directory sync'); error.code = 'DURABILITY_UNAVAILABLE'; throw error; } });
   try { assert.throws(() => restoreBackup(dir, snapshot.path), (error) => error.code === 'DURABILITY_UNAVAILABLE'); assert.deepEqual(fs.readFileSync(path.join(dir, 'inboxharbor.db')), before); assert.equal(fs.existsSync(path.join(dir, 'restore-journal.json')), false); } finally { setDirectorySync(null); }
 });
+test('environment-key restore verifies a non-secret key verifier before touching live data', () => {
+  const old = process.env.INBOXHARBOR_MASTER_KEY, key = Buffer.alloc(32, 21).toString('base64'), wrong = Buffer.alloc(32, 22).toString('base64');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ih-env-restore-')); process.env.INBOXHARBOR_MASTER_KEY = key;
+  const storage = new Storage(dir); storage.save({ generation: 'backup-secret' }); const snapshot = backup(dir, storage); storage.save({ generation: 'live-secret' }); storage.close();
+  const before = fs.readFileSync(path.join(dir, 'inboxharbor.db'));
+  setDirectorySync(()=>{});
+  try {
+    assert.equal(snapshot.manifest.key.source, 'environment'); assert.match(snapshot.manifest.key.verifier, /^[a-f0-9]{64}$/);
+    process.env.INBOXHARBOR_MASTER_KEY = wrong;
+    assert.throws(() => restoreBackup(dir, snapshot.path), /不匹配/);
+    assert.deepEqual(fs.readFileSync(path.join(dir, 'inboxharbor.db')), before);
+    assert.equal(fs.existsSync(path.join(dir, 'restore-journal.json')), false);
+    process.env.INBOXHARBOR_MASTER_KEY = key;
+    restoreBackup(dir, snapshot.path);
+    const restored = new Storage(dir); assert.equal(restored.load({}, null).generation, 'backup-secret'); restored.close();
+  } finally { setDirectorySync(null); if (old === undefined) delete process.env.INBOXHARBOR_MASTER_KEY; else process.env.INBOXHARBOR_MASTER_KEY = old; }
+});
+test('v1 environment-key backup without a key file is decrypted with the current environment key', () => {
+  const old = process.env.INBOXHARBOR_MASTER_KEY, key = Buffer.alloc(32, 31).toString('base64'), wrong = Buffer.alloc(32, 32).toString('base64');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ih-v1-env-')); process.env.INBOXHARBOR_MASTER_KEY = key;
+  const storage = new Storage(dir); storage.save({ generation: 'v1-backup' }); const snapshot = backup(dir, storage); storage.save({ generation: 'v1-live' }); storage.close();
+  const manifestPath = path.join(snapshot.path, 'manifest.json'), manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')); manifest.version = 1; delete manifest.key; fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+  setDirectorySync(()=>{});
+  try { process.env.INBOXHARBOR_MASTER_KEY = wrong; assert.throws(() => restoreBackup(dir, snapshot.path), /暂存恢复解密校验失败/); process.env.INBOXHARBOR_MASTER_KEY = key; restoreBackup(dir, snapshot.path); const restored = new Storage(dir); assert.equal(restored.load({}, null).generation, 'v1-backup'); restored.close(); } finally { setDirectorySync(null); if (old === undefined) delete process.env.INBOXHARBOR_MASTER_KEY; else process.env.INBOXHARBOR_MASTER_KEY = old; }
+});

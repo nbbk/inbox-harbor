@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { DatabaseSync } = require('node:sqlite');
+const { decodeMasterKey } = require('./storage');
 
 const id = () => crypto.randomUUID();
 const now = () => new Date().toISOString();
@@ -34,6 +35,9 @@ function inside(directory, candidate) {
   return value;
 }
 function sha256(file) { return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'); }
+const keyVerifier = (key) => crypto.createHmac('sha256', key).update('InboxHarbor backup key verifier v1').digest('hex');
+function keyMetadata(root, storage) { return { source: process.env.INBOXHARBOR_MASTER_KEY ? 'environment' : fs.existsSync(path.join(root, 'inboxharbor.key')) ? 'file' : 'external', verifier: keyVerifier(storage.key) }; }
+function environmentKeyFor(manifest) { if (manifest.key?.source !== 'environment' && !(manifest.version===1 && process.env.INBOXHARBOR_MASTER_KEY)) return null; if (!process.env.INBOXHARBOR_MASTER_KEY) throw new Error('该备份使用 INBOXHARBOR_MASTER_KEY；恢复前必须提供原环境密钥'); const key = decodeMasterKey(process.env.INBOXHARBOR_MASTER_KEY); if (manifest.key?.source === 'environment') { const expected = Buffer.from(manifest.key.verifier, 'hex'), actual = Buffer.from(keyVerifier(key), 'hex'); if (expected.length !== actual.length || !crypto.timingSafeEqual(expected, actual)) throw new Error('INBOXHARBOR_MASTER_KEY 与备份不匹配；未修改 live 数据'); } return key; }
 function atomicCopy(source, destination) {
   const temporary = `${destination}.${crypto.randomUUID()}.tmp`;
   const input = fs.openSync(source, 'r'), output = fs.openSync(temporary, 'wx', 0o600);
@@ -56,7 +60,7 @@ function backup(directory, storage) {
     const source = path.join(root, name);
     if (fs.existsSync(source)) { const destination = path.join(target, name); atomicCopy(source, destination); files.push({ name, size: fs.statSync(destination).size, sha256: sha256(destination) }); }
   }
-  const manifest = { version: 1, directory: root, files, createdAt: now() };
+  const manifest = { version: 2, directory: root, files, key: keyMetadata(root, storage), createdAt: now() };
   fs.writeFileSync(path.join(target, 'manifest.json'), JSON.stringify(manifest, null, 2), { mode: 0o600 });
   return { path: target, manifest };
 }
@@ -64,21 +68,22 @@ function verifyBackup(directory, backupPath) {
   const target = inside(directory, backupPath), manifestPath = path.join(target, 'manifest.json');
   if (!fs.existsSync(manifestPath)) throw new Error('备份缺少 manifest.json');
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-  if (path.resolve(manifest.directory) !== path.resolve(directory) || !Array.isArray(manifest.files)) throw new Error('备份清单与当前 DATA_DIR 不匹配');
+  if (![1,2].includes(manifest.version) || path.resolve(manifest.directory) !== path.resolve(directory) || !Array.isArray(manifest.files)) throw new Error('备份清单与当前 DATA_DIR 不匹配');
+  if (manifest.version>=2 && (!manifest.key || !['environment','file','external'].includes(manifest.key.source) || !/^[a-f0-9]{64}$/.test(manifest.key.verifier))) throw new Error('备份密钥清单无效');
   for (const item of manifest.files) { const name = item.name; const file = path.join(target, name); if (!['inboxharbor.db', 'inboxharbor.key', 'inboxharbor.admin-token', 'data.json'].includes(name) || !Number.isInteger(item.size) || !/^[a-f0-9]{64}$/.test(item.sha256) || !fs.existsSync(file) || fs.statSync(file).size !== item.size || sha256(file) !== item.sha256) throw new Error('备份清单无效或文件已损坏'); }
   return { target, manifest };
 }
 function atomicJson(file, value, critical = true) { const tmp = `${file}.${crypto.randomUUID()}.tmp`; if (critical) preflightCritical(path.dirname(file)); const fd = fs.openSync(tmp, 'wx', 0o600); try { fs.writeFileSync(fd, JSON.stringify(value)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); } durableRename(tmp, file, critical); }
 function safeGeneration(root, value, prefix) { const safe = inside(root, value); if (safe === root || path.basename(safe).startsWith(prefix) === false || (fs.existsSync(safe) && fs.lstatSync(safe).isSymbolicLink())) throw new Error('恢复目录不安全'); return safe; }
-function verifyGeneration(root, stage, manifest) {
+function verifyGeneration(root, stage, manifest, suppliedKey = null) {
   for (const item of manifest.files) { const file = path.join(stage, item.name); if (!fs.existsSync(file) || fs.lstatSync(file).isSymbolicLink() || sha256(file) !== item.sha256) return false; }
   const dbPath = path.join(stage, 'inboxharbor.db');
   if (!fs.existsSync(dbPath)) return true;
-  let db; try { db = new DatabaseSync(dbPath); if (db.prepare('PRAGMA foreign_key_check').all().length) return false; const row = db.prepare("SELECT value FROM kv WHERE key='state'").get(); if (row && fs.existsSync(path.join(stage, 'inboxharbor.key'))) { const key = fs.readFileSync(path.join(stage, 'inboxharbor.key')); const item = JSON.parse(row.value); const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(item.iv, 'base64')); decipher.setAuthTag(Buffer.from(item.tag, 'base64')); JSON.parse(Buffer.concat([decipher.update(Buffer.from(item.data, 'base64')), decipher.final()]).toString('utf8')); } return true; } catch { return false; } finally { try { db?.close(); } catch {} }
+  let db; try { db = new DatabaseSync(dbPath); if (db.prepare('PRAGMA foreign_key_check').all().length) return false; const row = db.prepare("SELECT value FROM kv WHERE key='state'").get(); if (row) { const key = suppliedKey || (fs.existsSync(path.join(stage, 'inboxharbor.key')) ? fs.readFileSync(path.join(stage, 'inboxharbor.key')) : null); if (!key) return false; const item = JSON.parse(row.value); const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(item.iv, 'base64')); decipher.setAuthTag(Buffer.from(item.tag, 'base64')); JSON.parse(Buffer.concat([decipher.update(Buffer.from(item.data, 'base64')), decipher.final()]).toString('utf8')); } return true; } catch { return false; } finally { try { db?.close(); } catch {} }
 }
-function verifyLiveGeneration(root) {
+function verifyLiveGeneration(root, suppliedKey = null) {
   const dbPath = path.join(root, 'inboxharbor.db'); if (!fs.existsSync(dbPath)) return true;
-  let db; try { db = new DatabaseSync(dbPath); if (db.prepare('PRAGMA foreign_key_check').all().length) return false; const row = db.prepare("SELECT value FROM kv WHERE key='state'").get(); if (row && fs.existsSync(path.join(root, 'inboxharbor.key'))) { const key = fs.readFileSync(path.join(root, 'inboxharbor.key')), item = JSON.parse(row.value), decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(item.iv, 'base64')); decipher.setAuthTag(Buffer.from(item.tag, 'base64')); JSON.parse(Buffer.concat([decipher.update(Buffer.from(item.data, 'base64')), decipher.final()]).toString('utf8')); } return true; } catch { return false; } finally { try { db?.close(); } catch {} }
+  let db; try { db = new DatabaseSync(dbPath); if (db.prepare('PRAGMA foreign_key_check').all().length) return false; const row = db.prepare("SELECT value FROM kv WHERE key='state'").get(); if (row) { const key = suppliedKey || (fs.existsSync(path.join(root, 'inboxharbor.key')) ? fs.readFileSync(path.join(root, 'inboxharbor.key')) : null); if (!key) return false; const item = JSON.parse(row.value), decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(item.iv, 'base64')); decipher.setAuthTag(Buffer.from(item.tag, 'base64')); JSON.parse(Buffer.concat([decipher.update(Buffer.from(item.data, 'base64')), decipher.final()]).toString('utf8')); } return true; } catch { return false; } finally { try { db?.close(); } catch {} }
 }
 function recoverInterruptedRestore(directory) {
   const root = path.resolve(directory), journalPath = path.join(root, 'restore-journal.json');
@@ -89,16 +94,17 @@ function recoverInterruptedRestore(directory) {
   for (const item of journal.manifest.files) if (!journal.files.includes(item.name) || !Number.isInteger(item.size) || !/^[a-f0-9]{64}$/.test(item.sha256)) throw new Error('恢复 journal manifest 无效');
   const stage = safeGeneration(root, journal.stage, 'restore-stage-'), previous = safeGeneration(root, journal.previous, 'restore-previous-'); if (stage === previous) throw new Error('恢复目录不安全');
   const manifest = journal.manifest;
+  const suppliedKey = environmentKeyFor(manifest);
   const update = (phase) => { journal.phase = phase; atomicJson(journalPath, journal); };
   try {
-    if (verifyGeneration(root, stage, manifest)) {
+    if (verifyGeneration(root, stage, manifest, suppliedKey)) {
       update('recover-completing-stage');
       for (const name of journal.files) { const live = path.join(root, name), staged = path.join(stage, name); if (fs.existsSync(staged)) { if (fs.existsSync(live)) durableRename(live, path.join(previous, `${name}.partial`), true); durableRename(staged, live, true); update(`new:${name}`); } }
     } else {
       update('recover-restoring-previous');
       for (const name of journal.files) { const live = path.join(root, name), old = path.join(previous, name); if (fs.existsSync(old)) { if (fs.existsSync(live)) durableRename(live, path.join(stage, `${name}.partial`), true); durableRename(old, live, true); update(`old:${name}`); } }
     }
-    if (!verifyLiveGeneration(root)) throw new Error('恢复后 generation 校验失败');
+    if (!verifyLiveGeneration(root, suppliedKey)) throw new Error('恢复后 generation 校验失败');
     durableUnlink(journalPath, true); fs.rmSync(stage, { recursive: true, force: true }); directorySync(root, { critical: true }); fs.rmSync(previous, { recursive: true, force: true }); directorySync(root, { critical: true }); return { recovered: true };
   } catch (error) { throw new Error(`中断恢复未完成：${error.message}`); }
 }
@@ -107,17 +113,21 @@ function restoreBackup(directory, backupPath, options = {}) {
   const root = path.resolve(directory), journalPath = path.join(root, 'restore-journal.json');
   const stage = inside(root, path.join(root, `restore-stage-${crypto.randomUUID()}`));
   const previous = inside(root, path.join(root, `restore-previous-${crypto.randomUUID()}`));
+  // Fail before creating any restore artifact when an environment-key backup is
+  // being restored without the exact key that encrypted it.
+  const suppliedKey = environmentKeyFor(manifest);
   // Prove durability support before creating any journal/generation artifact.
   preflightCritical(root); fs.mkdirSync(stage); fs.mkdirSync(previous);
   try {
     // Validate the entire staged generation before replacing any live component.
     for (const item of manifest.files) atomicCopy(path.join(target, item.name), path.join(stage, item.name));
     for (const item of manifest.files) if (sha256(path.join(stage, item.name)) !== item.sha256) throw new Error('暂存恢复校验失败');
+    if (!verifyGeneration(root, stage, manifest, suppliedKey)) throw new Error('暂存恢复解密校验失败');
     const journal = { version: 1, root, stage, previous, live: root, files: manifest.files.map((item) => item.name), manifest, phase: 'validated' }; atomicJson(journalPath, journal);
     let changes = 0; const tick = () => { changes += 1; if (options.failAfterRename === changes) throw new Error('injected restore interruption'); };
     for (const item of manifest.files) { const live = path.join(root, item.name); if (fs.existsSync(live)) { durableRename(live, path.join(previous, item.name), true); journal.phase = `previous:${item.name}`; atomicJson(journalPath, journal); tick(); } }
     for (const item of manifest.files) { durableRename(path.join(stage, item.name), path.join(root, item.name), true); journal.phase = `live:${item.name}`; atomicJson(journalPath, journal); tick(); }
-    if (!verifyLiveGeneration(root)) throw new Error('恢复 generation 校验失败');
+    if (!verifyLiveGeneration(root, suppliedKey)) throw new Error('恢复 generation 校验失败');
     // Keep the completed journal if cleanup durability cannot be confirmed.
     preflightCritical(root); durableUnlink(journalPath, true); fs.rmSync(stage, { recursive: true, force: true }); directorySync(root, { critical: true }); fs.rmSync(previous, { recursive: true, force: true }); directorySync(root, { critical: true });
     return { restored: manifest.files.map((item) => item.name), backupPath: target };

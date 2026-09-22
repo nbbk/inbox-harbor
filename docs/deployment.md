@@ -96,30 +96,33 @@ chmod +x scripts/update-linux.sh
 
 ## 备份与恢复
 
-数据库位于命名卷；默认自动生成的主密钥和管理口令也在同一卷。若通过 `.env` 自定义了主密钥、管理口令或 OAuth 配置，则 `.env` 也是备份的一部分。为保证 SQLite 一致性，先停止应用；备份写入仓库外、仅 root 可读的目录：
+数据库位于命名卷；默认自动生成的主密钥和管理口令也在同一卷。先使用应用命令生成 SQLite 一致性快照（带 SHA-256 manifest），再将该**快照目录**导出到卷外、仅 root 可读的目录：
 
 ```sh
 mkdir -p /root/inboxharbor-backups
 chmod 700 /root/inboxharbor-backups
 docker compose stop inboxharbor
-docker run --rm -v inboxharbor-data:/data -v /root/inboxharbor-backups:/backup alpine tar czf /backup/inboxharbor-data-backup.tgz -C /data .
-[ ! -f .env ] || install -m 600 .env /root/inboxharbor-backups/inboxharbor.env
+docker compose run --rm inboxharbor npm run backup
+# 将输出的 migration-backup-... 目录名替换到下方 <snapshot>
+docker run --rm -v inboxharbor-data:/data -v /root/inboxharbor-backups:/export alpine sh -c 'cp -a /data/<snapshot> /export/<snapshot> && chmod -R go-rwx /export/<snapshot>'
+sha256sum /root/inboxharbor-backups/<snapshot>/manifest.json | tee /root/inboxharbor-backups/<snapshot>/manifest.json.sha256
 docker compose start inboxharbor
 ```
 
-`.env` 保存 OAuth 应用配置，不在数据卷中，因此存在时也要一并备份。若自定义了 `INBOXHARBOR_ADMIN_TOKEN` 或 `INBOXHARBOR_MASTER_KEY`，它们同样在此文件中。
+如果 `.env` 提供 `INBOXHARBOR_MASTER_KEY` 或管理口令，它不写入应用快照；单独以 `install -m 600 .env /root/inboxharbor-backups/inboxharbor.env` 备份。环境密钥快照只记录不可逆 verifier，恢复时必须提供同一密钥。
 
-恢复会覆盖卷内现有数据。先列出归档以验证文件可读：必须包含 `inboxharbor.db`；默认配置还应包含 `inboxharbor.key` 和 `inboxharbor.admin-token`。若密钥或口令由环境变量提供，相应文件可以不存在，但备份目录中必须有包含原值的 `inboxharbor.env`。验证成功后才停止并清空旧数据：
+恢复绝不先清空 live 卷。先校验导出 manifest，再创建一份当前 live 快照，把已验证的快照目录暂存回卷，最后由应用执行 staging、SQLite/解密校验和原子切换：
 
 ```sh
-docker run --rm -v /root/inboxharbor-backups:/backup alpine tar tzf /backup/inboxharbor-data-backup.tgz
-docker compose down
-docker run --rm -v inboxharbor-data:/data -v /root/inboxharbor-backups:/backup alpine sh -c 'find /data -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + && tar xzf /backup/inboxharbor-data-backup.tgz -C /data'
-[ ! -f /root/inboxharbor-backups/inboxharbor.env ] || install -m 600 /root/inboxharbor-backups/inboxharbor.env .env
+sha256sum -c /root/inboxharbor-backups/<snapshot>/manifest.json.sha256
+docker compose stop inboxharbor
+docker compose run --rm inboxharbor npm run backup
+docker run --rm -v inboxharbor-data:/data -v /root/inboxharbor-backups:/export alpine sh -c 'test -f /export/<snapshot>/manifest.json && cp -a /export/<snapshot> /data/<snapshot>'
+docker compose run --rm inboxharbor npm run backup -- --restore <snapshot>
 docker compose up -d
 ```
 
-不要运行 `docker compose down -v`，它会删除命名卷；也不要只恢复数据库而丢失 `inboxharbor.key`。
+若使用环境密钥，先以权限 600 恢复/加载正确 `.env`，否则应用会在触碰 live 数据前拒绝恢复。不要运行 `docker compose down -v`，它会删除命名卷；也不要只恢复数据库而丢失 `inboxharbor.key`。
 
 ## 卸载
 
