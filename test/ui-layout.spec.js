@@ -65,12 +65,13 @@ for (const width of [1440,390]) {
     expect(box.x).toBeGreaterThanOrEqual(0);expect(box.y).toBeGreaterThanOrEqual(0);
     expect(box.x+box.width).toBeLessThanOrEqual(width);expect(box.y+box.height).toBeLessThanOrEqual(900);
     await page.keyboard.press('Escape');await expect(dialog).toBeVisible();
-    await page.screenshot({path:info.outputPath('recovery-'+width+'.png'),fullPage:true,mask:[page.locator('.ih-recovery-codes')]});
+    await page.screenshot({path:info.outputPath('recovery-'+width+'.png'),fullPage:false,mask:[page.locator('.ih-recovery-codes')],maskColor:'#e9f1f5'});
     await dialog.getByRole('button',{name:'我已安全保存'}).click();
     await expect(dialog).toHaveCount(0);
     await (width<768?page.locator('.ih-mobile').getByRole('button',{name:'通知',exact:true}):page.getByRole('button',{name:'通知渠道',exact:true})).click();
     await expect(page.locator('#ih-notifications')).toBeVisible();
-    await expect(page.locator('.ih-channel')).toHaveCount(9);
+    // Members cannot configure SMTP or arbitrary Webhook targets.
+    await expect(page.locator('.ih-channel')).toHaveCount(7);
     await page.locator('#ih-save').scrollIntoViewIfNeeded();
     expect(await page.locator('.ih-recovery-codes').count()).toBe(0);
     expect(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth)).toBe(false);
