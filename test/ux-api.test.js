@@ -18,7 +18,11 @@ test("health projection uses stable safe categories without provider detail", ()
   assert.equal(accountHealth({ status: "active", syncEnabled: false }).state, "paused");
   assert.equal(accountHealth({ status: "invalid", lastSyncError: "invalid_grant: refresh token abc" }).state, "authorization");
   assert.equal(accountHealth({ status: "active", syncStatus: "failed", lastSyncError: "ENOTFOUND internal.example" }).state, "network");
-  assert.equal(accountHealth({ status: "active", syncStatus: "failed", lastSyncError: "unexpected sync failure" }).state, "unsynced");
+  assert.equal(accountHealth({ status: "active", syncStatus: "failed", lastSyncError: "unexpected sync failure" }).state, "sync_failed");
+  assert.equal(safeFailure("authorization").code, "authorization");
+  assert.equal(accountHealth({ provider: "imap" }).state, "unsupported");
+  assert.equal(accountHealth({ status: "active", syncStatus: "syncing" }).state, "syncing");
+  assert.equal(safeFailure("未配置 Google Client ID").code, "configuration");
   assert.equal(safeFailure("permission denied for token xyz").code, "permission");
 });
 
@@ -64,7 +68,7 @@ test("tenant health, manual partial sync, filters, and delivery history are safe
       JSON.stringify({ state: "delivered", attempts: 1 }), "2026-01-02T12:00:00.000Z",
     );
     __storage.db.prepare("INSERT INTO notification_deliveries VALUES (?,?,?,?,?,?)").run(
-      "alice-malformed", users["alice@example.test"].id, null, null, "not-json", "2026-01-02T12:00:00.000Z",
+      "alice-malformed", users["alice@example.test"].id, null, null, "null", "2026-01-02T12:00:00.000Z",
     );
 
     const login = async (email) => {

@@ -203,7 +203,7 @@ let gData = {
   classificationRules: [],
 };
 
-function parseDeliveryStatus(value) { try { return JSON.parse(value || '{}'); } catch { return {}; } }
+function parseDeliveryStatus(value) { try { const parsed = JSON.parse(value || '{}'); return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}; } catch { return {}; } }
 function claimTenantDelivery(userId, channelId, messageId, now, claimTtlMs = 120000) {
   storage.db.exec('BEGIN IMMEDIATE');
   try {
@@ -1682,11 +1682,11 @@ app.get("/api/v1/notifications/deliveries", (req, res) => {
       id: row.id,
       kind: isTest ? "test" : "mail",
       state: ["pending", "sending", "delivered", "failed"].includes(meta.state) ? meta.state : "pending",
-      attempts: Math.max(0, Number(meta.attempts || 0)),
+      attempts: Number.isFinite(Number(meta.attempts)) ? Math.max(0, Number(meta.attempts)) : 0,
       createdAt: isoTime(row.created_at),
       updatedAt: isoTime(meta.updatedAt) || isoTime(row.created_at),
       nextRetryAt: isTest || Number(meta.attempts || 0) >= 3 ? null : isoTime(meta.nextRetryAt),
-      channelType: row.channel_type || meta.channelType || "unknown",
+      channelType: Object.hasOwn(CHANNELS, row.channel_type || meta.channelType || "") ? (row.channel_type || meta.channelType) : "unknown",
       mail: storedMail ? { id: row.message_id, subject: String(storedMail.subject || ""), sender: String(storedMail.sender || ""), account: String(storedMail.account || ""), receivedAt: isoTime(storedMail.receivedAt) } : null,
       error: failed ? safeFailure(meta.error?.code || meta.error || "delivery_failed") : null,
       deliveryNote: "渠道接受不代表终端已读。",
@@ -2167,7 +2167,7 @@ async function summarizeManualSync(userId, account) {
       const current = tenant.accounts.find((item) => item.id === account.id);
       if (current) {
         const expected = current.storageUpdatedAt;
-        const failure = safeFailure(error, "authorization");
+        const failure = safeFailure(error, "sync_failed");
         const toStore = { ...current, syncStatus: "failed", syncFailures: Number(current.syncFailures || 0) + 1, lastSyncError: failure.code, lastChecked: new Date().toISOString() };
         delete toStore.storageUpdatedAt;
         delete toStore.storageCreatedAt;
@@ -2182,6 +2182,7 @@ async function summarizeManualSync(userId, account) {
 app.post("/api/accounts/fetch-mail", async (req, res) => {
   const tenant = loadTenantState(storage, req.user.id);
   const { ids } = req.body || {};
+  if (ids !== undefined && (!Array.isArray(ids) || ids.some(id => typeof id !== "string"))) return res.status(400).json({ success: false, message: "请选择有效的邮箱账户" });
   const selectedAccounts = tenant.accounts.filter(
     (acc) => !ids || ids.length === 0 || ids.includes(acc.id),
   );
