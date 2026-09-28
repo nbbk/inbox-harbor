@@ -86,6 +86,9 @@ test("notification rules save channel ids and quiet hours", async ({page}) => {
   expect(body.rules[0].sender).toBe("alerts@example.com");
   expect(body.dedupeMinutes).toBe(5);
   await page.screenshot({path:"test-results/ui-policy-desktop.png",fullPage:true});
+  await page.setViewportSize({width:390,height:844});
+  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=document.documentElement.clientWidth)).toBe(true);
+  await page.screenshot({path:"test-results/ui-policy-mobile.png",fullPage:true});
 });
 
 test("connector check exposes ready state and actionable limitation", async ({page}) => {

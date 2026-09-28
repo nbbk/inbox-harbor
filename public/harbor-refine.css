@@ -169,3 +169,15 @@ body:has(dialog.ih-recovery-notice[open]) { overflow: hidden; }
 @media(max-width:768px){.ih-rule-row{grid-template-columns:1fr}.ih-rule-channels{grid-column:1}.ih-quiet-hours label{min-width:0}}
 
 #cx-result {display:block;flex-basis:100%;min-width:0;overflow-wrap:anywhere}.ih-connector-check{padding:12px 0;border-bottom:1px solid #dbe6eb}.ih-connector-check p{margin:6px 0;font-size:13px;line-height:1.6}
+
+.ih-quiet-hours {display:flex;flex-wrap:wrap;gap:16px;align-items:end;padding:16px;border:1px solid #dbe6eb;border-radius:8px;margin-top:16px}
+.ih-quiet-hours label {display:grid;gap:6px;font-size:13px;color:#385567}
+.ih-quiet-hours input:not([type=checkbox]) {min-height:40px;border:1px solid #c8d7df;border-radius:7px;padding:8px 10px;color:#28465a;background:#fff;max-width:100%;box-sizing:border-box}
+.ih-quiet-hours input[type=checkbox] {width:18px;height:18px}
+@media(max-width:600px){
+ .ih-mail-tools {grid-template-columns:repeat(2,minmax(0,1fr))}
+ .ih-mail-tools .ih-mail-search {grid-column:1/-1}
+ .ih-mail-tools input,.ih-mail-tools select {min-width:0;max-width:100%;box-sizing:border-box}
+ .ih-quiet-hours {display:grid;grid-template-columns:1fr 1fr}
+ .ih-quiet-hours label:last-child {grid-column:1/-1}
+}
