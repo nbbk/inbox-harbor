@@ -341,12 +341,12 @@ test("connector setup guides beginners, saves once, and supports multiple mailbo
   await page.getByRole("button", { name: "连接器设置" }).click();
   await expect(page.getByText("每个平台只配置一次应用")).toBeVisible();
   await expect(page.getByText("如何授权多个邮箱")).toBeVisible();
-  await page.getByText("Google 新手配置教程（展开逐步操作）").click();
-  await expect(page.getByRole("link", { name: "Google Cloud 新建项目" })).toHaveAttribute(
+  await page.getByText("Google 新手配置教程（长期使用 · 展开逐步操作）").click();
+  await expect(page.getByRole("link", { name: "新建项目" })).toHaveAttribute(
     "href",
     "https://console.cloud.google.com/projectcreate",
   );
-  await expect(page.getByRole("link", { name: "Gmail API", exact: true })).toHaveAttribute(
+  await expect(page.getByRole("link", { name: "Gmail API 配置页", exact: true })).toHaveAttribute(
     "href",
     "https://console.cloud.google.com/apis/library/gmail.googleapis.com",
   );
