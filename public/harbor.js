@@ -314,7 +314,7 @@
       finally { button.disabled = false; button.textContent = "刷新列表"; }
     };
     s.querySelector("#ih-compose").onclick = openCompose;
-    const scheduleFilter = () => { ++mailRequestSequence; mailState.selectedIds = []; writePreferences(); clearTimeout(mailState.searchTimer); mailState.searchTimer = setTimeout(() => loadMailPage(1), 250); };
+    const scheduleFilter = () => { ++mailRequestSequence; mailState.selectedIds = []; renderBatchToolbar(mailState.mails); writePreferences(); clearTimeout(mailState.searchTimer); mailState.searchTimer = setTimeout(() => loadMailPage(1), 250); };
     s.querySelector("#ih-mail-search").oninput = (event) => { mailState.query = event.target.value.trim(); scheduleFilter(); };
     s.querySelector("#ih-mail-sender").oninput = (event) => { mailState.sender = event.target.value.trim(); scheduleFilter(); };
     s.querySelector("#ih-mail-account").onchange = (event) => { mailState.account = event.target.value; writePreferences(); loadMailPage(1); };
@@ -740,7 +740,7 @@
   }
   function addNotificationRule(rule={}) {
     const box=document.getElementById("ih-rules-list"); if(!box)return;
-    const row=element("div","ih-rule-row"); row.dataset.id=rule.id||crypto.randomUUID();
+    const row=element("div","ih-rule-row"); row.dataset.id=rule.id||("rule_"+Date.now()+"_"+Math.random().toString(36).slice(2,10));
     const field=(title,node)=>{const label=element("label","ih-field-label",title);label.append(node);return label;};
     const enabled=document.createElement("input");enabled.type="checkbox";enabled.className="ih-rule-enabled";enabled.checked=rule.enabled!==false;enabled.setAttribute("aria-label","启用规则");
     const account=document.createElement("select");account.className="ih-rule-account";account.append(new Option("所有账户",""));
@@ -784,14 +784,17 @@
       document.getElementById("ih-rules-save").disabled=false;document.getElementById("ih-rules-add").disabled=false;
     } catch(error){if(status.isConnected)status.textContent="规则未加载："+error.message;}
   }
-  async function saveNotificationRules() {
-    const button=document.getElementById("ih-rules-save"),status=document.getElementById("ih-rules-status");
-    const rules=[...document.querySelectorAll("#ih-rules-list .ih-rule-row")].map(row=>({
+  function captureNotificationRules() {
+return [...document.querySelectorAll("#ih-rules-list .ih-rule-row")].map(row=>({
       id:row.dataset.id,enabled:row.querySelector(".ih-rule-enabled").checked,
       accountId:row.querySelector(".ih-rule-account").value||null,
       sender:row.querySelector(".ih-rule-sender").value.trim(),keyword:row.querySelector(".ih-rule-keyword").value.trim(),
       channelIds:[...row.querySelectorAll(".ih-rule-channels input:checked")].map(input=>input.value)
     }));
+  }
+  async function saveNotificationRules() {
+    const button=document.getElementById("ih-rules-save"),status=document.getElementById("ih-rules-status");
+    const rules=captureNotificationRules();
     if(rules.some(rule=>!rule.channelIds.length)){status.textContent="每条规则至少选择一个已保存的通知渠道。";return;}
     const quietHours={enabled:document.getElementById("ih-quiet-enabled").checked,start:document.getElementById("ih-quiet-start").value,end:document.getElementById("ih-quiet-end").value,timeZone:document.getElementById("ih-quiet-timezone").value.trim()};
     const dedupeMinutes=Number(document.getElementById("ih-dedupe-minutes").value);
@@ -1083,7 +1086,7 @@
           method: "POST",
           body: "{}",
         });
-        renderConnectorCheck(check,result,"配置已保存。");
+        renderConnectorCheck(check,result,"保存成功。");
         secret.value = "";
         document.getElementById("cx-clear").checked = false;
         await loadConnectors();
@@ -1118,7 +1121,7 @@
       await loadMailPage(mailState.page || 1);
       if (loadSequence !== activeLoadSequence || epoch !== sessionEpoch || !currentUser) return;
       loadConnectors().catch(() => {});
-      if (notices) { catalog = notices.catalog; config = notices.configuration; renderChannels(); if (document.getElementById("ih-rules-list")) loadNotificationRules().catch(()=>{}); loadNotificationHistory().catch(()=>{}); }
+      if (notices) { catalog = notices.catalog; config = notices.configuration; renderChannels(); if (document.getElementById("ih-rules-list")) { if(rulesLoaded){const draft=captureNotificationRules();document.getElementById("ih-rules-list").replaceChildren();draft.forEach(addNotificationRule);}else loadNotificationRules().catch(()=>{}); } loadNotificationHistory().catch(()=>{}); }
       loadUserAreas().catch(() => {});
       setTimeout(()=>{const recovery=document.getElementById('ih-recovery');if(recovery)recovery.onclick=async()=>{const currentPassword=prompt('输入当前密码以生成新恢复码');if(!currentPassword)return;try{const result=await request('/api/auth/recovery/regenerate',{method:'POST',body:JSON.stringify({currentPassword})});displayRecoveryCodes(result.recoveryCodes);renderRecoveryNotice();}catch(error){alert(error.message);}};const remove=document.getElementById('ih-delete-account');if(remove)remove.onclick=async()=>{const currentPassword=prompt('输入当前密码以永久删除账户');if(!currentPassword)return;if(!confirm('邮件、账户、通知和共享链接将被永久删除。'))return;try{await request('/api/auth/me',{method:'DELETE',body:JSON.stringify({currentPassword})});lock();}catch(error){alert(error.message);}};},0);
     } catch (err) {

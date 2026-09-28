@@ -80,7 +80,7 @@ test("notification rules save channel ids and quiet hours", async ({page}) => {
   await row.locator(".ih-rule-channels input[value=channel-a]").check();
   await page.locator("#ih-quiet-enabled").check();
   await page.locator("#ih-quiet-start").fill("22:00"); await page.locator("#ih-quiet-end").fill("07:00");
-  await page.getByRole("button",{name:"保存规则"}).click();
+  await page.getByRole("button",{name:"保存规则",exact:true}).click();
   await expect.poll(()=>body).toMatchObject({quietHours:{enabled:true,start:"22:00",end:"07:00",timeZone:"Asia/Shanghai"}});
   expect(body.rules[0].channelIds).toEqual(["channel-a"]);
   expect(body.rules[0].sender).toBe("alerts@example.com");
