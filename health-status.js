@@ -12,6 +12,10 @@ const HEALTH_COPY = Object.freeze({
   unsupported: { label: "历史账户", hint: "当前仅支持 Google 和 Microsoft OAuth，请重新添加受支持的邮箱。" },
   paused: { label: "已暂停", hint: "该邮箱的读取或同步已暂停。" },
   unsynced: { label: "尚未同步", hint: "请完成一次手动同步或等待后台同步。" },
+  official_target: { label: "必须使用官方地址", hint: "成员和管理员只能使用该渠道的官方服务地址。" },
+  owner_only: { label: "仅 Owner 可配置", hint: "请联系 Owner 配置此类通知渠道。" },
+  private_target: { label: "不能使用内网地址", hint: "通知目标不能指向本机或内网，请检查渠道地址。" },
+  channel_configuration: { label: "渠道配置不完整或格式无效", hint: "请检查该渠道的必填字段和地址格式后重新测试。" },
   delivery_failed: { label: "投递失败", hint: "渠道暂未接受本次通知，请检查渠道设置与重试状态。" },
 });
 
@@ -23,7 +27,11 @@ function textOf(value) {
 function safeFailure(value, fallback = "delivery_failed") {
   const text = textOf(value).toLowerCase();
   let code = Object.hasOwn(HEALTH_COPY, text) ? text : fallback;
-  if (/未配置|配置.*缺失|invalid_client|client.*(?:missing|secret)|客户端.*配置/.test(text)) code = "configuration";
+  if (/官方地址/.test(text)) code = "official_target";
+  else if (/仅 owner/.test(text)) code = "owner_only";
+  else if (/内网|链路本地/.test(text)) code = "private_target";
+  else if (/smtp.*(?:缺少|端口)|webhook.*缺少|headers json|必须是有效|仅允许 http|不允许包含用户信息/.test(text)) code = "channel_configuration";
+  else if (/未配置|配置.*缺失|invalid_client|client.*(?:missing|secret)|客户端.*配置/.test(text)) code = "configuration";
   else if (/timeout|timed out|econn|enotfound|eai_again|network|socket|proxy|网络|超时|连接/.test(text)) code = "network";
   else if (/forbidden|permission|scope|mail\.read|mail\.send|access denied|权限|范围/.test(text)) code = "permission";
   else if (/invalid_grant|invalid token|token.*(?:expired|revoked)|oauth|authorize|授权|登录/.test(text)) code = "authorization";

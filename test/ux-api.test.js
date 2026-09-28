@@ -19,6 +19,7 @@ test("health projection uses stable safe categories without provider detail", ()
   assert.equal(accountHealth({ status: "invalid", lastSyncError: "invalid_grant: refresh token abc" }).state, "authorization");
   assert.equal(accountHealth({ status: "active", syncStatus: "failed", lastSyncError: "ENOTFOUND internal.example" }).state, "network");
   assert.equal(accountHealth({ status: "active", syncStatus: "failed", lastSyncError: "unexpected sync failure" }).state, "sync_failed");
+  assert.equal(safeFailure("Bark 必须使用官方地址").code, "official_target");
   assert.equal(safeFailure("authorization").code, "authorization");
   assert.equal(accountHealth({ provider: "imap" }).state, "unsupported");
   assert.equal(accountHealth({ status: "active", syncStatus: "syncing" }).state, "syncing");
