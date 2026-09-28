@@ -23,6 +23,7 @@ const { BoundedAuthRateLimiter } = require("./auth-rate-limiter");
 const { loadOrCreateAdminToken } = require("./instance-config");
 const { acquireInstanceLock, dataDirectory } = require("./instance-lock");
 const { loadTenantState, enforceQuota } = require("./tenant-state");
+const { accountHealth, safeFailure, isoTime } = require("./health-status");
 const { registerBrandingRoutes } = require("./branding");
 const { listAllAccountsWithUser } = require("./repository");
 const { recoverInterruptedRestore } = require("./migration-service");
@@ -202,7 +203,7 @@ let gData = {
   classificationRules: [],
 };
 
-function parseDeliveryStatus(value) { try { return JSON.parse(value || '{}'); } catch { return {}; } }
+function parseDeliveryStatus(value) { try { const parsed = JSON.parse(value || '{}'); return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}; } catch { return {}; } }
 function claimTenantDelivery(userId, channelId, messageId, now, claimTtlMs = 120000) {
   storage.db.exec('BEGIN IMMEDIATE');
   try {
@@ -213,7 +214,7 @@ function claimTenantDelivery(userId, channelId, messageId, now, claimTtlMs = 120
     if (meta.state === 'delivered' || (meta.state === 'failed' && (Number(meta.attempts || 0) >= 3 || retryAt > now)) || (meta.state === 'sending' && (Number(meta.attempts || 0) >= 3 || leaseUntil > now))) {
       storage.db.exec('COMMIT'); return null;
     }
-    meta = { ...meta, state: 'sending', attempts: Number(meta.attempts || 0) + 1, nextRetryAt: null, claimedAt: now, claimId: crypto.randomUUID() };
+    meta = { ...meta, state: 'sending', attempts: Number(meta.attempts || 0) + 1, nextRetryAt: null, claimedAt: now, claimId: crypto.randomUUID(), updatedAt: new Date(now).toISOString(), error: null };
     if (row) storage.db.prepare('UPDATE notification_deliveries SET status=? WHERE id=? AND user_id=?').run(JSON.stringify(meta), row.id, userId);
     else {
       const id = crypto.randomUUID();
@@ -223,19 +224,38 @@ function claimTenantDelivery(userId, channelId, messageId, now, claimTtlMs = 120
     storage.db.exec('COMMIT'); return { id: row.id, meta };
   } catch (error) { storage.db.exec('ROLLBACK'); throw error; }
 }
-function finishTenantDelivery(userId, delivery, ok, now) {
+function finishTenantDelivery(userId, delivery, ok, now, failure = null) {
   storage.db.exec('BEGIN IMMEDIATE');
   try {
     const row = storage.db.prepare('SELECT status FROM notification_deliveries WHERE id=? AND user_id=?').get(delivery.id, userId);
     const meta = row && parseDeliveryStatus(row.status);
     if (!meta || meta.claimId !== delivery.meta.claimId) { storage.db.exec('COMMIT'); return false; }
     meta.state = ok ? 'delivered' : 'failed';
-    meta.nextRetryAt = ok ? null : now + Math.min(900000, 30000 * 2 ** (Number(meta.attempts || 1) - 1));
+    const attempts = Number(meta.attempts || 0);
+    meta.nextRetryAt = ok || attempts >= 3 ? null : now + Math.min(900000, 30000 * 2 ** (attempts - 1));
+    meta.updatedAt = new Date(now).toISOString();
+    meta.error = ok ? null : safeFailure(failure);
     delete meta.claimId; delete meta.claimedAt;
     storage.db.prepare('UPDATE notification_deliveries SET status=? WHERE id=? AND user_id=?').run(JSON.stringify(meta), delivery.id, userId);
     storage.db.exec('COMMIT'); return true;
   } catch (error) { storage.db.exec('ROLLBACK'); throw error; }
 }
+function recordTenantTestDelivery(userId, channelId, type, ok, failure = null) {
+  const now = new Date().toISOString();
+  const status = {
+    kind: "test",
+    state: ok ? "delivered" : "failed",
+    attempts: 1,
+    channelType: type,
+    updatedAt: now,
+    nextRetryAt: null,
+    error: ok ? null : safeFailure(failure),
+  };
+  storage.db.prepare("INSERT INTO notification_deliveries VALUES (?,?,?,?,?,?)").run(
+    crypto.randomUUID(), userId, channelId || null, null, JSON.stringify(status), now,
+  );
+}
+
 async function pushTenantNotifications(events, deps = {}) {
   const now = deps.now || Date.now(), sendFn = deps.sendFn || send, messageFn = deps.messageForFn || messageFor, claimTtlMs = deps.claimTtlMs || 120000;
   for (const { userId, mail } of events || []) {
@@ -249,16 +269,17 @@ async function pushTenantNotifications(events, deps = {}) {
       const delivery = claimTenantDelivery(userId, channel.id, mail.id, now, claimTtlMs);
       if (!delivery) continue;
       const flight = (async () => {
-        let ok = false;
+        let ok = false, failure = null;
         try {
           const share = getOrCreateShare(userId, mail.id, Number(storage.db.prepare('SELECT value FROM instance_settings WHERE key=?').get(`user:${userId}:shareLinkDays`)?.value) || 30);
           validateChannelPolicy(channel, user.role);
           await sendFn(channel, messageFn({ ...mail, appUrl: `${PUBLIC_BASE_URL}/shared/mail/${share.token}` }), user.role);
           ok = true;
         } catch (e) {
+          failure = e;
           authService.audit(userId, 'notification.delivery.failed', 'notification_channel', channel.id, { type: channel.type });
         } finally {
-          finishTenantDelivery(userId, delivery, ok, now);
+          finishTenantDelivery(userId, delivery, ok, now, failure);
         }
       })().finally(() => { if (deliverySendFlights.get(flightKey) === flight) deliverySendFlights.delete(flightKey); });
       deliverySendFlights.set(flightKey, flight);
@@ -778,6 +799,7 @@ async function verifyGoogleAccount(acc) {
   }
 
   const { clientId, clientSecret, refreshToken } = parseCredentials(acc);
+  let networkFailure = false;
 
   if (refreshToken) {
     try {
@@ -811,12 +833,15 @@ async function verifyGoogleAccount(acc) {
           error: null,
         };
       }
-    } catch (err) {}
+      if (resp.status === 429 || resp.status >= 500) networkFailure = true;
+    } catch (err) {
+      networkFailure = true;
+    }
   }
 
   return {
     status: "invalid",
-    error: "请点击右侧【授权】连接谷歌账号",
+    error: networkFailure ? "网络通信异常" : "请点击右侧【授权】连接谷歌账号",
     accessToken: null,
   };
 }
@@ -1532,9 +1557,11 @@ function publicAccount(account) {
     token,
     _cachedToken,
     _cachedExpiresAt,
+    errorDetail,
+    lastSyncError,
     ...safe
   } = account;
-  return safe;
+  return { ...safe, health: accountHealth(account) };
 }
 
 app.get("/api/tg/config", (req, res) => res.status(410).json({ success: false, message: "旧 Telegram 配置接口已停用，请使用通知渠道设置。" }));
@@ -1625,6 +1652,47 @@ app.get("/api/v1/notifications", (req, res) => {
     catalog: CHANNELS,
     configuration: publicConfig({ includeFullBody: true, shareLinkDays, channels: tenant.channels }),
   });
+});
+
+app.get("/api/v1/notifications/deliveries", (req, res) => {
+  const state = String(req.query.state || "").trim().toLowerCase();
+  if (state && !["pending", "sending", "delivered", "failed"].includes(state))
+    return res.status(400).json({ success: false, message: "无效的投递状态" });
+  const positiveInt = (value, fallback, max) => {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, max) : fallback;
+  };
+  const page = positiveInt(req.query.page, 1, Number.MAX_SAFE_INTEGER);
+  const pageSize = positiveInt(req.query.pageSize || req.query.limit, 30, 100);
+  // status is historical JSON and may be malformed in old databases. Parse it
+  // defensively instead of relying on JSON text matching in SQL.
+  const allRows = storage.db.prepare("SELECT d.id,d.channel_id,d.message_id,d.status,d.created_at,c.type AS channel_type,m.payload AS message_payload FROM notification_deliveries d LEFT JOIN notification_channels c ON c.id=d.channel_id AND c.user_id=d.user_id LEFT JOIN mail_messages m ON m.id=d.message_id AND m.user_id=d.user_id WHERE d.user_id=? ORDER BY d.created_at DESC").all(req.user.id);
+  const matchingRows = state
+    ? allRows.filter((row) => parseDeliveryStatus(row.status).state === state)
+    : allRows;
+  const total = matchingRows.length;
+  const rows = matchingRows.slice((page - 1) * pageSize, page * pageSize);
+  const deliveries = rows.map((row) => {
+    const meta = parseDeliveryStatus(row.status);
+    let storedMail = null;
+    try { storedMail = row.message_payload ? storage.decrypt(row.message_payload) : null; } catch {}
+    const failed = meta.state === "failed";
+    const isTest = meta.kind === "test";
+    return {
+      id: row.id,
+      kind: isTest ? "test" : "mail",
+      state: ["pending", "sending", "delivered", "failed"].includes(meta.state) ? meta.state : "pending",
+      attempts: Number.isFinite(Number(meta.attempts)) ? Math.max(0, Number(meta.attempts)) : 0,
+      createdAt: isoTime(row.created_at),
+      updatedAt: isoTime(meta.updatedAt) || isoTime(row.created_at),
+      nextRetryAt: isTest || Number(meta.attempts || 0) >= 3 ? null : isoTime(meta.nextRetryAt),
+      channelType: Object.hasOwn(CHANNELS, row.channel_type || meta.channelType || "") ? (row.channel_type || meta.channelType) : "unknown",
+      mail: storedMail ? { id: row.message_id, subject: String(storedMail.subject || ""), sender: String(storedMail.sender || ""), account: String(storedMail.account || ""), receivedAt: isoTime(storedMail.receivedAt) } : null,
+      error: failed ? safeFailure(meta.error?.code || meta.error || "delivery_failed") : null,
+      deliveryNote: "渠道接受不代表终端已读。",
+    };
+  });
+  res.json({ success: true, deliveries, total, page, pageSize });
 });
 
 app.get("/api/v1/connectors", (req, res) =>
@@ -1720,9 +1788,8 @@ app.post("/api/v1/notifications/:type/test", async (req, res) => {
   const type = req.params.type;
   if (!Object.hasOwn(CHANNELS, type))
     return res.status(404).json({ success: false, message: "通知渠道不存在" });
-  const tenant = loadTenantState(storage, req.user.id); const saved = tenant.channels.find(
-    (item) => item.type === type,
-  );
+  const tenant = loadTenantState(storage, req.user.id);
+  const saved = tenant.channels.find((item) => item.type === type);
   const channel = {
     type,
     enabled: true,
@@ -1739,10 +1806,13 @@ app.post("/api/v1/notifications/:type/test", async (req, res) => {
         content: "渠道连接正常。之后的新邮件可按当前设置发送完整正文。",
       }), req.user.role,
     );
-    authService.audit(req.user, 'notification.channel.tested', 'notification_channel', saved?.id || null, { type });
+    recordTenantTestDelivery(req.user.id, saved?.id, type, true);
+    authService.audit(req.user, "notification.channel.tested", "notification_channel", saved?.id || null, { type });
     res.json({ success: true, message: `${CHANNELS[type].name} 测试成功` });
   } catch (error) {
-    res.status(400).json({ success: false, message: error.message });
+    recordTenantTestDelivery(req.user.id, saved?.id, type, false, error);
+    const safe = safeFailure(error);
+    res.status(400).json({ success: false, message: safe.label, error: safe });
   }
 });
 
@@ -2076,36 +2146,83 @@ function syncAndPersistAccount(userId, accountId) {
   accountSyncFlights.set(flightKey, flight); return flight;
 }
 
+async function summarizeManualSync(userId, account) {
+  try {
+    const result = await syncAndPersistAccount(userId, account.id);
+    const refreshed = loadTenantState(storage, userId).accounts.find((item) => item.id === account.id) || result.account || account;
+    const health = accountHealth(refreshed);
+    return {
+      accountId: account.id,
+      ok: result.stale !== true && health.state === "normal",
+      stale: result.stale === true,
+      newMailCount: result.notifiableMails?.length || 0,
+      health,
+      mails: result.notifiableMails || [],
+    };
+  } catch (error) {
+    // Persist a generic marker only. The original provider response may contain
+    // credentials, host names, or account-specific data and is never returned.
+    try {
+      const tenant = loadTenantState(storage, userId);
+      const current = tenant.accounts.find((item) => item.id === account.id);
+      if (current) {
+        const expected = current.storageUpdatedAt;
+        const failure = safeFailure(error, "sync_failed");
+        const toStore = { ...current, syncStatus: "failed", syncFailures: Number(current.syncFailures || 0) + 1, lastSyncError: failure.code, lastChecked: new Date().toISOString() };
+        delete toStore.storageUpdatedAt;
+        delete toStore.storageCreatedAt;
+        tenant.repo.updateIfUnchanged("accounts", current.id, toStore, { provider: toStore.provider, address: toStore.username }, expected);
+      }
+    } catch {}
+    const refreshed = loadTenantState(storage, userId).accounts.find((item) => item.id === account.id) || account;
+    return { accountId: account.id, ok: false, stale: false, newMailCount: 0, health: accountHealth(refreshed), mails: [] };
+  }
+}
+
 app.post("/api/accounts/fetch-mail", async (req, res) => {
   const tenant = loadTenantState(storage, req.user.id);
-  const { ids } = req.body;
-  const targetAccounts = tenant.accounts.filter(
-    (acc) =>
-      acc.readEnabled !== false &&
-      (!ids || ids.length === 0 || ids.includes(acc.id)),
+  const { ids } = req.body || {};
+  if (ids !== undefined && (!Array.isArray(ids) || ids.some(id => typeof id !== "string"))) return res.status(400).json({ success: false, message: "请选择有效的邮箱账户" });
+  const selectedAccounts = tenant.accounts.filter(
+    (acc) => !ids || ids.length === 0 || ids.includes(acc.id),
+  );
+  const summaries = selectedAccounts
+    .filter((account) => account.readEnabled === false || account.syncEnabled === false)
+    .map((account) => ({ accountId: account.id, ok: false, skipped: true, stale: false, newMailCount: 0, health: accountHealth(account) }));
+  const targetAccounts = selectedAccounts.filter(
+    (account) => account.readEnabled !== false && account.syncEnabled !== false,
   );
   const newMailsAll = [];
 
-  // Run in Parallel batches of 15
+  // A single bad provider response must not hide completed work from other
+  // accounts. Batches keep the existing concurrency ceiling.
   const batchSize = 15;
   for (let i = 0; i < targetAccounts.length; i += batchSize) {
-    const batch = targetAccounts.slice(i, i + batchSize);
     const batchResults = await Promise.all(
-      batch.map((acc) => syncAndPersistAccount(req.user.id, acc.id)),
+      targetAccounts.slice(i, i + batchSize).map((acc) => summarizeManualSync(req.user.id, acc)),
     );
-    batchResults.forEach((result) => newMailsAll.push(...result.notifiableMails));
+    for (const summary of batchResults) {
+      const { mails, ...publicSummary } = summary;
+      summaries.push(publicSummary);
+      newMailsAll.push(...mails);
+    }
   }
 
-
-  // Directly trigger Telegram Push for new mails!
   if (newMailsAll.length > 0) {
     await pushTenantNotifications(newMailsAll.map((mail) => ({ userId: req.user.id, mail })));
   }
 
+  const attemptedCount = summaries.filter((item) => !item.skipped).length;
+  const succeededCount = summaries.filter((item) => !item.skipped && item.ok).length;
   res.json({
     success: true,
     fetchedCount: newMailsAll.length,
     mails: newMailsAll,
+    attemptedCount,
+    succeededCount,
+    failedCount: attemptedCount - succeededCount,
+    skippedCount: summaries.length - attemptedCount,
+    results: summaries,
   });
 });
 
@@ -2186,7 +2303,18 @@ app.post("/api/accounts/send-test-mail", async (req, res) => {
 });
 
 app.get("/api/mails", (req, res) => {
-  const tenant = loadTenantState(storage, req.user.id); const result = queryMails(tenant.mails, req.query, tenant.rules);
+  const query = { ...req.query };
+  // Preserve from/to (sender/recipient) for existing clients; sender and
+  // start/end make the intended mail-sender and date-range filters explicit.
+  if (query.sender && !query.from) query.from = query.sender;
+  if (query.start && !query.dateFrom) query.dateFrom = query.start;
+  if (query.end && !query.dateTo) query.dateTo = query.end;
+  for (const field of ["dateFrom", "dateTo"]) {
+    if (query[field] && Number.isNaN(new Date(query[field]).valueOf()))
+      return res.status(400).json({ success: false, message: "时间范围格式无效" });
+  }
+  const tenant = loadTenantState(storage, req.user.id);
+  const result = queryMails(tenant.mails, query, tenant.rules);
   res.json({ success: true, ...result });
 });
 

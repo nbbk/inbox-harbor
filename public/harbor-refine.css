@@ -109,3 +109,47 @@ body:has(dialog.ih-recovery-notice[open]) { overflow: hidden; }
   .ih-recovery-codes { padding: 12px; font-size: 12px; }
   .ih-recovery-actions .ih-button:last-child { flex-basis: 100%; }
 }
+
+/* Mail experience: visible health, filters, delivery history and narrow-screen feedback. */
+.ih-mail-tools { display:grid; grid-template-columns:minmax(180px,2fr) minmax(150px,1fr) minmax(150px,1fr) minmax(130px,auto) minmax(130px,auto) auto; gap:10px; align-items:end; }
+.ih-mail-tools label { min-width:0; }
+.ih-mail-tools input,.ih-mail-tools select { width:100%; min-height:40px; }
+.ih-fetch-summary { min-height:22px; margin:8px 0; color:#486779; font-size:13px; }
+.ih-last-checked { display:grid; gap:3px; min-width:0; }
+.ih-last-checked b { color:#245e75; }
+.ih-last-checked small { color:#5c7685; overflow-wrap:anywhere; }
+.ih-code-box-prominent { border:2px solid #3b9ab9; background:#edf9fc; }
+.ih-code-box-prominent strong { font-size:26px; letter-spacing:.12em; }
+.ih-code-box-prominent small { display:block; margin-top:8px; color:#567082; }
+.ih-inline-feedback { max-width:240px; overflow-wrap:anywhere; }
+.ih-inline-feedback.success { color:#18734b; }
+.ih-inline-feedback.error { color:#a33838; }
+.ih-delivery-history { margin-top:18px; }
+.ih-delivery-row { align-items:flex-start; flex-wrap:wrap; }
+.ih-delivery-state { margin-left:auto; }
+@media (max-width: 900px) { .ih-mail-tools { grid-template-columns:repeat(2,minmax(0,1fr)); } .ih-mail-tools .ih-mail-search { grid-column:1/-1; } }
+@media (max-width: 600px) {
+  .ih-mail-tools { grid-template-columns:1fr; }
+  .ih-mail-tools .ih-mail-search { grid-column:auto; }
+  .ih-last-checked { display:grid; }
+  .ih-status { display:block; }
+  .ih-code-box-prominent strong { font-size:22px; }
+  .ih-delivery-state { margin-left:0; }
+}
+.ih-code-box-prominent{flex-wrap:wrap;gap:12px}.ih-code-box-prominent small{flex-basis:100%}.ih-delivery-detail{min-width:0;display:grid;gap:6px;flex:1;overflow-wrap:anywhere}.ih-delivery-error{color:#9a3636}.ih-history-controls{margin-bottom:12px}.ih-history-pager{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px}.ih-history-pager span{font-size:12px;color:#607888}.ih-last-checked::before{content:none!important}
+@media(max-width:1200px){.ih-mail-tools{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:600px){.ih-mail-tools{grid-template-columns:1fr}.ih-mail-tools .ih-mail-search{grid-column:auto}.ih-account-row .ih-status{display:none}.ih-delivery-row{display:block}.ih-delivery-state{display:block;margin-top:8px}}
+
+/* Keep health readable when the account table collapses to cards. */
+.ih-fetch-summary:empty { display:none; }
+.ih-last-checked b,.ih-last-checked small { display:block; line-height:1.6; }
+.ih-delivery-detail b { font:600 14px/1.5 Inter,system-ui,sans-serif; }
+.ih-delivery-detail small { font-size:12px; line-height:1.6; }
+.ih-history-controls select { min-height:40px; padding:8px 12px; border:1px solid #c8d7df; border-radius:7px; background:#fff; color:#28465a; }
+@media (min-width:1001px) and (max-width:1450px) {
+  .ih-account-row:not(.ih-account-row-head) .ih-last-checked { display:grid; grid-column:1/-1; grid-row:2; padding-top:0; }
+}
+@media (max-width:1000px) {
+  .ih-account-row .ih-last-checked { display:grid!important; grid-column:1/-1; grid-row:3; width:100%; }
+  .ih-account-row .ih-account-actions { grid-column:1/-1!important; grid-row:4; }
+}
