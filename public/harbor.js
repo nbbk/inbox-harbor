@@ -222,7 +222,7 @@
     [
       "概览|overview",
       "邮箱账户|accounts",
-      "连接器设置|connectors",
+      ...(currentUser?.role === "owner" ? ["连接器设置|connectors"] : []),
       "通知渠道|notifications",
       "个人中心|profile",
       ...(currentUser?.role === "owner" || currentUser?.role === "admin" ? ["管理后台|admin"] : []),
@@ -243,7 +243,7 @@
       head,
       overview(),
       accounts(),
-      connectors(),
+      ...(currentUser?.role === "owner" ? [connectors()] : []),
       notifications(),
       profile(),
       ...(currentUser?.role === "owner" || currentUser?.role === "admin" ? [admin()] : []),
@@ -254,7 +254,7 @@
     [
       "概览|overview",
       "账户|accounts",
-      "设置|connectors",
+      ...(currentUser?.role === "owner" ? ["设置|connectors"] : []),
       "通知|notifications",
       "我的|profile",
       ...(currentUser?.role === "owner" || currentUser?.role === "admin" ? ["管理|admin"] : []),
@@ -289,7 +289,7 @@
   function handleAuthorizationError(error) {
     alert(error.message);
     if (/未配置.*(CLIENT|OAuth)|请填写.*Client/i.test(error.message)) {
-      show("connectors");
+      show(currentUser?.role === "owner" ? "connectors" : "accounts");
       window.scrollTo({ top: 0, behavior: "smooth" });
     }
   }
@@ -713,6 +713,11 @@
     const s = element("section", "ih-page");
     s.id = "ih-accounts";
     s.innerHTML = '<div class="ih-section-head"><div><h1>邮箱账户</h1><p class="ih-section-copy">统一管理 Google 与 Microsoft 邮箱授权、收件和发信权限。</p></div><div class="ih-section-actions"><button id="ih-fetch" class="ih-button ih-button-quiet">手动取件</button><button id="ih-add" class="ih-button">添加邮箱</button></div></div><div id="ih-fetch-summary" class="ih-fetch-summary" role="status"></div><div class="ih-account-surface" id="ih-accounts-list">正在加载账户…</div>';
+    if(currentUser?.role!=="owner") {
+      const status=element("section","ih-card");status.id="ih-connector-status";status.setAttribute("aria-label","全站邮箱连接状态");
+      status.append(element("h2","","邮箱连接状态"),element("p","ih-section-copy","连接器由站点 Owner 统一配置，你无需填写 Client ID 或密钥。添加自己的邮箱后，点击授权即可。"),element("p","ih-section-copy","正在读取连接状态…"));
+      s.querySelector("#ih-accounts-list").before(status);
+    }
     s.querySelector("#ih-fetch").onclick = async () => {
       const button=s.querySelector("#ih-fetch"), summary=s.querySelector("#ih-fetch-summary");
       button.disabled=true; button.textContent="取件中…"; summary.textContent="正在检查账户…";
@@ -1031,6 +1036,20 @@ return [...document.querySelectorAll("#ih-rules-list .ih-rule-row")].map(row=>({
     box.append(element("p","ih-section-copy",(result.limitations||["这里只检查本站已保存的配置，不验证服务商授权或应用发布状态。"]).join(" ")));
     box.className=missing?"error":"success";
   }
+  async function loadConnectorStatus() {
+    const box=document.getElementById("ih-connector-status"),epoch=sessionEpoch;
+    if(!box)return;
+    try{
+      const result=await request("/api/v1/connectors/status");
+      if(epoch!==sessionEpoch||!box.isConnected)return;
+      box.replaceChildren(element("h2","","邮箱连接状态"),element("p","ih-section-copy","连接器由站点 Owner 统一配置，你只需添加并授权自己的邮箱。"));
+      for(const [provider,label] of [["google","Google"],["microsoft","Microsoft"]]){
+        const ready=result.providers?.[provider]?.configured===true;
+        box.append(element("p","ih-section-copy",label+"："+(ready?"已配置，可以添加邮箱并授权。":"尚未配置，请联系站点 Owner。")));
+      }
+      box.append(element("small","ih-section-copy","已配置不代表你的邮箱已授权；请查看下方各邮箱的授权状态。"));
+    }catch(error){if(epoch===sessionEpoch&&box.isConnected){box.lastElementChild.textContent="连接状态暂时无法读取，请刷新重试或联系站点 Owner。";}}
+  }
   async function loadConnectors() {
     const r = await request("/api/v1/connectors");
     const c = r.configuration;
@@ -1109,6 +1128,10 @@ return [...document.querySelectorAll("#ih-rules-list .ih-rule-row")].map(row=>({
   function guide() {
     const s = element("section", "ih-page");
     s.id = "ih-guide";
+    if(currentUser?.role!=="owner"){
+      s.innerHTML='<div class="ih-section-head"><div><h1>邮箱使用帮助</h1><p class="ih-section-copy">管理自己的邮箱和通知，无需配置全站连接器。</p></div></div><div class="ih-guide-grid"><section class="ih-card"><h2>添加与授权邮箱</h2><ol><li>到“邮箱账户”查看 Google、Microsoft 连接状态。</li><li>点击“添加邮箱”，填写地址并选择对应平台。</li><li>点击该邮箱的“授权”，登录与此邮箱地址一致的服务商账号，并完成同意。</li><li>Microsoft 会显示设备代码，请在官方验证页面输入。</li></ol><p>若平台尚未配置，请联系站点 Owner。不要向管理员发送邮箱密码、验证码或令牌。</p></section><section class="ih-card"><h2>阅读与整理邮件</h2><p>在概览中按邮箱、发件人、日期、未读或收藏筛选邮件。勾选邮件或选择当前页后，可以批量标记已读、未读和收藏；这些标记仅作用于本站。</p><p>验证码可一键复制，是否有效以发件方为准。</p></section><section class="ih-card"><h2>设置自己的通知</h2><p>在“通知渠道”保存个人渠道，再配置邮箱、发件人、关键词规则。免打扰按所选时区暂缓通知，结束后自动投递。渠道测试会立即发送。</p><p>到通知历史查看失败原因和重试安排。</p></section><section class="ih-card"><h2>授权异常与账户安全</h2><p>网络异常可重试同步；授权失效可重新授权。全站连接器未配置或配置有误时，请联系站点 Owner。</p><p>在个人中心保存恢复码、管理共享链接；不再使用邮箱时可撤销授权。开启发信权限后需要重新授权。</p></section></div>';
+      return s;
+    }
     s.innerHTML =
       '<div class="ih-section-head"><div><h1>使用与更新</h1><p class="ih-section-copy">复制命令前，请确认项目目录是 /www/wwwroot/InboxHarbor。</p></div></div><div class="ih-guide-grid"><section class="ih-card"><h2>首次 Docker 手动启动</h2><pre class="ih-command">cd /www/wwwroot/InboxHarbor\ndocker compose build --pull\ndocker compose up -d\ndocker compose ps\ndocker compose exec -T inboxharbor npm run credentials</pre><p class="ih-muted">不需要在宿主机安装 Node.js；程序会自动生成管理口令。</p></section><section class="ih-card"><h2>更新到最新版</h2><pre class="ih-command">git config --global --add safe.directory /www/wwwroot/InboxHarbor\ncd /www/wwwroot/InboxHarbor\ngit remote set-url origin https://github.com/nbbk/inbox-harbor.git\ngit pull --ff-only origin main\ndocker compose up -d --build</pre><p class="ih-muted">第一行用于修复 detected dubious ownership。只信任这个准确目录，不要设置 safe.directory \'*\'。</p></section><section class="ih-card"><h2>后续一键更新</h2><pre class="ih-command">cd /www/wwwroot/InboxHarbor\nchmod +x scripts/update-linux.sh\n./scripts/update-linux.sh</pre><p class="ih-muted">脚本只允许快进更新，不会用 reset 强制覆盖服务器修改。</p></section><section class="ih-card"><h2>非 Docker 临时运行</h2><pre class="ih-command">cd /www/wwwroot/InboxHarbor\nnode --version\nnpm ci --omit=dev\nnpm start</pre><p class="ih-muted">Node 必须为 v24 或更高；关闭终端后程序会停止，生产环境建议使用 Docker。</p></section></div>';
     return s;
@@ -1127,7 +1150,8 @@ return [...document.querySelectorAll("#ih-rules-list .ih-rule-row")].map(row=>({
       mailState.accounts = accounts.accounts || [];
       await loadMailPage(mailState.page || 1);
       if (loadSequence !== activeLoadSequence || epoch !== sessionEpoch || !currentUser) return;
-      loadConnectors().catch(() => {});
+      if (currentUser.role === "owner") loadConnectors().catch(() => {});
+      else loadConnectorStatus();
       if (notices) { catalog = notices.catalog; config = notices.configuration; renderChannels(); if (document.getElementById("ih-rules-list")) { if(rulesLoaded){const draft=captureNotificationRules();document.getElementById("ih-rules-list").replaceChildren();draft.forEach(addNotificationRule);}else loadNotificationRules().catch(()=>{}); } loadNotificationHistory().catch(()=>{}); }
       loadUserAreas().catch(() => {});
       setTimeout(()=>{const recovery=document.getElementById('ih-recovery');if(recovery)recovery.onclick=async()=>{const currentPassword=prompt('输入当前密码以生成新恢复码');if(!currentPassword)return;try{const result=await request('/api/auth/recovery/regenerate',{method:'POST',body:JSON.stringify({currentPassword})});displayRecoveryCodes(result.recoveryCodes);renderRecoveryNotice();}catch(error){alert(error.message);}};const remove=document.getElementById('ih-delete-account');if(remove)remove.onclick=async()=>{const currentPassword=prompt('输入当前密码以永久删除账户');if(!currentPassword)return;if(!confirm('邮件、账户、通知和共享链接将被永久删除。'))return;try{await request('/api/auth/me',{method:'DELETE',body:JSON.stringify({currentPassword})});lock();}catch(error){alert(error.message);}};},0);
