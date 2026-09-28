@@ -24,15 +24,16 @@ function escapeHtml(value) {
   return String(value || '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
 }
 function messageFor(mail = {}) {
-  const title = mail.subject || 'InboxHarbor 测试通知';
+  const siteName = typeof mail.siteName === 'string' && mail.siteName.trim() ? mail.siteName.trim() : 'InboxHarbor';
+  const title = mail.subject || `${siteName} 测试通知`;
   const account = mail.account || 'demo@inboxharbor.local';
-  const sender = mail.sender || 'InboxHarbor';
-  const summary = cleanMailText(mail.preview || mail.content || '这是一条来自 InboxHarbor 的测试通知。').slice(0, 240);
+  const sender = mail.sender || siteName;
+  const summary = cleanMailText(mail.preview || mail.content || `这是一条来自 ${siteName} 的测试通知。`).slice(0, 240);
   const receivedAt = mail.receivedAt ? new Date(mail.receivedAt).toLocaleString('zh-CN') : '刚刚';
   const appUrl = mail.appUrl || process.env.PUBLIC_BASE_URL || '';
-  const openLink = appUrl ? `<a href="${escapeHtml(appUrl)}" style="display:inline-block;padding:10px 16px;border-radius:8px;background:#147ea8;color:#fff;text-decoration:none">打开邮件中心</a>` : '<span style="color:#6b7b87">请打开 InboxHarbor 查看完整邮件</span>';
-  const content = `【新邮件】\n发件人：${sender}\n账户：${account}\n时间：${receivedAt}\n主题：${title}\n摘要：${summary}\n\n【查看完整邮件】\n${appUrl || '请打开 InboxHarbor 查看完整邮件'}`;
-  const html = `<div style="margin:0;background:#f4f8fa;padding:28px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;color:#17324d"><div style="max-width:640px;margin:0 auto;background:#fff;border:1px solid #dbe7ec;border-radius:14px;overflow:hidden"><div style="padding:22px 24px;border-bottom:1px solid #e7eef1"><div style="font-size:13px;color:#147ea8;font-weight:700">InboxHarbor · 新邮件提醒</div><h1 style="margin:10px 0 0;font-size:22px;line-height:1.35">${escapeHtml(title)}</h1></div><div style="padding:20px 24px"><div style="font-size:14px;line-height:1.8;color:#526879"><b style="color:#17324d">${escapeHtml(sender)}</b><br>所属账户：${escapeHtml(account)}<br>接收时间：${escapeHtml(receivedAt)}</div><div style="margin-top:18px;padding:16px;background:#f5fafb;border-radius:10px;white-space:pre-wrap;line-height:1.7"><b>邮件摘要</b><br>${escapeHtml(summary)}</div><div style="margin-top:22px">${openLink}</div></div></div></div>`;
+  const openLink = appUrl ? `<a href="${escapeHtml(appUrl)}" style="display:inline-block;padding:10px 16px;border-radius:8px;background:#147ea8;color:#fff;text-decoration:none">打开邮件中心</a>` : `<span style="color:#6b7b87">请打开 ${escapeHtml(siteName)} 查看完整邮件</span>`;
+  const content = `【新邮件】\n发件人：${sender}\n账户：${account}\n时间：${receivedAt}\n主题：${title}\n摘要：${summary}\n\n【查看完整邮件】\n${appUrl || `请打开 ${siteName} 查看完整邮件`}`;
+  const html = `<div style="margin:0;background:#f4f8fa;padding:28px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;color:#17324d"><div style="max-width:640px;margin:0 auto;background:#fff;border:1px solid #dbe7ec;border-radius:14px;overflow:hidden"><div style="padding:22px 24px;border-bottom:1px solid #e7eef1"><div style="font-size:13px;color:#147ea8;font-weight:700">${escapeHtml(siteName)} · 新邮件提醒</div><h1 style="margin:10px 0 0;font-size:22px;line-height:1.35">${escapeHtml(title)}</h1></div><div style="padding:20px 24px"><div style="font-size:14px;line-height:1.8;color:#526879"><b style="color:#17324d">${escapeHtml(sender)}</b><br>所属账户：${escapeHtml(account)}<br>接收时间：${escapeHtml(receivedAt)}</div><div style="margin-top:18px;padding:16px;background:#f5fafb;border-radius:10px;white-space:pre-wrap;line-height:1.7"><b>邮件摘要</b><br>${escapeHtml(summary)}</div><div style="margin-top:22px">${openLink}</div></div></div></div>`;
   return { title, content, html };
 }
 async function postJson(url, payload, headers = {}) {
