@@ -449,7 +449,11 @@ test("mail center filters, reads verification codes, and sends composed mail", a
     const url = new URL(route.request().url());
     const category = url.searchParams.get("category");
     const direction = url.searchParams.get("direction");
+    const query = (url.searchParams.get("q") || "").toLowerCase();
+    const account = url.searchParams.get("account");
     const filtered = mails.filter((mail) =>
+      (!query || [mail.subject,mail.sender,mail.content,mail.code,mail.recipient,mail.account].some(value=>String(value||"").toLowerCase().includes(query))) &&
+      (!account || mail.account === account) &&
       (!category || mail.category === category) &&
       (!direction || direction === "all" || (direction === "sent") === (mail.direction === "sent")),
     );
