@@ -23,6 +23,7 @@ const { BoundedAuthRateLimiter } = require("./auth-rate-limiter");
 const { loadOrCreateAdminToken } = require("./instance-config");
 const { acquireInstanceLock, dataDirectory } = require("./instance-lock");
 const { loadTenantState, enforceQuota } = require("./tenant-state");
+const { registerBrandingRoutes } = require("./branding");
 const { listAllAccountsWithUser } = require("./repository");
 const { recoverInterruptedRestore } = require("./migration-service");
 const {
@@ -85,7 +86,7 @@ app.post('/api/auth/bootstrap', async (req,res) => { try { if ((req.get('authori
 app.post('/api/auth/login', async (req,res) => { if(!sameOrigin(req))return res.status(403).json({success:false,message:'跨站写操作已被拒绝'});const wait=authWait(req,'login',req.body.email);if(wait){res.set('Retry-After',String(wait));return res.status(429).json({success:false,message:'尝试过于频繁'});}try { const result=await authService.login(req.body.email,req.body.password);authLimiter.clearIdentity('login',req.ip,req.body.email);res.cookie('inboxharbor_session',result.token,{httpOnly:true,sameSite:'lax',secure:process.env.NODE_ENV==='production',path:'/'});res.json({success:true,user:result.user}); }catch(e){if(e.code==='KDF_BUSY')return res.status(429).json({success:false,message:e.message});res.status(401).json({success:false,message:e.message});} });
 app.post('/api/auth/logout',(req,res)=>{if(!sameOrigin(req))return res.status(403).json({success:false,message:'跨站写操作已被拒绝'});authService.logout(readSessionToken(req));res.clearCookie('inboxharbor_session',{path:'/'});res.json({success:true});});
 app.use("/api", (req, res, next) => {
-  if(['/auth/config','/auth/register','/auth/invitations/accept','/auth/recovery/reset'].includes(req.path))return next();
+  if(['/auth/config','/auth/register','/auth/invitations/accept','/auth/recovery/reset','/auth/branding'].includes(req.path))return next();
   const supplied = (req.get("authorization") || "").replace(/^Bearer\s+/i, "");
   const left = Buffer.from(supplied);
   const right = Buffer.from(ADMIN_TOKEN);
@@ -108,6 +109,7 @@ app.use(express.static(path.join(__dirname, "public")));
 const DATA_FILE = path.join(DATA_DIR, "data.json");
 const storage = new Storage(DATA_DIR);
 authService = new AuthService(storage);
+registerBrandingRoutes(app, authService);
 app.get('/api/auth/config',(req,res)=>res.json({success:true,ownerInitialized:authService.setting('owner_initialized','0')==='1',allowPublicRegistration:authService.setting('allow_public_registration','false')==='true',user:authService.session(readSessionToken(req))}));
 app.get('/api/auth/me',(req,res)=>{if(!req.user)return res.status(401).json({success:false,message:'未登录'});res.json({success:true,user:req.user});});
 app.post('/api/auth/change-password',async(req,res)=>{if(!req.user)return res.status(401).json({success:false});try{await authService.changePassword(req.user.id,req.body.currentPassword,req.body.newPassword);res.clearCookie('inboxharbor_session',{path:'/'});res.json({success:true,message:'密码已更新，请重新登录'});}catch(e){res.status(400).json({success:false,message:e.message});}});
@@ -199,19 +201,74 @@ let gData = {
   classificationRules: [],
 };
 
+function parseDeliveryStatus(value) { try { return JSON.parse(value || '{}'); } catch { return {}; } }
+function claimTenantDelivery(userId, channelId, messageId, now, claimTtlMs = 120000) {
+  storage.db.exec('BEGIN IMMEDIATE');
+  try {
+    let row = storage.db.prepare('SELECT * FROM notification_deliveries WHERE user_id=? AND channel_id=? AND message_id=?').get(userId, channelId, messageId);
+    let meta = row ? parseDeliveryStatus(row.status) : { state: 'pending', attempts: 0 };
+    const retryAt = Number(meta.nextRetryAt || 0);
+    const leaseUntil = Number(meta.claimedAt || 0) + claimTtlMs;
+    if (meta.state === 'delivered' || (meta.state === 'failed' && (Number(meta.attempts || 0) >= 3 || retryAt > now)) || (meta.state === 'sending' && leaseUntil > now)) {
+      storage.db.exec('COMMIT'); return null;
+    }
+    meta = { ...meta, state: 'sending', attempts: Number(meta.attempts || 0) + 1, nextRetryAt: null, claimedAt: now, claimId: crypto.randomUUID() };
+    if (row) storage.db.prepare('UPDATE notification_deliveries SET status=? WHERE id=? AND user_id=?').run(JSON.stringify(meta), row.id, userId);
+    else {
+      const id = crypto.randomUUID();
+      storage.db.prepare('INSERT INTO notification_deliveries VALUES (?,?,?,?,?,?)').run(id, userId, channelId, messageId, JSON.stringify(meta), new Date(now).toISOString());
+      row = { id };
+    }
+    storage.db.exec('COMMIT'); return { id: row.id, meta };
+  } catch (error) { storage.db.exec('ROLLBACK'); throw error; }
+}
+function finishTenantDelivery(userId, delivery, ok, now) {
+  storage.db.exec('BEGIN IMMEDIATE');
+  try {
+    const row = storage.db.prepare('SELECT status FROM notification_deliveries WHERE id=? AND user_id=?').get(delivery.id, userId);
+    const meta = row && parseDeliveryStatus(row.status);
+    if (!meta || meta.claimId !== delivery.meta.claimId) { storage.db.exec('COMMIT'); return false; }
+    meta.state = ok ? 'delivered' : 'failed';
+    meta.nextRetryAt = ok ? null : now + Math.min(900000, 30000 * 2 ** (Number(meta.attempts || 1) - 1));
+    delete meta.claimId; delete meta.claimedAt;
+    storage.db.prepare('UPDATE notification_deliveries SET status=? WHERE id=? AND user_id=?').run(JSON.stringify(meta), delivery.id, userId);
+    storage.db.exec('COMMIT'); return true;
+  } catch (error) { storage.db.exec('ROLLBACK'); throw error; }
+}
 async function pushTenantNotifications(events, deps = {}) {
-  const now = deps.now || Date.now(), sendFn = deps.sendFn || send, messageFn = deps.messageForFn || messageFor;
-  for (const { userId, mail } of events || []) { if (!userId || !mail?.id) continue; const user = storage.db.prepare('SELECT id,role,enabled FROM users WHERE id=?').get(userId); if (!user?.enabled) continue; const tenant = loadTenantState(storage, userId);
+  const now = deps.now || Date.now(), sendFn = deps.sendFn || send, messageFn = deps.messageForFn || messageFor, claimTtlMs = deps.claimTtlMs || 120000;
+  for (const { userId, mail } of events || []) {
+    if (!userId || !mail?.id) continue;
+    const user = storage.db.prepare('SELECT id,role,enabled FROM users WHERE id=?').get(userId);
+    if (!user?.enabled) continue;
+    const tenant = loadTenantState(storage, userId);
     for (const channel of tenant.channels.filter((c) => c.enabled && (!mail.__retryChannelId || c.id === mail.__retryChannelId))) {
-      const row = storage.db.prepare('SELECT * FROM notification_deliveries WHERE user_id=? AND channel_id=? AND message_id=?').get(userId, channel.id, mail.id); let meta = row ? JSON.parse(row.status || '{}') : { state:'pending', attempts:0 };
-      if (meta.state==='delivered' || (meta.state==='failed' && (meta.attempts>=3 || Number(meta.nextRetryAt)>now))) continue; meta.attempts++;
-      const share = getOrCreateShare(userId, mail.id, Number(storage.db.prepare('SELECT value FROM instance_settings WHERE key=?').get(`user:${userId}:shareLinkDays`)?.value) || 30);
-      try { validateChannelPolicy(channel, user.role); await sendFn(channel,messageFn({ ...mail, appUrl: `${PUBLIC_BASE_URL}/shared/mail/${share.token}` }),user.role); meta.state='delivered'; meta.nextRetryAt=null; } catch(e) { meta.state='failed'; meta.nextRetryAt=now+Math.min(900000,30000*2**(meta.attempts-1)); authService.audit(userId,'notification.delivery.failed','notification_channel',channel.id,{type:channel.type}); }
-      if(row) storage.db.prepare('UPDATE notification_deliveries SET status=? WHERE id=? AND user_id=?').run(JSON.stringify(meta),row.id,userId); else storage.db.prepare('INSERT INTO notification_deliveries VALUES (?,?,?,?,?,?)').run(crypto.randomUUID(),userId,channel.id,mail.id,JSON.stringify(meta),new Date().toISOString());
+      const delivery = claimTenantDelivery(userId, channel.id, mail.id, now, claimTtlMs);
+      if (!delivery) continue;
+      let ok = false;
+      try {
+        const share = getOrCreateShare(userId, mail.id, Number(storage.db.prepare('SELECT value FROM instance_settings WHERE key=?').get(`user:${userId}:shareLinkDays`)?.value) || 30);
+        validateChannelPolicy(channel, user.role);
+        await sendFn(channel, messageFn({ ...mail, appUrl: `${PUBLIC_BASE_URL}/shared/mail/${share.token}` }), user.role);
+        ok = true;
+      } catch (e) {
+        authService.audit(userId, 'notification.delivery.failed', 'notification_channel', channel.id, { type: channel.type });
+      }
+      finishTenantDelivery(userId, delivery, ok, now);
     }
   }
 }
-async function retryTenantNotifications(deps={}) { const rows=storage.db.prepare('SELECT d.user_id,d.channel_id,d.message_id,d.status,m.payload FROM notification_deliveries d JOIN mail_messages m ON m.id=d.message_id AND m.user_id=d.user_id JOIN users u ON u.id=d.user_id AND u.enabled=1').all(); const events=[]; for(const row of rows){let meta;try{meta=JSON.parse(row.status)}catch{continue}if(meta.state==='failed'&&meta.attempts<3&&Number(meta.nextRetryAt||0)<=Date.now())events.push({userId:row.user_id,mail:{...storage.decrypt(row.payload),id:row.message_id,__retryChannelId:row.channel_id}})} await pushTenantNotifications(events,deps); }
+async function retryTenantNotifications(deps = {}) {
+  const now = deps.now || Date.now();
+  const rows = storage.db.prepare('SELECT d.user_id,d.channel_id,d.message_id,d.status,m.payload FROM notification_deliveries d JOIN mail_messages m ON m.id=d.message_id AND m.user_id=d.user_id JOIN users u ON u.id=d.user_id AND u.enabled=1').all();
+  const events = [];
+  for (const row of rows) {
+    const meta = parseDeliveryStatus(row.status);
+    const sendingExpired = meta.state === 'sending' && Number(meta.claimedAt || 0) + (deps.claimTtlMs || 120000) <= now;
+    if ((meta.state === 'failed' && Number(meta.attempts || 0) < 3 && Number(meta.nextRetryAt || 0) <= now) || sendingExpired) events.push({ userId: row.user_id, mail: { ...storage.decrypt(row.payload), id: row.message_id, __retryChannelId: row.channel_id } });
+  }
+  await pushTenantNotifications(events, { ...deps, now });
+}
 function loadDataFromDisk() {
   try {
     const parsed = storage.load(gData, DATA_FILE);
@@ -421,10 +478,15 @@ function getMailFingerprint(mail) {
   const senderStr = decodeMimeHeader(mail.sender || "")
     .toLowerCase()
     .trim();
-  const mailId = (mail.id || "").trim();
+  const mailId = String(mail.sourceId || mail.providerMessageId || mail.id || "").trim();
   const codeStr =
     mail.code && mail.code !== "未发现验证码" ? mail.code.trim() : "";
   return `fp_${accStr}___${senderStr}___${subjectStr}___${codeStr}___${mailId}`;
+}
+
+function mailSourceIdentity(mail, accountId) {
+  const sourceId = String(mail?.sourceId || mail?.providerMessageId || mail?.id || '');
+  return { sourceId, sourceKey: mail?.sourceKey || `${accountId || mail?.accountId || ''}:${mail?.provider || ''}:${sourceId}` };
 }
 
 // Strict Telegram Push Deduplication Fingerprint by Account + Code to prevent duplicate pushes of same code
@@ -664,7 +726,6 @@ async function verifyMicrosoftAccount(acc) {
         (data.expires_in ? (data.expires_in - 120) * 1000 : 3400 * 1000);
       if (data.refresh_token) acc.note = data.refresh_token;
       if (data.scope) acc.providerScopes = data.scope;
-      saveDataToDisk();
       return {
         status: "active",
         accessToken: data.access_token,
@@ -918,12 +979,9 @@ async function fetchGoogleMails(acc, accessToken) {
             cursor: acc.syncCursor,
             fetchImpl: smartProxyFetch,
           });
-      if (!pendingBootstrap && stageGmailBootstrap(acc, incremental)) {
-        // Persist the fixed baseline and work list before requesting details. If a
-        // detail call fails, the next run replays exactly this batch instead of
-        // taking a newer baseline that could permanently skip an older message.
-        saveDataToDisk();
-      }
+      if (!pendingBootstrap) stageGmailBootstrap(acc, incremental);
+      // The caller persists the account relation after the entire sync succeeds.
+      // Saving gData here would lose a tenant's pending bootstrap baseline.
       for (const msg of incremental.messageIds.map((id) => ({ id }))) {
         const detailResp = await smartProxyFetch(
             `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`,
@@ -1142,7 +1200,7 @@ app.post("/api/auth/microsoft/device-code", async (req, res) => {
     if (resp.ok && data.user_code && data.device_code) {
       microsoftOAuthTransactions.set(data.device_code, {
         userId: req.user.id, sessionHash: crypto.createHash('sha256').update(readSessionToken(req)).digest('hex'),
-        accountId: requested.id,
+        accountId: requested.id, accountUpdatedAt: requested.storageUpdatedAt,
         clientId,
         expiresAt: Date.now() + Number(data.expires_in || 600) * 1000,
       });
@@ -1186,7 +1244,7 @@ app.post("/api/auth/microsoft/poll-device-token", async (req, res) => {
   const tenant = loadTenantState(storage, req.user.id); const targetAcc = tenant.accounts.find(
     (account) => account.id === transaction.accountId,
   );
-  if (!targetAcc || targetAcc.provider !== "microsoft") {
+  if (!targetAcc || targetAcc.provider !== "microsoft" || targetAcc.storageUpdatedAt !== transaction.accountUpdatedAt) {
     microsoftOAuthTransactions.delete(deviceCode);
     return res.status(409).json({
       success: false,
@@ -1320,7 +1378,7 @@ app.get("/api/auth/google/url", (req, res) => {
   const redirectUri = `${PUBLIC_BASE_URL}/auth/google/callback`;
   googleOAuthTransactions.set(state, {
     userId: req.user.id, sessionHash: crypto.createHash('sha256').update(readSessionToken(req)).digest('hex'),
-    accountId,
+    accountId, accountUpdatedAt: account.storageUpdatedAt,
     verifier,
     clientId: GOOGLE_CLIENT_ID,
     clientSecret: GOOGLE_CLIENT_SECRET,
@@ -1396,7 +1454,7 @@ app.get("/auth/google/callback", async (req, res) => {
       const tenant = loadTenantState(storage, transaction.userId); const targetAcc = tenant.accounts.find(
         (a) => a.id === transaction.accountId,
       );
-      if (!targetAcc || targetAcc.provider !== "google") {
+      if (!targetAcc || targetAcc.provider !== "google" || targetAcc.storageUpdatedAt !== transaction.accountUpdatedAt) {
         return res
           .status(409)
           .send(
@@ -1861,7 +1919,10 @@ app.post("/api/accounts/check-status", async (req, res) => {
     checkedCount++;
   }
 
-  for (const account of targetAccounts) tenant.repo.update('accounts', account.id, account, { provider: account.provider, address: account.username });
+  for (const account of targetAccounts) {
+    const expectedUpdatedAt = account.storageUpdatedAt; delete account.storageUpdatedAt; delete account.storageCreatedAt;
+    tenant.repo.updateIfUnchanged('accounts', account.id, account, { provider: account.provider, address: account.username }, expectedUpdatedAt);
+  }
   res.json({
     success: true,
     checkedCount,
@@ -1900,23 +1961,18 @@ async function processSingleAccountFetchCore(acc, dataStore) {
     const fetched = fetchResult.mails;
 
     fetched.sort((a, b) => new Date(b.receivedAt) - new Date(a.receivedAt));
-    const existingIds = new Set(dataStore.mails.map((m) => m.id));
-    const existingFps = new Set(
-      dataStore.mails.map((m) => getMailFingerprint(m)),
-    );
+    const existingSourceKeys = new Set(dataStore.mails.map((mail) => mail.sourceKey || mailSourceIdentity(mail, mail.accountId).sourceKey));
+    const existingFps = new Set(dataStore.mails.map((mail) => getMailFingerprint(mail)));
     const clearedSet = new Set(dataStore.clearedMailIds || []);
 
-    for (let m of fetched) {
+    for (const m of fetched) {
+      const identity = mailSourceIdentity(m, acc.id);
+      m.sourceId = identity.sourceId; m.providerMessageId = identity.sourceId; m.sourceKey = identity.sourceKey;
       const fp = getMailFingerprint(m);
-      if (
-        !existingIds.has(m.id) &&
-        !existingFps.has(fp) &&
-        !clearedSet.has(m.id) &&
-        !clearedSet.has(fp)
-      ) {
+      if (!existingSourceKeys.has(identity.sourceKey) && !existingFps.has(fp) && !clearedSet.has(identity.sourceId) && !clearedSet.has(identity.sourceKey) && !clearedSet.has(fp)) {
         dataStore.mails.unshift(m);
         if (!fetchResult.bootstrap) newMails.push(m);
-        existingIds.add(m.id);
+        existingSourceKeys.add(identity.sourceKey);
         existingFps.add(fp);
       }
     }
@@ -1964,18 +2020,32 @@ let syncCoreForTest = processSingleAccountFetchCore;
 // second write, which prevents cursor rollback and duplicate bootstrap records.
 function syncAndPersistAccount(userId, accountId) {
   const flightKey = `${userId}:${accountId}`;
-  if (accountSyncFlights.has(flightKey)) return accountSyncFlights.get(flightKey);
+  // Followers reuse the persistence result but never publish its event list.
+  // Manual and background callers therefore cannot both schedule delivery.
+  if (accountSyncFlights.has(flightKey)) return accountSyncFlights.get(flightKey).then((result) => ({ ...result, persistedNewMails: [], notifiableMails: [], follower: true }));
   const flight = (async () => {
     const tenant = loadTenantState(storage, userId);
     const account = tenant.accounts.find((item) => item.id === accountId);
     if (!account) throw new Error('账号不存在或不属于当前用户');
-    const before = new Set(tenant.mails.map((mail) => mail.id));
+    const before = new Set(tenant.mails.map((mail) => mail.sourceKey || mailSourceIdentity(mail, mail.accountId).sourceKey));
     const notifiableMails = await syncCoreForTest(account, { userId, mails: tenant.mails, clearedMailIds: tenant.tombstones });
-    const persistedNewMails = tenant.mails.filter((mail) => !before.has(mail.id));
-    const storedBySourceId = new Map();
-    for (const mail of persistedNewMails) { const sourceId = mail.id; const storedId = tenant.repo.insert('messages', mail, { account_id: account.id }); mail.id = storedId; storedBySourceId.set(sourceId, mail); }
-    tenant.repo.update('accounts', account.id, account, { provider: account.provider, address: account.username });
-    return { persistedNewMails, notifiableMails: notifiableMails.map((mail) => storedBySourceId.get(mail.id) || mail), account };
+    const current = tenant.repo.get('accounts', accountId);
+    if (!current || current.updated_at !== account.storageUpdatedAt) return { persistedNewMails: [], notifiableMails: [], account: current ? { ...current.payload, id: current.id } : null, stale: true };
+    const persistedNewMails = tenant.mails.filter((mail) => !before.has(mail.sourceKey || mailSourceIdentity(mail, account.id).sourceKey));
+    const storedBySourceId = new Map(), expectedUpdatedAt = account.storageUpdatedAt;
+    delete account.storageUpdatedAt; delete account.storageCreatedAt;
+    storage.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const mail of persistedNewMails) {
+        const identity = mailSourceIdentity(mail, account.id);
+        mail.sourceId = identity.sourceId; mail.providerMessageId = identity.sourceId; mail.sourceKey = identity.sourceKey; mail.accountId = account.id;
+        const storedId = tenant.repo.insert('messages', mail, { account_id: account.id });
+        mail.id = storedId; storedBySourceId.set(identity.sourceId, mail);
+      }
+      if (!tenant.repo.updateIfUnchanged('accounts', account.id, account, { provider: account.provider, address: account.username }, expectedUpdatedAt)) throw new Error('账户在同步期间已变更');
+      storage.db.exec('COMMIT');
+    } catch (error) { storage.db.exec('ROLLBACK'); throw error; }
+    return { persistedNewMails, notifiableMails: notifiableMails.map((mail) => storedBySourceId.get(mailSourceIdentity(mail, account.id).sourceId) || mail), account };
   })().finally(() => { if (accountSyncFlights.get(flightKey) === flight) accountSyncFlights.delete(flightKey); });
   accountSyncFlights.set(flightKey, flight); return flight;
 }
@@ -2280,6 +2350,9 @@ app.delete("/api/mails/:id", (req, res) => {
   tenant.repo.delete('messages', id);
   storage.db.prepare('UPDATE share_links SET revoked_at=? WHERE user_id=? AND mail_id=? AND revoked_at IS NULL').run(new Date().toISOString(), req.user.id, id);
   tenant.repo.insert('tombstones', {}, { mail_id: id });
+  const source = mailSourceIdentity(removed, removed.accountId);
+  if (source.sourceId) tenant.repo.insert('tombstones', {}, { mail_id: source.sourceId });
+  if (source.sourceKey) tenant.repo.insert('tombstones', {}, { mail_id: source.sourceKey });
   const fingerprint = getMailFingerprint(removed);
   if (fingerprint) tenant.repo.insert('tombstones', {}, { mail_id: fingerprint });
   authService.audit(req.user, 'mail.deleted', 'mail', id, {});
@@ -2297,6 +2370,9 @@ app.post("/api/mails/clear", (req, res) => {
   const tenant = loadTenantState(storage, req.user.id);
   for (let m of tenant.mails) {
     if (m.id) tenant.repo.insert('tombstones', {}, { mail_id: m.id });
+    const source = mailSourceIdentity(m, m.accountId);
+    if (source.sourceId) tenant.repo.insert('tombstones', {}, { mail_id: source.sourceId });
+    if (source.sourceKey) tenant.repo.insert('tombstones', {}, { mail_id: source.sourceKey });
     const fp = getMailFingerprint(m);
     if (fp) tenant.repo.insert('tombstones', {}, { mail_id: fp });
   }
