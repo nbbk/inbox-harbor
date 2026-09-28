@@ -24,7 +24,9 @@ const { loadOrCreateAdminToken } = require("./instance-config");
 const { acquireInstanceLock, dataDirectory } = require("./instance-lock");
 const { loadTenantState, enforceQuota } = require("./tenant-state");
 const { accountHealth, safeFailure, isoTime } = require("./health-status");
-const { registerBrandingRoutes } = require("./branding");
+const { registerBrandingRoutes, readSiteName: brandingReadSiteName } = require("./branding");
+const readSiteName = brandingReadSiteName || ((auth) => auth.setting("branding_site_name", "InboxHarbor") || "InboxHarbor");
+const { DEFAULT_POLICY, normalizePolicy, isQuiet, quietEndsAt, matchingChannelIds, dedupeKey } = require("./notification-policy");
 const { listAllAccountsWithUser } = require("./repository");
 const { recoverInterruptedRestore } = require("./migration-service");
 const {
@@ -204,17 +206,77 @@ let gData = {
 };
 
 function parseDeliveryStatus(value) { try { const parsed = JSON.parse(value || '{}'); return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}; } catch { return {}; } }
-function claimTenantDelivery(userId, channelId, messageId, now, claimTtlMs = 120000) {
+function notificationPolicyKey(userId) { return `user:${userId}:notificationPolicy`; }
+function readTenantNotificationPolicy(userId, tenant) {
+  const row = storage.db.prepare('SELECT value FROM instance_settings WHERE key=?').get(notificationPolicyKey(userId));
+  try { return normalizePolicy(row ? JSON.parse(row.value) : DEFAULT_POLICY, { accountIds: new Set(tenant.accounts.map((a) => a.id)), channelIds: new Set(tenant.channels.map((c) => c.id)) }); } catch { return { ...DEFAULT_POLICY, rules: [] }; }
+}
+function dedupeSettingKey(userId) { return `user:${userId}:notificationDedupe`; }
+function mutateDedupe(userId, callback) {
+  storage.db.exec('BEGIN IMMEDIATE');
+  try {
+    const row = storage.db.prepare('SELECT value FROM instance_settings WHERE key=?').get(dedupeSettingKey(userId));
+    let entries = {}; try { entries = row ? JSON.parse(row.value) : {}; } catch {}
+    if (!entries || typeof entries !== 'object' || Array.isArray(entries)) entries = {};
+    const result = callback(entries);
+    storage.db.prepare('INSERT OR REPLACE INTO instance_settings (key,value) VALUES (?,?)').run(dedupeSettingKey(userId), JSON.stringify(entries));
+    storage.db.exec('COMMIT'); return result;
+  } catch (error) { storage.db.exec('ROLLBACK'); throw error; }
+}
+function claimDedupe(userId, key, minutes, now) {
+  if (!key || !minutes) return { duplicate: false, inFlight: false };
+  return mutateDedupe(userId, (entries) => {
+    for (const [entryKey, entry] of Object.entries(entries)) if (!entry || now - Number(entry.at || 0) > 2 * 3600000) delete entries[entryKey];
+    const prior = entries[key];
+    if (prior && prior.state === 'delivered' && now - Number(prior.at || 0) < minutes * 60000) return { duplicate: true, inFlight: false };
+    // A concurrent send receives a durable deferred record. If the first send
+    // fails, settleDedupe reactivates it; only a successful send leaves it skipped.
+    if (prior && prior.state === 'sending' && now - Number(prior.at || 0) < 120000) return { duplicate: true, inFlight: true };
+    entries[key] = { state: 'sending', at: now }; return { duplicate: false, inFlight: false };
+  });
+}
+function reactivateInFlightDedupe(userId, key, now) {
+  if (!key) return;
+  storage.db.exec('BEGIN IMMEDIATE');
+  try {
+    const rows = storage.db.prepare('SELECT id,status FROM notification_deliveries WHERE user_id=?').all(userId);
+    for (const row of rows) {
+      const meta = parseDeliveryStatus(row.status);
+      if (meta.state !== 'skipped' || meta.skippedReason !== 'deduplicated_in_flight' || meta.dedupeKey !== key) continue;
+      meta.state = 'pending'; meta.skippedReason = null; meta.deferredReason = 'dedupe_retry'; meta.nextRetryAt = now; meta.updatedAt = new Date(now).toISOString();
+      storage.db.prepare('UPDATE notification_deliveries SET status=? WHERE id=? AND user_id=?').run(JSON.stringify(meta), row.id, userId);
+    }
+    storage.db.exec('COMMIT');
+  } catch (error) { storage.db.exec('ROLLBACK'); throw error; }
+}
+function settleDedupe(userId, key, ok, now) {
+  if (!key) return;
+  mutateDedupe(userId, (entries) => { if (ok) entries[key] = { state: 'delivered', at: now }; else delete entries[key]; });
+  if (!ok) reactivateInFlightDedupe(userId, key, now);
+}
+function queueQuietDelivery(userId, channelId, mail, now, retryAt, dedupeValue) {
+  storage.db.exec('BEGIN IMMEDIATE');
+  try {
+    const exists = storage.db.prepare('SELECT id FROM notification_deliveries WHERE user_id=? AND channel_id=? AND message_id=?').get(userId, channelId, mail.id);
+    if (!exists) storage.db.prepare('INSERT INTO notification_deliveries VALUES (?,?,?,?,?,?)').run(crypto.randomUUID(), userId, channelId, mail.id, JSON.stringify({ state: 'pending', attempts: 0, nextRetryAt: retryAt, deferredReason: 'quiet_hours', dedupeKey: dedupeValue || null, updatedAt: new Date(now).toISOString() }), new Date(now).toISOString());
+    storage.db.exec('COMMIT'); return !exists;
+  } catch (error) { storage.db.exec('ROLLBACK'); throw error; }
+}
+function recordDeduplicatedDelivery(userId, channelId, mail, now, dedupeValue, reason = 'deduplicated') {
+  storage.db.prepare('INSERT OR IGNORE INTO notification_deliveries VALUES (?,?,?,?,?,?)').run(crypto.randomUUID(), userId, channelId, mail.id, JSON.stringify({ state: 'skipped', attempts: 0, skippedReason: reason, dedupeKey: dedupeValue, updatedAt: new Date(now).toISOString() }), new Date(now).toISOString());
+}
+
+function claimTenantDelivery(userId, channelId, messageId, now, claimTtlMs = 120000, dedupeValue = null) {
   storage.db.exec('BEGIN IMMEDIATE');
   try {
     let row = storage.db.prepare('SELECT * FROM notification_deliveries WHERE user_id=? AND channel_id=? AND message_id=?').get(userId, channelId, messageId);
     let meta = row ? parseDeliveryStatus(row.status) : { state: 'pending', attempts: 0 };
     const retryAt = Number(meta.nextRetryAt || 0);
     const leaseUntil = Number(meta.claimedAt || 0) + claimTtlMs;
-    if (meta.state === 'delivered' || (meta.state === 'failed' && (Number(meta.attempts || 0) >= 3 || retryAt > now)) || (meta.state === 'sending' && (Number(meta.attempts || 0) >= 3 || leaseUntil > now))) {
+    if (meta.state === 'delivered' || meta.state === 'skipped' || (meta.state === 'pending' && retryAt > now) || (meta.state === 'failed' && (Number(meta.attempts || 0) >= 3 || retryAt > now)) || (meta.state === 'sending' && (Number(meta.attempts || 0) >= 3 || leaseUntil > now))) {
       storage.db.exec('COMMIT'); return null;
     }
-    meta = { ...meta, state: 'sending', attempts: Number(meta.attempts || 0) + 1, nextRetryAt: null, claimedAt: now, claimId: crypto.randomUUID(), updatedAt: new Date(now).toISOString(), error: null };
+    meta = { ...meta, state: 'sending', attempts: Number(meta.attempts || 0) + 1, nextRetryAt: null, claimedAt: now, claimId: crypto.randomUUID(), dedupeKey: dedupeValue || meta.dedupeKey || null, deferredReason: null, updatedAt: new Date(now).toISOString(), error: null };
     if (row) storage.db.prepare('UPDATE notification_deliveries SET status=? WHERE id=? AND user_id=?').run(JSON.stringify(meta), row.id, userId);
     else {
       const id = crypto.randomUUID();
@@ -237,7 +299,9 @@ function finishTenantDelivery(userId, delivery, ok, now, failure = null) {
     meta.error = ok ? null : safeFailure(failure);
     delete meta.claimId; delete meta.claimedAt;
     storage.db.prepare('UPDATE notification_deliveries SET status=? WHERE id=? AND user_id=?').run(JSON.stringify(meta), delivery.id, userId);
-    storage.db.exec('COMMIT'); return true;
+    storage.db.exec('COMMIT');
+    settleDedupe(userId, meta.dedupeKey, ok, now);
+    return true;
   } catch (error) { storage.db.exec('ROLLBACK'); throw error; }
 }
 function recordTenantTestDelivery(userId, channelId, type, ok, failure = null) {
@@ -263,17 +327,35 @@ async function pushTenantNotifications(events, deps = {}) {
     const user = storage.db.prepare('SELECT id,role,enabled FROM users WHERE id=?').get(userId);
     if (!user?.enabled) continue;
     const tenant = loadTenantState(storage, userId);
-    for (const channel of tenant.channels.filter((c) => c.enabled && (!mail.__retryChannelId || c.id === mail.__retryChannelId))) {
+    const policy = readTenantNotificationPolicy(userId, tenant);
+    const directChannelId = mail.__retryChannelId;
+    const candidates = directChannelId
+      ? tenant.channels.filter((channel) => channel.enabled && channel.id === directChannelId)
+      : tenant.channels.filter((channel) => matchingChannelIds(policy, mail, tenant.channels).includes(channel.id));
+    for (const channel of candidates) {
       const flightKey = `${userId}:${channel.id}:${mail.id}`;
       if (deliverySendFlights.has(flightKey)) continue;
-      const delivery = claimTenantDelivery(userId, channel.id, mail.id, now, claimTtlMs);
-      if (!delivery) continue;
+      const key = mail.__dedupeKey || (policy.dedupeMinutes ? `${channel.id}:${dedupeKey(mail)}` : null);
+      const dedupeClaim = claimDedupe(userId, key, policy.dedupeMinutes, now);
+      if (dedupeClaim.duplicate) {
+        recordDeduplicatedDelivery(userId, channel.id, mail, now, key, dedupeClaim.inFlight ? 'deduplicated_in_flight' : 'deduplicated');
+        continue;
+      }
+      if (!directChannelId && isQuiet(policy, now)) {
+        queueQuietDelivery(userId, channel.id, mail, now, quietEndsAt(policy, now), key);
+        // Queuing is not a successful delivery, so another mail is never
+        // suppressed merely because it is waiting for quiet hours to end.
+        settleDedupe(userId, key, false, now);
+        continue;
+      }
+      const delivery = claimTenantDelivery(userId, channel.id, mail.id, now, claimTtlMs, key);
+      if (!delivery) { settleDedupe(userId, key, false, now); continue; }
       const flight = (async () => {
         let ok = false, failure = null;
         try {
           const share = getOrCreateShare(userId, mail.id, Number(storage.db.prepare('SELECT value FROM instance_settings WHERE key=?').get(`user:${userId}:shareLinkDays`)?.value) || 30);
           validateChannelPolicy(channel, user.role);
-          await sendFn(channel, messageFn({ ...mail, appUrl: `${PUBLIC_BASE_URL}/shared/mail/${share.token}` }), user.role);
+          await sendFn(channel, messageFn({ ...mail, appUrl: `${PUBLIC_BASE_URL}/shared/mail/${share.token}`, siteName: readSiteName(authService) }), user.role);
           ok = true;
         } catch (e) {
           failure = e;
@@ -294,7 +376,8 @@ async function retryTenantNotifications(deps = {}) {
   for (const row of rows) {
     const meta = parseDeliveryStatus(row.status);
     const sendingExpired = meta.state === 'sending' && Number(meta.attempts || 0) < 3 && Number(meta.claimedAt || 0) + (deps.claimTtlMs || 120000) <= now;
-    if ((meta.state === 'failed' && Number(meta.attempts || 0) < 3 && Number(meta.nextRetryAt || 0) <= now) || sendingExpired) events.push({ userId: row.user_id, mail: { ...storage.decrypt(row.payload), id: row.message_id, __retryChannelId: row.channel_id } });
+    const deferredDue = meta.state === 'pending' && ['quiet_hours', 'dedupe_retry'].includes(meta.deferredReason) && Number(meta.nextRetryAt || 0) <= now;
+    if ((meta.state === 'failed' && Number(meta.attempts || 0) < 3 && Number(meta.nextRetryAt || 0) <= now) || sendingExpired || deferredDue) events.push({ userId: row.user_id, mail: { ...storage.decrypt(row.payload), id: row.message_id, __retryChannelId: row.channel_id, __dedupeKey: meta.dedupeKey || null } });
   }
   await pushTenantNotifications(events, { ...deps, now });
 }
@@ -1438,7 +1521,7 @@ app.get("/auth/google/callback", async (req, res) => {
   if (!transaction || transaction.expiresAt < Date.now())
     return res
       .status(400)
-      .send("这里是 Google OAuth 回调地址，不是登录页面。请勿直接打开；请把它复制到 Google 控制台的 Authorized redirect URIs。需要授权邮箱时，请回到 InboxHarbor 的邮箱账户并点击“授权”。");
+      .send("这里是 Google OAuth 回调地址，不是登录页面。请勿直接打开；请把它复制到 Google 控制台的 Authorized redirect URIs。需要授权邮箱时，请回到本站的邮箱账户并点击“授权”。");
   const callbackSession = readSessionToken(req);
   const callbackUser = callbackSession && authService.session(callbackSession);
   if (!callbackSession || !callbackUser || callbackUser.id !== transaction.userId || transaction.sessionHash !== crypto.createHash('sha256').update(callbackSession).digest('hex')) return res.status(403).send('OAuth 授权会话不匹配。');
@@ -1493,7 +1576,7 @@ app.get("/auth/google/callback", async (req, res) => {
         return res
           .status(409)
           .send(
-            "原 Google 账户已不存在或服务商已变更，请回到 InboxHarbor 重新添加并授权。",
+            "原 Google 账户已不存在或服务商已变更，请回到本站重新添加并授权。",
           );
       }
 
@@ -1643,6 +1726,20 @@ app.post("/api/accounts/:id/revoke", (req, res) => {
   res.json({ success: true, account: publicAccount(account) });
 });
 
+app.get("/api/v1/notification-rules", (req, res) => {
+  const tenant = loadTenantState(storage, req.user.id);
+  res.json({ success: true, policy: readTenantNotificationPolicy(req.user.id, tenant), behavior: { matching: "启用规则的条件按 AND 匹配；多条命中规则合并渠道且每封邮件每渠道只投递一次。", disabledRules: "全部规则关闭时使用所有启用渠道。", quietHours: "免打扰期间创建待投递记录，结束后自动恢复。", dedupe: "仅抑制同渠道且此前投递成功的相同内容；不会合并不同邮件正文。" } });
+});
+app.put("/api/v1/notification-rules", (req, res) => {
+  const tenant = loadTenantState(storage, req.user.id);
+  try {
+    const policy = normalizePolicy(req.body || {}, { accountIds: new Set(tenant.accounts.map((account) => account.id)), channelIds: new Set(tenant.channels.map((channel) => channel.id)) });
+    storage.db.prepare("INSERT OR REPLACE INTO instance_settings (key,value) VALUES (?,?)").run(notificationPolicyKey(req.user.id), JSON.stringify(policy));
+    authService.audit(req.user, "notification.policy.updated", "notification_policy", null, { rules: policy.rules.length });
+    res.json({ success: true, policy });
+  } catch (error) { res.status(400).json({ success: false, message: error.message }); }
+});
+
 app.get("/api/v1/notifications", (req, res) => {
   const tenant = loadTenantState(storage, req.user.id);
   const setting = storage.db.prepare('SELECT value FROM instance_settings WHERE key=?').get(`user:${req.user.id}:shareLinkDays`);
@@ -1656,7 +1753,7 @@ app.get("/api/v1/notifications", (req, res) => {
 
 app.get("/api/v1/notifications/deliveries", (req, res) => {
   const state = String(req.query.state || "").trim().toLowerCase();
-  if (state && !["pending", "sending", "delivered", "failed"].includes(state))
+  if (state && !["pending", "sending", "delivered", "failed", "skipped"].includes(state))
     return res.status(400).json({ success: false, message: "无效的投递状态" });
   const positiveInt = (value, fallback, max) => {
     const parsed = Number.parseInt(value, 10);
@@ -1681,7 +1778,7 @@ app.get("/api/v1/notifications/deliveries", (req, res) => {
     return {
       id: row.id,
       kind: isTest ? "test" : "mail",
-      state: ["pending", "sending", "delivered", "failed"].includes(meta.state) ? meta.state : "pending",
+      state: ["pending", "sending", "delivered", "failed", "skipped"].includes(meta.state) ? meta.state : "pending",
       attempts: Number.isFinite(Number(meta.attempts)) ? Math.max(0, Number(meta.attempts)) : 0,
       createdAt: isoTime(row.created_at),
       updatedAt: isoTime(meta.updatedAt) || isoTime(row.created_at),
@@ -1689,6 +1786,7 @@ app.get("/api/v1/notifications/deliveries", (req, res) => {
       channelType: Object.hasOwn(CHANNELS, row.channel_type || meta.channelType || "") ? (row.channel_type || meta.channelType) : "unknown",
       mail: storedMail ? { id: row.message_id, subject: String(storedMail.subject || ""), sender: String(storedMail.sender || ""), account: String(storedMail.account || ""), receivedAt: isoTime(storedMail.receivedAt) } : null,
       error: failed ? safeFailure(meta.error?.code || meta.error || "delivery_failed") : null,
+      deferredReason: meta.deferredReason || meta.skippedReason || null,
       deliveryNote: "渠道接受不代表终端已读。",
     };
   });
@@ -1721,33 +1819,18 @@ app.put("/api/v1/connectors", (req, res) => {
   }
 });
 
-app.post("/api/v1/connectors/check", (req, res) => {
+function connectorCheck(req, res) {
   const configuration = publicConnectorConfig();
+  const microsoftReady = configuration.microsoft.configured;
+  const googleReady = configuration.google.clientIdConfigured && configuration.google.clientSecretConfigured;
   const results = {
-    microsoft: {
-      ready: configuration.microsoft.configured,
-      message: configuration.microsoft.configured
-        ? "本地格式检查通过，可以逐个授权 Microsoft 邮箱。"
-        : "请填写 Microsoft Client ID。",
-    },
-    google: {
-      ready:
-        configuration.google.clientIdConfigured &&
-        configuration.google.clientSecretConfigured,
-      message:
-        configuration.google.clientIdConfigured &&
-        configuration.google.clientSecretConfigured
-          ? `本地格式检查通过。请确认 Google 控制台回调地址为 ${configuration.googleCallbackUrl}`
-          : "请同时填写 Google Client ID 与 Client Secret。",
-    },
+    microsoft: { ready: microsoftReady, checked: "local_configuration_only", message: microsoftReady ? "本地 Client ID 格式可用于发起逐邮箱授权。" : "请填写 Microsoft Client ID。" },
+    google: { ready: googleReady, checked: "local_configuration_only", message: googleReady ? "本地 Client ID 与 Secret 已配置；请在 Google 控制台核对回调地址。" : "请同时填写 Google Client ID 与 Client Secret。" },
   };
-  res.json({
-    success: true,
-    ready: results.microsoft.ready || results.google.ready,
-    results,
-    configuration,
-  });
-});
+  res.json({ success: true, ready: microsoftReady || googleReady, results, configuration, limitations: ["未向 Microsoft 或 Google 发起网络请求。", "不会验证 OAuth 同意屏、Google 发布状态、测试用户、管理员同意或现有授权有效性。", "响应不包含 Client Secret、refresh token 或 access token。"] });
+}
+app.get("/api/v1/connectors/check", connectorCheck);
+app.post("/api/v1/connectors/check", connectorCheck);
 
 app.put("/api/v1/notifications", (req, res) => {
   try {
@@ -1800,10 +1883,11 @@ app.post("/api/v1/notifications/:type/test", async (req, res) => {
     await send(
       validatedChannel,
       messageFor({
-        subject: "InboxHarbor 通知测试",
+        subject: `${readSiteName(authService)} 通知测试`,
         account: "local@inboxharbor.app",
-        sender: "InboxHarbor",
-        content: "渠道连接正常。之后的新邮件可按当前设置发送完整正文。",
+        sender: readSiteName(authService),
+        siteName: readSiteName(authService),
+        content: `${readSiteName(authService)} 的渠道连接正常。之后的新邮件可按当前设置发送完整正文。`,
       }), req.user.role,
     );
     recordTenantTestDelivery(req.user.id, saved?.id, type, true);
@@ -2304,17 +2388,16 @@ app.post("/api/accounts/send-test-mail", async (req, res) => {
 
 app.get("/api/mails", (req, res) => {
   const query = { ...req.query };
-  // Preserve from/to (sender/recipient) for existing clients; sender and
-  // start/end make the intended mail-sender and date-range filters explicit.
   if (query.sender && !query.from) query.from = query.sender;
   if (query.start && !query.dateFrom) query.dateFrom = query.start;
   if (query.end && !query.dateTo) query.dateTo = query.end;
-  for (const field of ["dateFrom", "dateTo"]) {
-    if (query[field] && Number.isNaN(new Date(query[field]).valueOf()))
-      return res.status(400).json({ success: false, message: "时间范围格式无效" });
-  }
+  for (const field of ["dateFrom", "dateTo"]) if (query[field] && Number.isNaN(new Date(query[field]).valueOf())) return res.status(400).json({ success: false, message: "时间范围格式无效" });
+  const bool = (value) => value === undefined || value === "" ? null : ["true","1"].includes(String(value).toLowerCase()) ? true : ["false","0"].includes(String(value).toLowerCase()) ? false : undefined;
+  const unread = bool(query.unread), starred = bool(query.starred);
+  if (unread === undefined || starred === undefined) return res.status(400).json({ success: false, message: "未读和收藏筛选必须为 true 或 false" });
   const tenant = loadTenantState(storage, req.user.id);
-  const result = queryMails(tenant.mails, query, tenant.rules);
+  const mails = tenant.mails.filter((mail) => (unread === null || Boolean(!mail.isRead) === unread) && (starred === null || Boolean(mail.isStarred) === starred));
+  const result = queryMails(mails, query, tenant.rules);
   res.json({ success: true, ...result });
 });
 
@@ -2345,6 +2428,24 @@ app.patch("/api/mails/:id/state", (req, res) => {
   tenant.repo.update('messages', mail.id, mail, { account_id: mail.accountId || null });
   authService.audit(req.user, 'mail.state.updated', 'mail', mail.id, {});
   res.json({ success: true, mail: publicMail(mail, tenant.rules) });
+});
+
+app.post("/api/mails/batch-state", (req, res) => {
+  const ids = req.body?.ids, state = req.body?.state;
+  if (!Array.isArray(ids) || ids.length < 1 || ids.length > 200 || new Set(ids).size !== ids.length || ids.some((id) => typeof id !== "string")) return res.status(400).json({ success: false, message: "请选择 1–200 封不同的邮件" });
+  if (!state || typeof state !== "object" || (typeof state.isRead !== "boolean" && typeof state.isStarred !== "boolean")) return res.status(400).json({ success: false, message: "请提供已读或收藏状态" });
+  const tenant = loadTenantState(storage, req.user.id), mails = tenant.mails.filter((mail) => ids.includes(mail.id));
+  storage.db.exec("BEGIN IMMEDIATE");
+  try {
+    for (const mail of mails) {
+      if (typeof state.isRead === "boolean") mail.isRead = state.isRead;
+      if (typeof state.isStarred === "boolean") mail.isStarred = state.isStarred;
+      if (!tenant.repo.update("messages", mail.id, mail, { account_id: mail.accountId || null })) throw new Error("邮件状态已变更");
+    }
+    storage.db.exec("COMMIT");
+  } catch (error) { storage.db.exec("ROLLBACK"); return res.status(409).json({ success: false, message: "邮件状态未能保存，请刷新后重试" }); }
+  authService.audit(req.user, "mail.state.batch_updated", "mail", null, { count: mails.length });
+  res.json({ success: true, updatedCount: mails.length, localOnly: true, message: "仅更新本地状态，不会同步到邮箱提供商。", mails: mails.map((mail) => publicMail(mail, tenant.rules)) });
 });
 
 app.get("/api/classification-rules", (req, res) => {
@@ -2517,7 +2618,7 @@ app.post('/api/mails/:id/share-links',(req,res)=>{const tenant=loadTenantState(s
 app.get('/api/share-links',(req,res)=>res.json({success:true,links:storage.db.prepare('SELECT id,mail_id,expires_at,revoked_at,last_accessed_at,access_count,max_accesses,created_at FROM share_links WHERE user_id=?').all(req.user.id)}));
 app.post('/api/share-links/:id/revoke',(req,res)=>{const changed=storage.db.prepare('UPDATE share_links SET revoked_at=? WHERE id=? AND user_id=? AND revoked_at IS NULL').run(new Date().toISOString(),req.params.id,req.user.id).changes;if(!changed)return res.status(404).json({success:false});authService.audit(req.user,'share.revoked','share_link',req.params.id,{});res.json({success:true});});
 app.delete('/api/share-links/:id',(req,res)=>{const changed=storage.db.prepare('DELETE FROM share_links WHERE id=? AND user_id=?').run(req.params.id,req.user.id).changes;if(!changed)return res.status(404).json({success:false});authService.audit(req.user,'share.deleted','share_link',req.params.id,{});res.json({success:true});});
-app.get('/shared/mail/:token',(req,res)=>{const hash=crypto.createHash('sha256').update(String(req.params.token)).digest('hex'),now=new Date().toISOString();storage.db.exec('BEGIN IMMEDIATE');try{const row=storage.db.prepare("SELECT s.*,m.payload,u.enabled FROM share_links s JOIN mail_messages m ON m.id=s.mail_id AND m.user_id=s.user_id JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.revoked_at IS NULL AND s.expires_at>? AND u.enabled=1").get(hash,now);if(!row|| (row.max_accesses!==null&&row.access_count>=row.max_accesses)){storage.db.exec('ROLLBACK');return res.status(404).send('Not found');}storage.db.prepare('UPDATE share_links SET access_count=access_count+1,last_accessed_at=? WHERE id=?').run(now,row.id);storage.db.exec('COMMIT');const mail=storage.decrypt(row.payload);res.set({'X-Robots-Tag':'noindex','Cache-Control':'no-store','Referrer-Policy':'no-referrer'}).send(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>InboxHarbor</title><main style="max-width:760px;margin:24px auto;font-family:system-ui"><h1>${escapeHtml(mail.subject||'邮件')}</h1><p>${escapeHtml(mail.sender||'')}</p><article style="white-space:pre-wrap">${escapeHtml(mail.content||'')}</article></main>`);}catch(e){try{storage.db.exec('ROLLBACK')}catch{}res.status(404).send('Not found');}});
+app.get('/shared/mail/:token',(req,res)=>{const hash=crypto.createHash('sha256').update(String(req.params.token)).digest('hex'),now=new Date().toISOString();storage.db.exec('BEGIN IMMEDIATE');try{const row=storage.db.prepare("SELECT s.*,m.payload,u.enabled FROM share_links s JOIN mail_messages m ON m.id=s.mail_id AND m.user_id=s.user_id JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.revoked_at IS NULL AND s.expires_at>? AND u.enabled=1").get(hash,now);if(!row|| (row.max_accesses!==null&&row.access_count>=row.max_accesses)){storage.db.exec('ROLLBACK');return res.status(404).send('Not found');}storage.db.prepare('UPDATE share_links SET access_count=access_count+1,last_accessed_at=? WHERE id=?').run(now,row.id);storage.db.exec('COMMIT');const mail=storage.decrypt(row.payload);res.set({'X-Robots-Tag':'noindex','Cache-Control':'no-store','Referrer-Policy':'no-referrer'}).send(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(readSiteName(authService))}</title><main style="max-width:760px;margin:24px auto;font-family:system-ui"><h1>${escapeHtml(mail.subject||'邮件')}</h1><p>${escapeHtml(mail.sender||'')}</p><article style="white-space:pre-wrap">${escapeHtml(mail.content||'')}</article></main>`);}catch(e){try{storage.db.exec('ROLLBACK')}catch{}res.status(404).send('Not found');}});
 
 app.post("/api/mails/clear", (req, res) => {
   const tenant = loadTenantState(storage, req.user.id);
