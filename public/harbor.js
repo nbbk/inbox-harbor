@@ -2,7 +2,7 @@
   const root = document.getElementById("harbor-ui");
   let currentUser = null;
   let pendingRecoveryCodes = null;
-  let branding = { logoDataUrl: "" };
+  let branding = { siteName: "InboxHarbor", logoDataUrl: "" };
   let authConfig = { ownerInitialized: true, allowPublicRegistration: false };
   const pendingInviteToken = new URLSearchParams(location.search).get("invite") || "";
   if (pendingInviteToken) history.replaceState({}, "", location.pathname);
@@ -17,6 +17,9 @@
     sender: "",
     dateFrom: "",
     dateTo: "",
+    unread: "",
+    starred: "",
+    selectedIds: [],
     selectedId: "",
     page: 1,
     pageSize: 50,
@@ -34,14 +37,15 @@
   }
   function writePreferences() {
     try {
-      const value = { category: mailState.category, account: mailState.account, query: mailState.query, sender: mailState.sender, dateFrom: mailState.dateFrom, dateTo: mailState.dateTo, pageSize: mailState.pageSize };
+      const value = { category: mailState.category, account: mailState.account, query: mailState.query, sender: mailState.sender, dateFrom: mailState.dateFrom, dateTo: mailState.dateTo, unread: mailState.unread, starred: mailState.starred, pageSize: mailState.pageSize };
       localStorage.setItem(preferenceKey(), JSON.stringify(value));
     } catch {}
   }
   function restorePreferences() {
     const value = readPreferences();
-    for (const key of ["category","account","query","sender","dateFrom","dateTo","pageSize"]) if (value[key] !== undefined) mailState[key] = value[key];
+    for (const key of ["category","account","query","sender","dateFrom","dateTo","unread","starred","pageSize"]) if (value[key] !== undefined) mailState[key] = value[key];
     if (!["全部","已发送","验证码","通知","账单","社交","推广","其他"].includes(mailState.category)) mailState.category = "全部";
+    for (const key of ["unread","starred"]) if (![ "", "true", "false" ].includes(String(mailState[key]))) mailState[key] = "";
     for (const key of ["account","query","sender","dateFrom","dateTo"]) mailState[key] = typeof mailState[key] === "string" ? mailState[key].slice(0,500) : (key === "account" ? "全部" : "");
     for (const key of ["dateFrom","dateTo"]) if (!/^\d{4}-\d{2}-\d{2}$/.test(mailState[key])) mailState[key] = "";
     mailState.pageSize = [20,50,100].includes(Number(mailState.pageSize)) ? Number(mailState.pageSize) : 50;
@@ -49,7 +53,7 @@
   }
   function resetMailState() {
     clearTimeout(mailState.searchTimer);
-    mailState = { mails: [], accounts: [], category:"全部", account:"全部", query:"", sender:"", dateFrom:"", dateTo:"", selectedId:"", page:1, pageSize:50, pagination:{page:1,pageSize:50,total:0,totalPages:1}, facets:{} };
+    mailState = { mails: [], accounts: [], category:"全部", account:"全部", query:"", sender:"", dateFrom:"", dateTo:"", unread:"", starred:"", selectedIds:[], selectedId:"", page:1, pageSize:50, pagination:{page:1,pageSize:50,total:0,totalPages:1}, facets:{} };
     ++activeLoadSequence; ++mailRequestSequence; ++historySequence;
     allAccounts = []; providerFilter = "all"; statusFilter = "all"; searchQuery = ""; accountPage = 1;
     catalog = {}; config = { includeFullBody:false, shareLinkDays:30, channels:[] };
@@ -89,12 +93,19 @@
     root.querySelector(".ih-recovery-notice")?.remove();
     renderLock();
   }
+  function applyBranding() {
+    const siteName = branding.siteName || "InboxHarbor";
+    document.title = siteName;
+    root.querySelectorAll(".ih-brand, .ih-lock h1").forEach(node => node.title = siteName);
+    root.querySelectorAll("[data-site-name]").forEach(node => { node.textContent = siteName; });
+    root.querySelectorAll(".ih-mark img").forEach(image => { image.alt = siteName + " Logo"; });
+  }
   function brandMark() {
     const mark = element("span", "ih-mark");
     if (branding.logoDataUrl) {
       const image = document.createElement("img");
       image.src = branding.logoDataUrl;
-      image.alt = "InboxHarbor Logo";
+      image.alt = (branding.siteName || "InboxHarbor") + " Logo";
       mark.append(image);
     } else mark.textContent = "IH";
     return mark;
@@ -106,7 +117,8 @@
     root.innerHTML = "";
     const box = element("div", "ih-lock");
     const card = element("div");
-    card.append(brandMark(), element("h1", "", "InboxHarbor"), element("p", "", "私有、克制的邮件工作台。"));
+    const title = element("h1", "", branding.siteName || "InboxHarbor"); title.dataset.siteName = "true";
+    card.append(brandMark(), title, element("p", "", "私有、克制的邮件工作台。"));
     const form = element("form", "ih-auth-form");
     const email = document.createElement("input");
     email.type = "email"; email.placeholder = "邮箱地址"; email.required = true;
@@ -200,9 +212,10 @@
     const shell = element("div", "ih-shell");
     const side = element("aside", "ih-side");
     const brand = element("div", "ih-brand");
-    brand.innerHTML =
-      '<div><b>InboxHarbor</b><small>收件港</small></div>';
-    brand.prepend(brandMark());
+    const brandText = element("div");
+    const brandName = element("b", "", branding.siteName || "InboxHarbor"); brandName.dataset.siteName = "true";
+    brandText.append(brandName, element("small", "", "收件港"));
+    brand.replaceChildren(brandText); brand.prepend(brandMark());
     const nav = element("nav", "ih-nav");
     [
       "概览|overview",
@@ -242,6 +255,7 @@
       "设置|connectors",
       "通知|notifications",
       "我的|profile",
+      ...(currentUser?.role === "owner" || currentUser?.role === "admin" ? ["管理|admin"] : []),
       "帮助|guide",
     ].forEach((x) => {
       const [a, b] = x.split("|");
@@ -281,8 +295,11 @@
         <label><span>邮箱账户</span><select id="ih-mail-account"><option value="全部">全部账户</option></select></label>
         <label><span>起始日期</span><input id="ih-mail-date-from" type="date"></label>
         <label><span>结束日期</span><input id="ih-mail-date-to" type="date"></label>
+        <label><span>未读</span><select id="ih-mail-unread"><option value="">全部</option><option value="true">仅未读</option><option value="false">仅已读</option></select></label>
+        <label><span>收藏</span><select id="ih-mail-starred"><option value="">全部</option><option value="true">仅收藏</option><option value="false">未收藏</option></select></label>
         <button id="ih-mail-reset" class="ih-button ih-button-quiet" type="button">重置筛选</button>
       </div>
+      <div class="ih-batch-toolbar" id="ih-mail-batch" aria-live="polite"><label><input id="ih-mail-select-page" type="checkbox"> 选择当前页</label><span id="ih-mail-selected-count">已选择 0 封</span><button data-batch-state="isRead:true" type="button" disabled>标记已读</button><button data-batch-state="isRead:false" type="button" disabled>标记未读</button><button data-batch-state="isStarred:true" type="button" disabled>收藏</button><button data-batch-state="isStarred:false" type="button" disabled>取消收藏</button><small>站内状态只影响 InboxHarbor，不会同步到邮箱服务商。</small></div>
       <div class="ih-mail-workspace"><div class="ih-mail-list" id="ih-mail-list"></div><article class="ih-mail-reader" id="ih-mail-reader"><div class="ih-mail-empty"><b>选择一封邮件</b><span>正文会在这里清晰呈现。</span></div></article></div><div class="ih-mail-pager" id="ih-mail-pager"></div>`;
     s.querySelector("#ih-mail-refresh").onclick = async () => {
       const button = s.querySelector("#ih-mail-refresh");
@@ -295,17 +312,22 @@
       finally { button.disabled = false; button.textContent = "刷新列表"; }
     };
     s.querySelector("#ih-compose").onclick = openCompose;
-    const scheduleFilter = () => { ++mailRequestSequence; writePreferences(); clearTimeout(mailState.searchTimer); mailState.searchTimer = setTimeout(() => loadMailPage(1), 250); };
+    const scheduleFilter = () => { ++mailRequestSequence; mailState.selectedIds = []; writePreferences(); clearTimeout(mailState.searchTimer); mailState.searchTimer = setTimeout(() => loadMailPage(1), 250); };
     s.querySelector("#ih-mail-search").oninput = (event) => { mailState.query = event.target.value.trim(); scheduleFilter(); };
     s.querySelector("#ih-mail-sender").oninput = (event) => { mailState.sender = event.target.value.trim(); scheduleFilter(); };
     s.querySelector("#ih-mail-account").onchange = (event) => { mailState.account = event.target.value; writePreferences(); loadMailPage(1); };
     s.querySelector("#ih-mail-date-from").onchange = (event) => { mailState.dateFrom = event.target.value; writePreferences(); loadMailPage(1); };
     s.querySelector("#ih-mail-date-to").onchange = (event) => { mailState.dateTo = event.target.value; writePreferences(); loadMailPage(1); };
+    s.querySelector("#ih-mail-unread").onchange = (event) => { mailState.unread = event.target.value; loadMailPage(1); };
+    s.querySelector("#ih-mail-starred").onchange = (event) => { mailState.starred = event.target.value; loadMailPage(1); };
+    s.querySelector("#ih-mail-select-page").onchange = (event) => { const ids = visibleMails().map(mail => mail.id); mailState.selectedIds = event.target.checked ? [...new Set([...mailState.selectedIds, ...ids])] : mailState.selectedIds.filter(id => !ids.includes(id)); renderMailCenter(); };
+    s.querySelectorAll("[data-batch-state]").forEach(button => button.onclick = () => { const [key,value]=button.dataset.batchState.split(":"); batchUpdateMailState({[key]:value==="true"}); });
     s.querySelector("#ih-mail-reset").onclick = () => {
-      mailState.category="全部"; mailState.account="全部"; mailState.query=""; mailState.sender=""; mailState.dateFrom=""; mailState.dateTo=""; mailState.page=1; mailState.selectedId="";
+      mailState.category="全部"; mailState.account="全部"; mailState.query=""; mailState.sender=""; mailState.dateFrom=""; mailState.dateTo=""; mailState.unread=""; mailState.starred=""; mailState.page=1; mailState.selectedIds=[]; mailState.selectedId="";
       writePreferences();
       ["#ih-mail-search","#ih-mail-sender","#ih-mail-date-from","#ih-mail-date-to"].forEach(sel => { const input=s.querySelector(sel); if(input) input.value=""; });
       const account=s.querySelector("#ih-mail-account"); if(account) account.value="全部";
+      const unread=s.querySelector("#ih-mail-unread"), starred=s.querySelector("#ih-mail-starred"); if(unread) unread.value=""; if(starred) starred.value="";
       loadMailPage(1);
     };
     return s;
@@ -337,10 +359,32 @@
   function visibleMails() {
     return mailState.mails;
   }
+  async function batchUpdateMailState(state) {
+    const ids = [...new Set(mailState.selectedIds)].filter(id => mailState.mails.some(mail => mail.id === id));
+    if (!ids.length) return;
+    const buttons = [...document.querySelectorAll("#ih-mail-batch [data-batch-state]")];
+    buttons.forEach(button => { button.disabled = true; });
+    try {
+      const result = await request("/api/mails/batch-state", {method:"POST", body:JSON.stringify({ids,state})});
+      const changed = new Map((result.mails || []).map(mail => [mail.id, mail]));
+      mailState.mails = mailState.mails.map(mail => changed.get(mail.id) || mail);
+      mailState.selectedIds = [];
+      await loadMailPage(mailState.page || 1);
+    } catch (error) { alert(error.message); renderMailCenter(); }
+    finally { buttons.forEach(button => { button.disabled = false; }); renderBatchToolbar(mailState.mails); }
+  }
+  function renderBatchToolbar(filtered) {
+    const selected = new Set(mailState.selectedIds);
+    const pageIds = filtered.map(mail => mail.id);
+    const select = document.getElementById("ih-mail-select-page");
+    if (select) { select.checked = pageIds.length > 0 && pageIds.every(id => selected.has(id)); select.indeterminate = pageIds.some(id => selected.has(id)) && !select.checked; }
+    const count = document.getElementById("ih-mail-selected-count"); if (count) count.textContent = `已选择 ${selected.size} 封`;
+    document.querySelectorAll("#ih-mail-batch [data-batch-state]").forEach(button => { button.disabled = selected.size === 0; });
+  }
 
   function renderMailCenter(mails, accounts) {
-    const search=document.getElementById("ih-mail-search"), sender=document.getElementById("ih-mail-sender"), from=document.getElementById("ih-mail-date-from"), to=document.getElementById("ih-mail-date-to");
-    if(search) search.value=mailState.query; if(sender) sender.value=mailState.sender; if(from) from.value=mailState.dateFrom; if(to) to.value=mailState.dateTo;
+    const search=document.getElementById("ih-mail-search"), sender=document.getElementById("ih-mail-sender"), from=document.getElementById("ih-mail-date-from"), to=document.getElementById("ih-mail-date-to"), unread=document.getElementById("ih-mail-unread"), starred=document.getElementById("ih-mail-starred");
+    if(search) search.value=mailState.query; if(sender) sender.value=mailState.sender; if(from) from.value=mailState.dateFrom; if(to) to.value=mailState.dateTo; if(unread) unread.value=mailState.unread; if(starred) starred.value=mailState.starred;
     if (mails) mailState.mails = mails;
     if (accounts) mailState.accounts = accounts;
     const list = document.getElementById("ih-mail-list");
@@ -378,6 +422,7 @@
       empty.append(element("b", "", "没有符合条件的邮件"), element("span", "", "换个分类或搜索词试试。"));
       list.append(empty);
       renderMailReader(null);
+      renderBatchToolbar(filtered);
       renderMailPager();
       return;
     }
@@ -385,10 +430,13 @@
       mailState.selectedId = filtered[0].id;
     filtered.forEach((mail) => {
       const button = element(
-        "button",
+        "div",
         `ih-mail-row${mail.id === mailState.selectedId ? " active" : ""}`,
       );
+      button.setAttribute("role","button"); button.tabIndex=0;
       const top = element("span", "ih-mail-row-top");
+      const check = document.createElement("input"); check.type="checkbox"; check.checked=mailState.selectedIds.includes(mail.id); check.setAttribute("aria-label", `选择邮件 ${mail.subject || mail.id}`);
+      check.onclick = event => { event.stopPropagation(); mailState.selectedIds = check.checked ? [...new Set([...mailState.selectedIds, mail.id])] : mailState.selectedIds.filter(id => id !== mail.id); renderBatchToolbar(filtered); }; top.append(check);
       top.append(
         element(
           "b",
@@ -408,6 +456,8 @@
       );
       button.append(top, subject, preview, meta);
       button.onclick = () => {
+        const wasUnread = mail.isRead === false;
+        if (wasUnread) { mail.isRead = true; updateMailState(mail, {isRead:true}, false); }
         mailState.selectedId = mail.id;
         renderMailCenter();
         if (matchMedia("(max-width: 760px)").matches)
@@ -416,6 +466,7 @@
       list.append(button);
     });
     renderMailReader(filtered.find((mail) => mail.id === mailState.selectedId));
+    renderBatchToolbar(filtered);
     renderMailPager();
   }
 
@@ -435,12 +486,15 @@
 
   async function loadMailPage(page) {
     clearTimeout(mailState.searchTimer);
+    mailState.selectedIds = [];
     const sequence = ++mailRequestSequence;
     if (!currentUser) return;
     if (mailState.dateFrom && mailState.dateTo && mailState.dateFrom > mailState.dateTo) { document.getElementById("ih-mail-summary").textContent = "起始日期不能晚于结束日期"; return; }
     try {
       const params = new URLSearchParams({ page: String(page), pageSize: String(mailState.pageSize) });
       if (mailState.query) params.set("q", mailState.query);
+      if (mailState.unread) params.set("unread", mailState.unread);
+      if (mailState.starred) params.set("starred", mailState.starred);
       if (mailState.sender) params.set("sender", mailState.sender);
       if (mailState.account !== "全部") params.set("account", mailState.account);
       if (mailState.dateFrom) params.set("dateFrom", mailState.dateFrom);
@@ -543,7 +597,7 @@
         attachments.append(element("span", "", "此邮件包含附件，当前版本仅展示附件信息。"));
       reader.append(attachments);
     }
-    if (!mail.isRead) updateMailState(mail, { isRead: true }, false);
+
   }
 
   async function updateMailState(mail, changes, rerender = true) {
@@ -663,7 +717,7 @@
   function notifications() {
     const s = element("section", "ih-page");
     s.id = "ih-notifications";
-    s.innerHTML = '<div class="ih-section-head"><div><h2>通知渠道</h2><p class="ih-section-copy">配置推送渠道与共享阅读规则。</p></div></div><div class="ih-layout"><div><section class="ih-share-settings" aria-labelledby="ih-share-title"><div class="ih-share-icon" aria-hidden="true">🔗</div><div class="ih-share-copy"><h3 id="ih-share-title">共享阅读链接</h3><p>通知中的“查看邮件”链接免登录、只读，过期后自动失效。</p></div><label class="ih-share-field" for="ih-share-days"><span>有效期</span><span class="ih-share-input"><input id="ih-share-days" type="number" min="1" max="365" value="30" inputmode="numeric" aria-label="查看链接有效期（天）" aria-describedby="ih-share-hint"><b>天</b></span><small id="ih-share-hint">1–365 天，默认 30 天</small></label></section><div class="ih-channels" id="ih-channel-list"></div><div class="ih-save-row"><button id="ih-save" class="ih-button">保存通知设置</button><span>保存后对新生成的链接生效</span></div></div><aside class="ih-card ih-guide" id="ih-channel-guide"><p>选择一个渠道</p><h3>配置说明</h3><p>所有渠道只推送摘要与免登录只读链接；凭据不会回显。</p></aside></div><section class="ih-card ih-delivery-history"><div class="ih-section-head"><div><h3>通知历史</h3><p class="ih-section-copy">仅展示当前账户的投递状态，不包含凭据。</p></div><button id="ih-history-refresh" class="ih-button ih-button-quiet">刷新历史</button></div><div id="ih-delivery-history" class="ih-simple-list">正在加载…</div></section>';
+    s.innerHTML = '<div class="ih-section-head"><div><h2>通知渠道</h2><p class="ih-section-copy">配置推送渠道与共享阅读规则。</p></div></div><div class="ih-layout"><div><section class="ih-share-settings" aria-labelledby="ih-share-title"><div class="ih-share-icon" aria-hidden="true">🔗</div><div class="ih-share-copy"><h3 id="ih-share-title">共享阅读链接</h3><p>通知中的“查看邮件”链接免登录、只读，过期后自动失效。</p></div><label class="ih-share-field" for="ih-share-days"><span>有效期</span><span class="ih-share-input"><input id="ih-share-days" type="number" min="1" max="365" value="30" inputmode="numeric" aria-label="查看链接有效期（天）" aria-describedby="ih-share-hint"><b>天</b></span><small id="ih-share-hint">1–365 天，默认 30 天</small></label></section><div class="ih-channels" id="ih-channel-list"></div><div class="ih-save-row"><button id="ih-save" class="ih-button">保存通知设置</button><span>保存后对新生成的链接生效</span></div></div><aside class="ih-card ih-guide" id="ih-channel-guide"><p>选择一个渠道</p><h3>配置说明</h3><p>所有渠道只推送摘要与免登录只读链接；凭据不会回显。</p></aside></div><section class="ih-card ih-notification-rules"><div class="ih-section-head"><div><h3>通知规则与免打扰</h3><p class="ih-section-copy">规则按账户、发件人和关键词同时满足；无规则时沿用所有启用渠道。</p></div><button id="ih-rules-save" class="ih-button">保存规则</button></div><div id="ih-rules-list"></div><button id="ih-rules-add" type="button" class="ih-button ih-button-quiet">添加规则</button><fieldset class="ih-quiet-hours"><legend>免打扰时段</legend><label><input id="ih-quiet-enabled" type="checkbox"> 启用</label><label>开始 <input id="ih-quiet-start" type="time"></label><label>结束 <input id="ih-quiet-end" type="time"></label><label>时区 <input id="ih-quiet-timezone" placeholder="Asia/Shanghai"></label></fieldset></section><section class="ih-card ih-delivery-history"><div class="ih-section-head"><div><h3>通知历史</h3><p class="ih-section-copy">仅展示当前账户的投递状态，不包含凭据。</p></div><button id="ih-history-refresh" class="ih-button ih-button-quiet">刷新历史</button></div><div id="ih-delivery-history" class="ih-simple-list">正在加载…</div></section>';
     const historyControls = element("div","ih-history-controls");
     const historyState = document.createElement("select"); historyState.id="ih-history-state"; historyState.setAttribute("aria-label","通知状态");
     [["","全部状态"],["failed","失败"],["delivered","渠道已接受"],["sending","发送中"]].forEach(([v,l])=>historyState.add(new Option(l,v)));
@@ -671,7 +725,39 @@
     s.querySelector(".ih-delivery-history").insertBefore(historyControls,s.querySelector("#ih-delivery-history"));
     const pager=element("div","ih-history-pager"); pager.id="ih-history-pager"; s.querySelector(".ih-delivery-history").append(pager);
     s.querySelector("#ih-history-refresh").onclick=()=>loadNotificationHistory(historyPage);
+    s.querySelector("#ih-rules-save").onclick=saveNotificationRules;
+    s.querySelector("#ih-rules-add").onclick=()=>{ addNotificationRule(); };
+    loadNotificationRules().catch(error=>{ const box=document.getElementById("ih-rules-list"); if(box)box.textContent="通知规则暂时不可用："+error.message; });
     return s;
+  }
+  function addNotificationRule(rule={}) {
+    const box=document.getElementById("ih-rules-list"); if(!box)return;
+    const row=element("div","ih-rule-row"); row.dataset.id=rule.id||"";
+    const account=document.createElement("select"); account.className="ih-rule-account"; account.append(new Option("所有账户",""));
+    mailState.accounts.forEach(a=>account.append(new Option(a.username,a.id))); account.value=rule.accountId||"";
+    const sender=document.createElement("input"); sender.placeholder="发件人"; sender.value=rule.sender||"";
+    const keyword=document.createElement("input"); keyword.placeholder="关键词"; keyword.value=rule.keyword||"";
+    const channels=document.createElement("select"); channels.className="ih-rule-channels"; channels.multiple=true; channels.size=Math.min(3, Math.max(1, config.channels.length));
+    config.channels.filter(channel=>channel && channel.id).forEach(channel=>channels.append(new Option(channel.name || channel.label || channel.type || channel.id, channel.id)));
+    new Set(rule.channelIds||[]).forEach(id=>{ const option=[...channels.options].find(item=>item.value===id); if(option) option.selected=true; });
+    channels.setAttribute("aria-label","通知渠道");
+    const enabled=document.createElement("input"); enabled.type="checkbox"; enabled.checked=rule.enabled!==false; enabled.setAttribute("aria-label","启用规则");
+    const remove=element("button","ih-button ih-button-quiet","删除"); remove.type="button"; remove.onclick=()=>row.remove();
+    row.append(enabled,account,sender,keyword,channels,remove); box.append(row);
+  }
+  async function loadNotificationRules() {
+    const result=await request("/api/v1/notification-rules"), box=document.getElementById("ih-rules-list"); if(!box)return;
+    box.replaceChildren(); (result.rules||[]).forEach(addNotificationRule); if(!(result.rules||[]).length)addNotificationRule();
+    const quiet=result.quietHours||{}; const enabled=document.getElementById("ih-quiet-enabled"); if(enabled)enabled.checked=!!quiet.enabled;
+    const start=document.getElementById("ih-quiet-start"), end=document.getElementById("ih-quiet-end"), tz=document.getElementById("ih-quiet-timezone");
+    if(start)start.value=quiet.start||""; if(end)end.value=quiet.end||""; if(tz)tz.value=quiet.timeZone||"Asia/Shanghai";
+  }
+  async function saveNotificationRules() {
+    const rules=[...document.querySelectorAll("#ih-rules-list .ih-rule-row")].map(row=>({id:row.dataset.id||undefined,enabled:row.querySelector('input[type="checkbox"]').checked,accountId:row.querySelector(".ih-rule-account").value||undefined,sender:row.querySelectorAll("input")[1].value.trim()||undefined,keyword:row.querySelectorAll("input")[2].value.trim()||undefined,channelIds:[...row.querySelector(".ih-rule-channels").selectedOptions].map(option=>option.value)}));
+    const quietHours={enabled:!!document.getElementById("ih-quiet-enabled")?.checked,start:document.getElementById("ih-quiet-start")?.value||"00:00",end:document.getElementById("ih-quiet-end")?.value||"00:00",timeZone:document.getElementById("ih-quiet-timezone")?.value||"Asia/Shanghai"};
+    const button=document.getElementById("ih-rules-save"); if(button)button.disabled=true;
+    try { await request("/api/v1/notification-rules",{method:"PUT",body:JSON.stringify({rules,quietHours})}); if(button)button.textContent="已保存"; setTimeout(()=>{if(button)button.textContent="保存规则";},1500); }
+    catch(error){ if(button)button.textContent=error.message; } finally { if(button)setTimeout(()=>button.disabled=false,1500); }
   }
   async function loadNotificationHistory(page = 1) {
     const box=document.getElementById("ih-delivery-history"); if(!box || !currentUser)return;
@@ -714,12 +800,33 @@
   function admin(){const s=element('section','ih-page');s.id='ih-admin';s.innerHTML='<div class="ih-section-head"><div><h1>管理后台</h1><p class="ih-section-copy">仅展示必要的成员、邀请与实例审计信息。</p></div></div><div class="ih-admin-grid"><section class="ih-card"><h2>成员</h2><div id="ih-users" class="ih-simple-list"></div></section><section class="ih-card"><h2>创建邀请</h2><form id="ih-invite-form"><label class="ih-field-label">邮箱（可留空）<input name="email" type="email" placeholder="member@example.com"></label><label class="ih-field-label">角色<select name="role"><option value="user">成员</option><option value="admin">管理员</option></select></label><label class="ih-field-label">有效期（小时）<input name="ttlHours" type="number" min="1" max="720" value="72"></label><button class="ih-button" type="submit">生成邀请链接</button></form><div id="ih-invite-result" class="ih-invite-result"></div><div id="ih-invites" class="ih-simple-list"></div></section></div><section class="ih-card ih-owner-only" id="ih-public-registration"><h2>公开注册</h2><p>关闭时仅可通过邀请创建成员。</p><label class="ih-switch"><input type="checkbox" id="ih-public-toggle"><span class="ih-switch-track"></span><span class="ih-switch-label">允许公开注册</span></label></section><section class="ih-card"><h2>审计日志</h2><div id="ih-audit" class="ih-simple-list"></div></section>';if(currentUser?.role==='owner')s.append(brandingSettings());return s;}
   function brandingSettings() {
     const section = element("section", "ih-card ih-branding-settings");
-    section.append(element("h2", "", "站点 Logo"), element("p", "ih-section-copy", "统一显示在登录页和侧边栏。支持 PNG、JPEG、WebP，最大 128 KB；留空使用默认 IH 标志。"));
+    section.append(element("h2", "", "站点品牌"), element("p", "ih-section-copy", "站点名称会显示在登录页、侧边栏和浏览器标题中。名称支持 1–60 个 Unicode 字符；留空恢复默认名称。"));
+    const nameLabel = element("label", "ih-field-label", "站点名称");
+    const nameInput = document.createElement("input"); nameInput.id = "ih-site-name"; nameInput.maxLength = 120; nameInput.value = branding.siteName || "InboxHarbor"; nameInput.setAttribute("aria-label", "站点名称");
+    nameLabel.append(nameInput);
+    const nameStatus = element("p", "ih-section-copy"); nameStatus.setAttribute("role", "status");
+    const nameActions = element("div", "ih-section-actions");
+    const nameSave = element("button", "ih-button", "保存站点名称"); nameSave.type = "button";
+    const nameReset = element("button", "ih-button ih-button-quiet", "恢复默认名称"); nameReset.type = "button";
+    const validSiteName = (value) => { const trimmed = String(value ?? "").trim(); return trimmed === "" || ([...trimmed].length <= 60 && !/[\u0000-\u001F\u007F]/.test(trimmed)); };
+    nameInput.oninput = () => { if (!validSiteName(nameInput.value)) { nameStatus.textContent = "站点名称最多 60 个 Unicode 字符，且不能包含控制字符。"; nameSave.disabled = true; } else { nameStatus.textContent = ""; nameSave.disabled = false; } };
+    async function persistName(value) {
+      if (!validSiteName(value)) { nameStatus.textContent = "站点名称最多 60 个 Unicode 字符，且不能包含控制字符。"; return; }
+      nameSave.disabled = true; nameReset.disabled = true;
+      try {
+        const result = await request("/api/v1/branding", { method:"PUT", body:JSON.stringify({siteName:value}) });
+        branding = { ...branding, ...result };
+        nameInput.value = branding.siteName || "InboxHarbor"; applyBranding(); nameStatus.textContent = "站点名称已更新。";
+      } catch (error) { nameStatus.textContent = error.message; }
+      finally { nameSave.disabled = false; nameReset.disabled = false; }
+    }
+    nameSave.onclick = () => persistName(nameInput.value);
+    nameReset.onclick = () => persistName("");
+    nameActions.append(nameSave, nameReset);
     const preview = element("div", "ih-logo-preview"); preview.append(brandMark());
-    const label = element("label", "ih-field-label", "上传 Logo");
-    const input = document.createElement("input"); input.type = "file";
-    input.accept = "image/png,image/jpeg,image/webp"; input.id = "ih-logo-upload";
-    label.htmlFor = input.id; label.append(input);
+    const logoLabel = element("label", "ih-field-label", "上传 Logo");
+    const input = document.createElement("input"); input.type = "file"; input.accept = "image/png,image/jpeg,image/webp"; input.id = "ih-logo-upload";
+    logoLabel.htmlFor = input.id; logoLabel.append(input);
     const status = element("p", "ih-section-copy"); status.setAttribute("role", "status");
     const actions = element("div", "ih-section-actions");
     const save = element("button", "ih-button", "保存 Logo"); save.type = "button"; save.disabled = true;
@@ -727,15 +834,13 @@
     let candidate = branding.logoDataUrl, reading = 0;
     function showPreview(value) {
       preview.replaceChildren();
-      if (value) { const image = document.createElement("img"); image.src = value; image.alt = "Logo 预览"; preview.append(image); }
-      else preview.append(element("span", "ih-mark", "IH"));
+      if (value) { const image = document.createElement("img"); image.src = value; image.alt = (branding.siteName || "InboxHarbor") + " Logo"; preview.append(image); }
+      else preview.append(brandMark());
     }
     input.onchange = async () => {
       const version = ++reading, file = input.files[0]; save.disabled = true;
       if (!file) return;
-      if (!["image/png","image/jpeg","image/webp"].includes(file.type) || file.size > 128 * 1024) {
-        status.textContent = "请选择不超过 128 KB 的 PNG、JPEG 或 WebP 图片。"; input.value = ""; return;
-      }
+      if (!["image/png","image/jpeg","image/webp"].includes(file.type) || file.size > 128 * 1024) { status.textContent = "请选择不超过 128 KB 的 PNG、JPEG 或 WebP 图片。"; input.value = ""; return; }
       try {
         const value = await new Promise((resolve,reject) => { const reader = new FileReader(); reader.onload=()=>resolve(reader.result); reader.onerror=reject; reader.readAsDataURL(file); });
         const image = new Image(); image.src = value; await image.decode();
@@ -743,17 +848,17 @@
         candidate = value; showPreview(candidate); save.disabled = false; status.textContent = "预览已更新，点击保存后全站生效。";
       } catch { if (version === reading) status.textContent = "图片无法读取，请选择有效图片。"; }
     };
-    async function persist(value) {
+    async function persistLogo(value) {
       ++reading; save.disabled = true; reset.disabled = true; input.disabled = true;
       try {
-        branding = await request("/api/v1/branding", {method:"PUT",body:JSON.stringify({logoDataUrl:value})});
-        candidate = branding.logoDataUrl; showPreview(candidate); refreshBrandMarks(); input.value = "";
+        const result = await request("/api/v1/branding", {method:"PUT",body:JSON.stringify({logoDataUrl:value})});
+        branding = { ...branding, ...result }; candidate = branding.logoDataUrl || ""; showPreview(candidate); refreshBrandMarks(); applyBranding(); input.value = "";
         status.textContent = value ? "Logo 已保存，登录页和侧边栏已同步更新。" : "已恢复默认 IH 标志。";
       } catch (error) { status.textContent = error.message; save.disabled = false; }
       finally { reset.disabled = false; input.disabled = false; }
     }
-    save.onclick = () => persist(candidate); reset.onclick = () => persist("");
-    actions.append(save,reset); section.append(preview,label,actions,status); return section;
+    save.onclick = () => persistLogo(candidate); reset.onclick = () => persistLogo("");
+    actions.append(save,reset); section.append(nameLabel,nameActions,nameStatus,preview,logoLabel,actions,status); return section;
   }
   async function loadUserAreas(){
     const profileIdentity=document.getElementById('ih-profile-identity'); if(profileIdentity){profileIdentity.textContent=`${currentUser.email} · ${currentUser.role}`;const quota=await request(`/api/auth/users/${encodeURIComponent(currentUser.id)}/quota`).catch(()=>({quota:null}));const q=quota.quota||{};document.getElementById('ih-profile-quota').textContent=`邮箱账户：${q.mail_account_limit??'未限制'} · 通知渠道：${q.notification_limit??'未限制'}`;const links=await request('/api/share-links').catch(()=>({links:[]}));const box=document.getElementById('ih-shares');box.replaceChildren();(links.links||[]).forEach(link=>{const row=element('div','ih-simple-row');row.append(element('span','',`${link.mailSubject||'邮件'} · ${link.expiresAt||'无期限'}`));const revoke=element('button','ih-button ih-button-quiet','撤销');revoke.onclick=async()=>{await request(`/api/share-links/${link.id}/revoke`,{method:'POST'});loadUserAreas();};row.append(revoke);box.append(row);});if(!(links.links||[]).length)box.textContent='暂无共享链接。';}
@@ -830,7 +935,7 @@
 </details>
             <p class="ih-callback-note"><b>长期使用：</b>请展开上方教程完成正式发布及重新授权；仅添加测试用户仍会受到 7 天限制。正式版支持自动续期，但不保证永久免授权。</p>
           </section>
-          <div class="ih-connector-actions"><button type="submit" id="cx-save" class="ih-button">保存并检测配置</button><span id="cx-result" aria-live="polite"></span></div>
+          <div class="ih-connector-actions"><button type="submit" id="cx-save" class="ih-button">保存并检测配置</button><button type="button" id="cx-check" class="ih-button ih-button-quiet">仅检查当前配置</button><span id="cx-result" aria-live="polite"></span></div>
         </form>
         <aside class="ih-setup-aside"><h2>如何授权多个邮箱</h2><ol><li>Google 与 Microsoft 的应用配置各保存一次。</li><li>到“邮箱账户”批量添加地址，并选择对应平台。</li><li>在每一行点击“授权”，登录与该行完全相同的邮箱。</li><li>默认只读；开启发信后，需要为该邮箱重新授权。</li></ol><p>程序不会保存邮箱登录密码。OAuth Token 与 Client Secret 使用本机主密钥加密存储。</p><p>更换 Client ID 或 Secret 后，请重新授权该平台已有的全部邮箱。</p></aside>
       </div>`;
@@ -893,6 +998,12 @@
       );
     document.getElementById("cx-copy").onclick = (event) =>
       copyText(c.googleCallbackUrl, event.currentTarget);
+    const checkButton=document.getElementById("cx-check"), checkResult=document.getElementById("cx-result");
+    if(checkButton)checkButton.onclick=async()=>{checkButton.disabled=true;checkResult.textContent="正在检查…";try{const result=await request("/api/v1/connectors/check",{method:"POST",body:"{}"});const results=result.results||{}; const entries=Object.entries(results);
+        const notReady=entries.filter(([,item])=>item && item.ready===false);
+        const lines=entries.map(([name,item])=>{ const label=item?.label||item?.message||(item?.ready===false?"未就绪":"已就绪"); const hint=item?.hint||item?.limitations; return `${name}：${label}${hint?" — "+hint:""}`; });
+        checkResult.textContent=lines.join("；")||"配置检查已完成。";
+        checkResult.className=notReady.length?"error":"success";}catch(error){checkResult.textContent=error.message;checkResult.className="error";}finally{checkButton.disabled=false;}};
     const form = document.getElementById("cx-form");
     form.onsubmit = async (event) => {
       event.preventDefault();
@@ -953,7 +1064,7 @@
       await loadMailPage(mailState.page || 1);
       if (loadSequence !== activeLoadSequence || epoch !== sessionEpoch || !currentUser) return;
       loadConnectors().catch(() => {});
-      if (notices) { catalog = notices.catalog; config = notices.configuration; renderChannels(); loadNotificationHistory().catch(()=>{}); }
+      if (notices) { catalog = notices.catalog; config = notices.configuration; renderChannels(); if (document.getElementById("ih-rules-list")) loadNotificationRules().catch(()=>{}); loadNotificationHistory().catch(()=>{}); }
       loadUserAreas().catch(() => {});
       setTimeout(()=>{const recovery=document.getElementById('ih-recovery');if(recovery)recovery.onclick=async()=>{const currentPassword=prompt('输入当前密码以生成新恢复码');if(!currentPassword)return;try{const result=await request('/api/auth/recovery/regenerate',{method:'POST',body:JSON.stringify({currentPassword})});displayRecoveryCodes(result.recoveryCodes);renderRecoveryNotice();}catch(error){alert(error.message);}};const remove=document.getElementById('ih-delete-account');if(remove)remove.onclick=async()=>{const currentPassword=prompt('输入当前密码以永久删除账户');if(!currentPassword)return;if(!confirm('邮件、账户、通知和共享链接将被永久删除。'))return;try{await request('/api/auth/me',{method:'DELETE',body:JSON.stringify({currentPassword})});lock();}catch(error){alert(error.message);}};},0);
     } catch (err) {
@@ -1504,5 +1615,5 @@
     document.getElementById("ih-add").onclick = openAddAccounts;
 
   }
-  (async()=>{try{[authConfig,branding]=await Promise.all([request("/api/auth/config"),request("/api/auth/branding").catch(()=>({logoDataUrl:""}))]);if(authConfig.user){currentUser=authConfig.user;render();}else renderLock();}catch(error){renderLock();}})();
+  (async()=>{try{[authConfig,branding]=await Promise.all([request("/api/auth/config"),request("/api/auth/branding").catch(()=>({siteName:"InboxHarbor",logoDataUrl:""}))]);branding={siteName:branding.siteName||"InboxHarbor",logoDataUrl:branding.logoDataUrl||""};applyBranding();if(authConfig.user){currentUser=authConfig.user;render();}else renderLock();}catch(error){branding={siteName:"InboxHarbor",logoDataUrl:""};renderLock();}})();
 })();

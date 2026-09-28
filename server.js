@@ -209,7 +209,16 @@ function parseDeliveryStatus(value) { try { const parsed = JSON.parse(value || '
 function notificationPolicyKey(userId) { return `user:${userId}:notificationPolicy`; }
 function readTenantNotificationPolicy(userId, tenant) {
   const row = storage.db.prepare('SELECT value FROM instance_settings WHERE key=?').get(notificationPolicyKey(userId));
-  try { return normalizePolicy(row ? JSON.parse(row.value) : DEFAULT_POLICY, { accountIds: new Set(tenant.accounts.map((a) => a.id)), channelIds: new Set(tenant.channels.map((c) => c.id)) }); } catch { return { ...DEFAULT_POLICY, rules: [] }; }
+  if (!row) return normalizePolicy(DEFAULT_POLICY);
+  try {
+    // References are checked on writes. Keep stale references in the allowlist:
+    // deleting an account/channel must never broaden delivery or disable quiet hours.
+    const value = JSON.parse(row.value);
+    const rules = Array.isArray(value.rules) ? value.rules : [];
+    return normalizePolicy(value, { accountIds: new Set(rules.map(r => r?.accountId).filter(Boolean)), channelIds: new Set(rules.flatMap(r => Array.isArray(r?.channelIds) ? r.channelIds : [])) });
+  } catch {
+    return { ...DEFAULT_POLICY, rules: [{ enabled: true, channelIds: [] }] };
+  }
 }
 function dedupeSettingKey(userId) { return `user:${userId}:notificationDedupe`; }
 function mutateDedupe(userId, callback) {
@@ -232,41 +241,36 @@ function claimDedupe(userId, key, minutes, now) {
     // A concurrent send receives a durable deferred record. If the first send
     // fails, settleDedupe reactivates it; only a successful send leaves it skipped.
     if (prior && prior.state === 'sending' && now - Number(prior.at || 0) < 120000) return { duplicate: true, inFlight: true };
-    entries[key] = { state: 'sending', at: now }; return { duplicate: false, inFlight: false };
+    const claimId = crypto.randomUUID(); entries[key] = { state: 'sending', at: now, claimId }; return { duplicate: false, inFlight: false, claimId };
   });
 }
-function reactivateInFlightDedupe(userId, key, now) {
-  if (!key) return;
+function settleDedupe(userId, key, ok, now, claimId) {
+  if (!key || !claimId) return;
+  mutateDedupe(userId, (entries) => {
+    if (entries[key]?.claimId !== claimId) return;
+    if (ok) entries[key] = { state: 'delivered', at: now }; else delete entries[key];
+  });
+}
+function deferTenantDelivery(userId, channelId, mail, now, retryAt, reason, key = null) {
+  // Durable outbox row precedes every dedupe claim, including a first send.
   storage.db.exec('BEGIN IMMEDIATE');
   try {
-    const rows = storage.db.prepare('SELECT id,status FROM notification_deliveries WHERE user_id=?').all(userId);
-    for (const row of rows) {
-      const meta = parseDeliveryStatus(row.status);
-      if (meta.state !== 'skipped' || meta.skippedReason !== 'deduplicated_in_flight' || meta.dedupeKey !== key) continue;
-      meta.state = 'pending'; meta.skippedReason = null; meta.deferredReason = 'dedupe_retry'; meta.nextRetryAt = now; meta.updatedAt = new Date(now).toISOString();
-      storage.db.prepare('UPDATE notification_deliveries SET status=? WHERE id=? AND user_id=?').run(JSON.stringify(meta), row.id, userId);
-    }
+    const row = storage.db.prepare('SELECT id,status FROM notification_deliveries WHERE user_id=? AND channel_id=? AND message_id=?').get(userId, channelId, mail.id);
+    const prior = row ? parseDeliveryStatus(row.status) : { attempts: 0 };
+    const meta = { ...prior, state: 'pending', nextRetryAt: retryAt, deferredReason: reason, skippedReason: null, dedupeKey: key, updatedAt: new Date(now).toISOString() };
+    delete meta.claimId; delete meta.claimedAt;
+    if (row) storage.db.prepare('UPDATE notification_deliveries SET status=? WHERE id=? AND user_id=?').run(JSON.stringify(meta), row.id, userId);
+    else storage.db.prepare('INSERT INTO notification_deliveries VALUES (?,?,?,?,?,?)').run(crypto.randomUUID(), userId, channelId, mail.id, JSON.stringify(meta), new Date(now).toISOString());
     storage.db.exec('COMMIT');
   } catch (error) { storage.db.exec('ROLLBACK'); throw error; }
 }
-function settleDedupe(userId, key, ok, now) {
-  if (!key) return;
-  mutateDedupe(userId, (entries) => { if (ok) entries[key] = { state: 'delivered', at: now }; else delete entries[key]; });
-  if (!ok) reactivateInFlightDedupe(userId, key, now);
+function recordDeduplicatedDelivery(userId, channelId, mail, now, key) {
+  const row = storage.db.prepare('SELECT id,status FROM notification_deliveries WHERE user_id=? AND channel_id=? AND message_id=?').get(userId, channelId, mail.id);
+  const prior = row ? parseDeliveryStatus(row.status) : { attempts: 0 };
+  const meta = { ...prior, state: 'skipped', nextRetryAt: null, deferredReason: null, skippedReason: 'deduplicated', dedupeKey: key, updatedAt: new Date(now).toISOString() };
+  if (row) storage.db.prepare('UPDATE notification_deliveries SET status=? WHERE id=? AND user_id=?').run(JSON.stringify(meta), row.id, userId);
 }
-function queueQuietDelivery(userId, channelId, mail, now, retryAt, dedupeValue) {
-  storage.db.exec('BEGIN IMMEDIATE');
-  try {
-    const exists = storage.db.prepare('SELECT id FROM notification_deliveries WHERE user_id=? AND channel_id=? AND message_id=?').get(userId, channelId, mail.id);
-    if (!exists) storage.db.prepare('INSERT INTO notification_deliveries VALUES (?,?,?,?,?,?)').run(crypto.randomUUID(), userId, channelId, mail.id, JSON.stringify({ state: 'pending', attempts: 0, nextRetryAt: retryAt, deferredReason: 'quiet_hours', dedupeKey: dedupeValue || null, updatedAt: new Date(now).toISOString() }), new Date(now).toISOString());
-    storage.db.exec('COMMIT'); return !exists;
-  } catch (error) { storage.db.exec('ROLLBACK'); throw error; }
-}
-function recordDeduplicatedDelivery(userId, channelId, mail, now, dedupeValue, reason = 'deduplicated') {
-  storage.db.prepare('INSERT OR IGNORE INTO notification_deliveries VALUES (?,?,?,?,?,?)').run(crypto.randomUUID(), userId, channelId, mail.id, JSON.stringify({ state: 'skipped', attempts: 0, skippedReason: reason, dedupeKey: dedupeValue, updatedAt: new Date(now).toISOString() }), new Date(now).toISOString());
-}
-
-function claimTenantDelivery(userId, channelId, messageId, now, claimTtlMs = 120000, dedupeValue = null) {
+function claimTenantDelivery(userId, channelId, messageId, now, claimTtlMs = 120000, dedupeValue = null, dedupeClaimId = null) {
   storage.db.exec('BEGIN IMMEDIATE');
   try {
     let row = storage.db.prepare('SELECT * FROM notification_deliveries WHERE user_id=? AND channel_id=? AND message_id=?').get(userId, channelId, messageId);
@@ -276,7 +280,7 @@ function claimTenantDelivery(userId, channelId, messageId, now, claimTtlMs = 120
     if (meta.state === 'delivered' || meta.state === 'skipped' || (meta.state === 'pending' && retryAt > now) || (meta.state === 'failed' && (Number(meta.attempts || 0) >= 3 || retryAt > now)) || (meta.state === 'sending' && (Number(meta.attempts || 0) >= 3 || leaseUntil > now))) {
       storage.db.exec('COMMIT'); return null;
     }
-    meta = { ...meta, state: 'sending', attempts: Number(meta.attempts || 0) + 1, nextRetryAt: null, claimedAt: now, claimId: crypto.randomUUID(), dedupeKey: dedupeValue || meta.dedupeKey || null, deferredReason: null, updatedAt: new Date(now).toISOString(), error: null };
+    meta = { ...meta, state: 'sending', attempts: Number(meta.attempts || 0) + 1, nextRetryAt: null, claimedAt: now, claimId: crypto.randomUUID(), dedupeKey: dedupeValue, dedupeClaimId, deferredReason: null, updatedAt: new Date(now).toISOString(), error: null };
     if (row) storage.db.prepare('UPDATE notification_deliveries SET status=? WHERE id=? AND user_id=?').run(JSON.stringify(meta), row.id, userId);
     else {
       const id = crypto.randomUUID();
@@ -300,7 +304,7 @@ function finishTenantDelivery(userId, delivery, ok, now, failure = null) {
     delete meta.claimId; delete meta.claimedAt;
     storage.db.prepare('UPDATE notification_deliveries SET status=? WHERE id=? AND user_id=?').run(JSON.stringify(meta), delivery.id, userId);
     storage.db.exec('COMMIT');
-    settleDedupe(userId, meta.dedupeKey, ok, now);
+    settleDedupe(userId, meta.dedupeKey, ok, now, meta.dedupeClaimId);
     return true;
   } catch (error) { storage.db.exec('ROLLBACK'); throw error; }
 }
@@ -335,21 +339,25 @@ async function pushTenantNotifications(events, deps = {}) {
     for (const channel of candidates) {
       const flightKey = `${userId}:${channel.id}:${mail.id}`;
       if (deliverySendFlights.has(flightKey)) continue;
-      const key = mail.__dedupeKey || (policy.dedupeMinutes ? `${channel.id}:${dedupeKey(mail)}` : null);
+      const existing = storage.db.prepare('SELECT status FROM notification_deliveries WHERE user_id=? AND channel_id=? AND message_id=?').get(userId, channel.id, mail.id);
+      const prior = existing ? parseDeliveryStatus(existing.status) : {};
+      if (['delivered','skipped'].includes(prior.state) || Number(prior.attempts || 0) >= 3 ||
+          (prior.state === 'sending' && Number(prior.claimedAt || 0) + claimTtlMs > now) ||
+          (['pending','failed'].includes(prior.state) && Number(prior.nextRetryAt || 0) > now)) continue;
+      const key = policy.dedupeMinutes ? channel.id + ':' + crypto.createHash('sha256').update(dedupeKey(mail)).digest('hex') : null;
+      if (isQuiet(policy, now)) {
+        deferTenantDelivery(userId, channel.id, mail, now, quietEndsAt(policy, now), 'quiet_hours', key);
+        continue;
+      }
+      deferTenantDelivery(userId, channel.id, mail, now, now, 'dedupe_retry', key);
       const dedupeClaim = claimDedupe(userId, key, policy.dedupeMinutes, now);
       if (dedupeClaim.duplicate) {
-        recordDeduplicatedDelivery(userId, channel.id, mail, now, key, dedupeClaim.inFlight ? 'deduplicated_in_flight' : 'deduplicated');
+        if (dedupeClaim.inFlight) deferTenantDelivery(userId, channel.id, mail, now, now + 120000, 'dedupe_retry', key);
+        else recordDeduplicatedDelivery(userId, channel.id, mail, now, key);
         continue;
       }
-      if (!directChannelId && isQuiet(policy, now)) {
-        queueQuietDelivery(userId, channel.id, mail, now, quietEndsAt(policy, now), key);
-        // Queuing is not a successful delivery, so another mail is never
-        // suppressed merely because it is waiting for quiet hours to end.
-        settleDedupe(userId, key, false, now);
-        continue;
-      }
-      const delivery = claimTenantDelivery(userId, channel.id, mail.id, now, claimTtlMs, key);
-      if (!delivery) { settleDedupe(userId, key, false, now); continue; }
+      const delivery = claimTenantDelivery(userId, channel.id, mail.id, now, claimTtlMs, key, dedupeClaim.claimId);
+      if (!delivery) { settleDedupe(userId, key, false, now, dedupeClaim.claimId); continue; }
       const flight = (async () => {
         let ok = false, failure = null;
         try {
