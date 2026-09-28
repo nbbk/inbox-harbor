@@ -160,3 +160,12 @@ body:has(dialog.ih-recovery-notice[open]) { overflow: hidden; }
 
 .ih-batch-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:10px 0;padding:10px;border:1px solid #dbe6eb;border-radius:8px;color:#496979;font-size:13px}.ih-batch-toolbar button{border:1px solid #c8d7df;background:#fff;border-radius:6px;padding:6px 9px;color:#155f7d}.ih-batch-toolbar button:disabled{opacity:.5}.ih-mail-row{cursor:pointer}.ih-mail-row-top{display:flex;align-items:center;gap:8px}.ih-mail-row-top input{flex:0 0 auto}.ih-rule-row{display:grid;grid-template-columns:auto minmax(160px,1fr) minmax(140px,1fr) minmax(140px,1fr) auto;gap:8px;align-items:center;margin:8px 0}.ih-rule-row input:not([type=checkbox]),.ih-rule-row select{min-height:38px;width:100%}.ih-quiet-hours{display:flex;gap:12px;flex-wrap:wrap;margin:16px 0;padding:12px;border:1px solid #dbe6eb;border-radius:8px}.ih-quiet-hours input{max-width:180px}.ih-connector-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}@media(max-width:600px){.ih-rule-row{grid-template-columns:1fr 1fr}.ih-rule-row button{grid-column:1/-1}.ih-batch-toolbar{align-items:flex-start}.ih-quiet-hours{display:grid;grid-template-columns:1fr}.ih-quiet-hours input{max-width:none;width:100%}}
 .ih-brand{min-width:0}.ih-brand>div{min-width:0}.ih-brand b{display:block;overflow-wrap:anywhere;word-break:break-word}.ih-lock h1{overflow-wrap:anywhere;word-break:break-word}
+.ih-rule-row { display:grid; grid-template-columns:auto 1fr 1fr 1fr; gap:12px; padding:16px; border:1px solid #dbe6eb; border-radius:8px; margin-bottom:12px; }
+.ih-rule-row .ih-field-label { min-width:0; margin:0; }
+.ih-rule-channels { grid-column:1/-1; display:flex; flex-wrap:wrap; gap:16px; border:1px solid #dbe6eb; border-radius:6px; }
+.ih-rule-channels label { display:flex; align-items:center; gap:6px; }
+.ih-rule-row input[type=checkbox],.ih-rule-channels input[type=checkbox] { width:18px; height:18px; min-height:0; }
+#ih-dedupe-minutes { max-width:140px; }
+@media(max-width:768px){.ih-rule-row{grid-template-columns:1fr}.ih-rule-channels{grid-column:1}.ih-quiet-hours label{min-width:0}}
+
+#cx-result {display:block;flex-basis:100%;min-width:0;overflow-wrap:anywhere}.ih-connector-check{padding:12px 0;border-bottom:1px solid #dbe6eb}.ih-connector-check p{margin:6px 0;font-size:13px;line-height:1.6}

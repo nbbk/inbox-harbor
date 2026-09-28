@@ -1835,6 +1835,12 @@ function connectorCheck(req, res) {
     microsoft: { ready: microsoftReady, checked: "local_configuration_only", message: microsoftReady ? "本地 Client ID 格式可用于发起逐邮箱授权。" : "请填写 Microsoft Client ID。" },
     google: { ready: googleReady, checked: "local_configuration_only", message: googleReady ? "本地 Client ID 与 Secret 已配置；请在 Google 控制台核对回调地址。" : "请同时填写 Google Client ID 与 Client Secret。" },
   };
+  results.microsoft.checks = [{label:"Client ID 已配置",ok:!!configuration.microsoft.configured}];
+  results.google.checks = [
+    {label:"Client ID 已配置",ok:!!configuration.google.clientIdConfigured},
+    {label:"Client Secret 已配置（不回显）",ok:!!configuration.google.clientSecretConfigured},
+    {label:"回调地址已生成",ok:!!configuration.googleCallbackUrl,detail:configuration.googleCallbackUrl},
+  ];
   res.json({ success: true, ready: microsoftReady || googleReady, results, configuration, limitations: ["未向 Microsoft 或 Google 发起网络请求。", "不会验证 OAuth 同意屏、Google 发布状态、测试用户、管理员同意或现有授权有效性。", "响应不包含 Client Secret、refresh token 或 access token。"] });
 }
 app.get("/api/v1/connectors/check", connectorCheck);

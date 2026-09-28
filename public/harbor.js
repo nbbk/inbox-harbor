@@ -31,6 +31,7 @@
   let sessionEpoch = 0;
   let historySequence = 0;
   let historyPage = 1;
+  let rulesLoaded = false, rulesSequence = 0, batchBusy = false;
   const preferenceKey = () => currentUser ? `inboxharbor.mail-preferences.${currentUser.id}` : "";
   function readPreferences() {
     try { const value = JSON.parse(localStorage.getItem(preferenceKey()) || "{}"); return value && typeof value === "object" && !Array.isArray(value) ? value : {}; } catch { return {}; }
@@ -54,7 +55,8 @@
   function resetMailState() {
     clearTimeout(mailState.searchTimer);
     mailState = { mails: [], accounts: [], category:"全部", account:"全部", query:"", sender:"", dateFrom:"", dateTo:"", unread:"", starred:"", selectedIds:[], selectedId:"", page:1, pageSize:50, pagination:{page:1,pageSize:50,total:0,totalPages:1}, facets:{} };
-    ++activeLoadSequence; ++mailRequestSequence; ++historySequence;
+    ++activeLoadSequence; ++mailRequestSequence; ++historySequence; ++rulesSequence;
+    rulesLoaded = false; batchBusy = false;
     allAccounts = []; providerFilter = "all"; statusFilter = "all"; searchQuery = ""; accountPage = 1;
     catalog = {}; config = { includeFullBody:false, shareLinkDays:30, channels:[] };
   }
@@ -361,7 +363,9 @@
   }
   async function batchUpdateMailState(state) {
     const ids = [...new Set(mailState.selectedIds)].filter(id => mailState.mails.some(mail => mail.id === id));
-    if (!ids.length) return;
+    if (!ids.length || batchBusy) return;
+    batchBusy=true;
+    const epoch=sessionEpoch;
     const buttons = [...document.querySelectorAll("#ih-mail-batch [data-batch-state]")];
     buttons.forEach(button => { button.disabled = true; });
     try {
@@ -371,7 +375,7 @@
       mailState.selectedIds = [];
       await loadMailPage(mailState.page || 1);
     } catch (error) { alert(error.message); renderMailCenter(); }
-    finally { buttons.forEach(button => { button.disabled = false; }); renderBatchToolbar(mailState.mails); }
+    finally { if(epoch===sessionEpoch){batchBusy=false;renderBatchToolbar(mailState.mails);} }
   }
   function renderBatchToolbar(filtered) {
     const selected = new Set(mailState.selectedIds);
@@ -379,7 +383,7 @@
     const select = document.getElementById("ih-mail-select-page");
     if (select) { select.checked = pageIds.length > 0 && pageIds.every(id => selected.has(id)); select.indeterminate = pageIds.some(id => selected.has(id)) && !select.checked; }
     const count = document.getElementById("ih-mail-selected-count"); if (count) count.textContent = `已选择 ${selected.size} 封`;
-    document.querySelectorAll("#ih-mail-batch [data-batch-state]").forEach(button => { button.disabled = selected.size === 0; });
+    document.querySelectorAll("#ih-mail-batch [data-batch-state]").forEach(button => { button.disabled = batchBusy || selected.size === 0; });
   }
 
   function renderMailCenter(mails, accounts) {
@@ -463,6 +467,7 @@
         if (matchMedia("(max-width: 760px)").matches)
           document.getElementById("ih-mail-reader").scrollIntoView({ behavior: "smooth" });
       };
+      button.onkeydown=event=>{if(event.target===button && ["Enter"," "].includes(event.key)){event.preventDefault();button.click();}};
       list.append(button);
     });
     renderMailReader(filtered.find((mail) => mail.id === mailState.selectedId));
@@ -487,6 +492,7 @@
   async function loadMailPage(page) {
     clearTimeout(mailState.searchTimer);
     mailState.selectedIds = [];
+    renderBatchToolbar(mailState.mails);
     const sequence = ++mailRequestSequence;
     if (!currentUser) return;
     if (mailState.dateFrom && mailState.dateTo && mailState.dateFrom > mailState.dateTo) { document.getElementById("ih-mail-summary").textContent = "起始日期不能晚于结束日期"; return; }
@@ -717,47 +723,82 @@
   function notifications() {
     const s = element("section", "ih-page");
     s.id = "ih-notifications";
-    s.innerHTML = '<div class="ih-section-head"><div><h2>通知渠道</h2><p class="ih-section-copy">配置推送渠道与共享阅读规则。</p></div></div><div class="ih-layout"><div><section class="ih-share-settings" aria-labelledby="ih-share-title"><div class="ih-share-icon" aria-hidden="true">🔗</div><div class="ih-share-copy"><h3 id="ih-share-title">共享阅读链接</h3><p>通知中的“查看邮件”链接免登录、只读，过期后自动失效。</p></div><label class="ih-share-field" for="ih-share-days"><span>有效期</span><span class="ih-share-input"><input id="ih-share-days" type="number" min="1" max="365" value="30" inputmode="numeric" aria-label="查看链接有效期（天）" aria-describedby="ih-share-hint"><b>天</b></span><small id="ih-share-hint">1–365 天，默认 30 天</small></label></section><div class="ih-channels" id="ih-channel-list"></div><div class="ih-save-row"><button id="ih-save" class="ih-button">保存通知设置</button><span>保存后对新生成的链接生效</span></div></div><aside class="ih-card ih-guide" id="ih-channel-guide"><p>选择一个渠道</p><h3>配置说明</h3><p>所有渠道只推送摘要与免登录只读链接；凭据不会回显。</p></aside></div><section class="ih-card ih-notification-rules"><div class="ih-section-head"><div><h3>通知规则与免打扰</h3><p class="ih-section-copy">规则按账户、发件人和关键词同时满足；无规则时沿用所有启用渠道。</p></div><button id="ih-rules-save" class="ih-button">保存规则</button></div><div id="ih-rules-list"></div><button id="ih-rules-add" type="button" class="ih-button ih-button-quiet">添加规则</button><fieldset class="ih-quiet-hours"><legend>免打扰时段</legend><label><input id="ih-quiet-enabled" type="checkbox"> 启用</label><label>开始 <input id="ih-quiet-start" type="time"></label><label>结束 <input id="ih-quiet-end" type="time"></label><label>时区 <input id="ih-quiet-timezone" placeholder="Asia/Shanghai"></label></fieldset></section><section class="ih-card ih-delivery-history"><div class="ih-section-head"><div><h3>通知历史</h3><p class="ih-section-copy">仅展示当前账户的投递状态，不包含凭据。</p></div><button id="ih-history-refresh" class="ih-button ih-button-quiet">刷新历史</button></div><div id="ih-delivery-history" class="ih-simple-list">正在加载…</div></section>';
+    s.innerHTML = '<div class="ih-section-head"><div><h2>通知渠道</h2><p class="ih-section-copy">配置推送渠道与共享阅读规则。</p></div></div><div class="ih-layout"><div><section class="ih-share-settings" aria-labelledby="ih-share-title"><div class="ih-share-icon" aria-hidden="true">🔗</div><div class="ih-share-copy"><h3 id="ih-share-title">共享阅读链接</h3><p>通知中的“查看邮件”链接免登录、只读，过期后自动失效。</p></div><label class="ih-share-field" for="ih-share-days"><span>有效期</span><span class="ih-share-input"><input id="ih-share-days" type="number" min="1" max="365" value="30" inputmode="numeric" aria-label="查看链接有效期（天）" aria-describedby="ih-share-hint"><b>天</b></span><small id="ih-share-hint">1–365 天，默认 30 天</small></label></section><div class="ih-channels" id="ih-channel-list"></div><div class="ih-save-row"><button id="ih-save" class="ih-button">保存通知设置</button><span>保存后对新生成的链接生效</span></div></div><aside class="ih-card ih-guide" id="ih-channel-guide"><p>选择一个渠道</p><h3>配置说明</h3><p>所有渠道只推送摘要与免登录只读链接；凭据不会回显。</p></aside></div><section class="ih-card ih-notification-rules"><div class="ih-section-head"><div><h3>通知规则与免打扰</h3><p class="ih-section-copy">规则按账户、发件人和关键词同时满足；发件人和关键词按包含文字匹配，不区分大小写。没有启用规则时使用所有启用渠道；多条规则命中同一邮件时，同一渠道只投递一次。</p></div><button id="ih-rules-save" class="ih-button">保存规则</button></div><div id="ih-rules-list"></div><button id="ih-rules-add" type="button" class="ih-button ih-button-quiet">添加规则</button><fieldset class="ih-quiet-hours"><legend>免打扰时段</legend><label><input id="ih-quiet-enabled" type="checkbox"> 启用</label><label>开始 <input id="ih-quiet-start" type="time"></label><label>结束 <input id="ih-quiet-end" type="time"></label><label>时区 <input id="ih-quiet-timezone" placeholder="Asia/Shanghai"></label></fieldset><p class="ih-section-copy">免打扰期间保存待发通知，结束后自动投递；开始与结束相同表示不静音。渠道测试会立即发送，不受规则和免打扰限制。</p><label class="ih-field-label">重复通知抑制（分钟）<input id="ih-dedupe-minutes" type="number" min="0" max="60" value="0"></label><p class="ih-section-copy">0 表示关闭。相同邮箱、发件人、主题和验证码在同一渠道成功投递后，窗口内不再重复通知；不同邮件正文不会合并。</p><p id="ih-rules-status" role="status" class="ih-section-copy"></p><button id="ih-rules-reload" type="button" class="ih-button ih-button-quiet">重新加载已保存规则</button></section><section class="ih-card ih-delivery-history"><div class="ih-section-head"><div><h3>通知历史</h3><p class="ih-section-copy">仅展示当前账户的投递状态，不包含凭据。</p></div><button id="ih-history-refresh" class="ih-button ih-button-quiet">刷新历史</button></div><div id="ih-delivery-history" class="ih-simple-list">正在加载…</div></section>';
     const historyControls = element("div","ih-history-controls");
     const historyState = document.createElement("select"); historyState.id="ih-history-state"; historyState.setAttribute("aria-label","通知状态");
-    [["","全部状态"],["failed","失败"],["delivered","渠道已接受"],["sending","发送中"]].forEach(([v,l])=>historyState.add(new Option(l,v)));
+    [["","全部状态"],["pending","等待发送"],["skipped","重复已抑制"],["failed","失败"],["delivered","渠道已接受"],["sending","发送中"]].forEach(([v,l])=>historyState.add(new Option(l,v)));
     historyState.onchange=()=>loadNotificationHistory(1); historyControls.append(historyState);
     s.querySelector(".ih-delivery-history").insertBefore(historyControls,s.querySelector("#ih-delivery-history"));
     const pager=element("div","ih-history-pager"); pager.id="ih-history-pager"; s.querySelector(".ih-delivery-history").append(pager);
     s.querySelector("#ih-history-refresh").onclick=()=>loadNotificationHistory(historyPage);
     s.querySelector("#ih-rules-save").onclick=saveNotificationRules;
     s.querySelector("#ih-rules-add").onclick=()=>{ addNotificationRule(); };
-    loadNotificationRules().catch(error=>{ const box=document.getElementById("ih-rules-list"); if(box)box.textContent="通知规则暂时不可用："+error.message; });
+    s.querySelector("#ih-rules-reload").onclick = () => { if (confirm("重新加载会替换尚未保存的规则，是否继续？")) loadNotificationRules(true); };
+    s.querySelector("#ih-rules-save").disabled = true;
+    s.querySelector("#ih-rules-add").disabled = true;
     return s;
   }
   function addNotificationRule(rule={}) {
     const box=document.getElementById("ih-rules-list"); if(!box)return;
-    const row=element("div","ih-rule-row"); row.dataset.id=rule.id||"";
-    const account=document.createElement("select"); account.className="ih-rule-account"; account.append(new Option("所有账户",""));
-    mailState.accounts.forEach(a=>account.append(new Option(a.username,a.id))); account.value=rule.accountId||"";
-    const sender=document.createElement("input"); sender.placeholder="发件人"; sender.value=rule.sender||"";
-    const keyword=document.createElement("input"); keyword.placeholder="关键词"; keyword.value=rule.keyword||"";
-    const channels=document.createElement("select"); channels.className="ih-rule-channels"; channels.multiple=true; channels.size=Math.min(3, Math.max(1, config.channels.length));
-    config.channels.filter(channel=>channel && channel.id).forEach(channel=>channels.append(new Option(channel.name || channel.label || channel.type || channel.id, channel.id)));
-    new Set(rule.channelIds||[]).forEach(id=>{ const option=[...channels.options].find(item=>item.value===id); if(option) option.selected=true; });
-    channels.setAttribute("aria-label","通知渠道");
-    const enabled=document.createElement("input"); enabled.type="checkbox"; enabled.checked=rule.enabled!==false; enabled.setAttribute("aria-label","启用规则");
-    const remove=element("button","ih-button ih-button-quiet","删除"); remove.type="button"; remove.onclick=()=>row.remove();
-    row.append(enabled,account,sender,keyword,channels,remove); box.append(row);
+    const row=element("div","ih-rule-row"); row.dataset.id=rule.id||crypto.randomUUID();
+    const field=(title,node)=>{const label=element("label","ih-field-label",title);label.append(node);return label;};
+    const enabled=document.createElement("input");enabled.type="checkbox";enabled.className="ih-rule-enabled";enabled.checked=rule.enabled!==false;enabled.setAttribute("aria-label","启用规则");
+    const account=document.createElement("select");account.className="ih-rule-account";account.append(new Option("所有账户",""));
+    mailState.accounts.forEach(a=>account.append(new Option(a.username,a.id)));
+    if(rule.accountId && !mailState.accounts.some(a=>a.id===rule.accountId))account.append(new Option("原邮箱已删除，请重新选择",rule.accountId));
+    account.value=rule.accountId||"";
+    const sender=document.createElement("input");sender.className="ih-rule-sender";sender.placeholder="发件人";sender.maxLength=254;sender.value=rule.sender||"";
+    const keyword=document.createElement("input");keyword.className="ih-rule-keyword";keyword.placeholder="关键词";keyword.maxLength=200;keyword.value=rule.keyword||"";
+    const channels=element("fieldset","ih-rule-channels");channels.append(element("legend","","投递渠道"));
+    const selected=new Set(rule.channelIds||[]);
+    const options=[...config.channels];
+    for(const id of selected)if(!options.some(c=>c.id===id))options.push({id,type:"原渠道已删除，请取消选择"});
+    for(const channel of options) {
+      const check=document.createElement("input");check.type="checkbox";check.value=channel.id;check.checked=selected.has(channel.id);
+      const label=element("label","",catalog[channel.type]?.name||channel.type);label.prepend(check);channels.append(label);
+    }
+    if(!options.length)channels.append(element("small","","请先在上方配置并保存通知渠道。"));
+    const remove=element("button","ih-button ih-button-quiet","删除规则");remove.type="button";remove.onclick=()=>row.remove();
+    row.append(field("启用",enabled),field("邮箱账户",account),field("发件人包含",sender),field("主题或正文包含",keyword),channels,remove);box.append(row);
   }
-  async function loadNotificationRules() {
-    const result=await request("/api/v1/notification-rules"), box=document.getElementById("ih-rules-list"); if(!box)return;
-    box.replaceChildren(); (result.rules||[]).forEach(addNotificationRule); if(!(result.rules||[]).length)addNotificationRule();
-    const quiet=result.quietHours||{}; const enabled=document.getElementById("ih-quiet-enabled"); if(enabled)enabled.checked=!!quiet.enabled;
-    const start=document.getElementById("ih-quiet-start"), end=document.getElementById("ih-quiet-end"), tz=document.getElementById("ih-quiet-timezone");
-    if(start)start.value=quiet.start||""; if(end)end.value=quiet.end||""; if(tz)tz.value=quiet.timeZone||"Asia/Shanghai";
+  function paintNotificationRules(policy) {
+    const box=document.getElementById("ih-rules-list");box.replaceChildren();
+    (policy.rules||[]).forEach(addNotificationRule);
+    const quiet=policy.quietHours||{};
+    document.getElementById("ih-quiet-enabled").checked=!!quiet.enabled;
+    document.getElementById("ih-quiet-start").value=quiet.start||"22:00";
+    document.getElementById("ih-quiet-end").value=quiet.end||"08:00";
+    document.getElementById("ih-quiet-timezone").value=quiet.timeZone||"UTC";
+    document.getElementById("ih-dedupe-minutes").value=policy.dedupeMinutes||0;
+  }
+  async function loadNotificationRules(force=false) {
+    if(rulesLoaded && !force)return;
+    const sequence=++rulesSequence,epoch=sessionEpoch;
+    const status=document.getElementById("ih-rules-status");if(!status)return;
+    status.textContent="正在加载规则…";
+    try {
+      const result=await request("/api/v1/notification-rules");
+      if(sequence!==rulesSequence || epoch!==sessionEpoch || !status.isConnected)return;
+      paintNotificationRules(result.policy);
+      rulesLoaded=true;status.textContent="";
+      document.getElementById("ih-rules-save").disabled=false;document.getElementById("ih-rules-add").disabled=false;
+    } catch(error){if(status.isConnected)status.textContent="规则未加载："+error.message;}
   }
   async function saveNotificationRules() {
-    const rules=[...document.querySelectorAll("#ih-rules-list .ih-rule-row")].map(row=>({id:row.dataset.id||undefined,enabled:row.querySelector('input[type="checkbox"]').checked,accountId:row.querySelector(".ih-rule-account").value||undefined,sender:row.querySelectorAll("input")[1].value.trim()||undefined,keyword:row.querySelectorAll("input")[2].value.trim()||undefined,channelIds:[...row.querySelector(".ih-rule-channels").selectedOptions].map(option=>option.value)}));
-    const quietHours={enabled:!!document.getElementById("ih-quiet-enabled")?.checked,start:document.getElementById("ih-quiet-start")?.value||"00:00",end:document.getElementById("ih-quiet-end")?.value||"00:00",timeZone:document.getElementById("ih-quiet-timezone")?.value||"Asia/Shanghai"};
-    const button=document.getElementById("ih-rules-save"); if(button)button.disabled=true;
-    try { await request("/api/v1/notification-rules",{method:"PUT",body:JSON.stringify({rules,quietHours})}); if(button)button.textContent="已保存"; setTimeout(()=>{if(button)button.textContent="保存规则";},1500); }
-    catch(error){ if(button)button.textContent=error.message; } finally { if(button)setTimeout(()=>button.disabled=false,1500); }
+    const button=document.getElementById("ih-rules-save"),status=document.getElementById("ih-rules-status");
+    const rules=[...document.querySelectorAll("#ih-rules-list .ih-rule-row")].map(row=>({
+      id:row.dataset.id,enabled:row.querySelector(".ih-rule-enabled").checked,
+      accountId:row.querySelector(".ih-rule-account").value||null,
+      sender:row.querySelector(".ih-rule-sender").value.trim(),keyword:row.querySelector(".ih-rule-keyword").value.trim(),
+      channelIds:[...row.querySelectorAll(".ih-rule-channels input:checked")].map(input=>input.value)
+    }));
+    if(rules.some(rule=>!rule.channelIds.length)){status.textContent="每条规则至少选择一个已保存的通知渠道。";return;}
+    const quietHours={enabled:document.getElementById("ih-quiet-enabled").checked,start:document.getElementById("ih-quiet-start").value,end:document.getElementById("ih-quiet-end").value,timeZone:document.getElementById("ih-quiet-timezone").value.trim()};
+    const dedupeMinutes=Number(document.getElementById("ih-dedupe-minutes").value);
+    button.disabled=true;status.textContent="正在保存…";
+    try {const result=await request("/api/v1/notification-rules",{method:"PUT",body:JSON.stringify({rules,quietHours,dedupeMinutes})});if(!button.isConnected)return;paintNotificationRules(result.policy);status.textContent="规则已保存。";}
+    catch(error){if(status.isConnected)status.textContent=error.message;}
+    finally{button.disabled=false;}
   }
   async function loadNotificationHistory(page = 1) {
     const box=document.getElementById("ih-delivery-history"); if(!box || !currentUser)return;
@@ -770,7 +811,7 @@
       const result=await request("/api/v1/notifications/deliveries?"+params);
       if(sequence!==historySequence || epoch!==sessionEpoch || !box.isConnected)return;
       box.replaceChildren();
-      const stateLabels={pending:"等待发送",sending:"发送中",delivered:"渠道已接受",failed:"发送失败"};
+      const stateLabels={pending:"等待发送",sending:"发送中",delivered:"渠道已接受",failed:"发送失败",skipped:"重复已抑制"};
       (result.deliveries||[]).forEach(item=>{
         const row=element("div","ih-simple-row ih-delivery-row"), detail=element("div","ih-delivery-detail");
         const title=item.kind==="test" ? "渠道测试" : item.mail?.subject || "原邮件已删除";
@@ -778,6 +819,7 @@
         detail.append(element("small","", "最近尝试："+formatMailTime(item.updatedAt||item.createdAt)+" · 尝试 "+(item.attempts||0)+" 次"));
         if(item.mail?.account)detail.append(element("small","",item.mail.account));
         if(item.error)detail.append(element("small","ih-delivery-error",item.error.label+"："+item.error.hint));
+        if(item.deferredReason)detail.append(element("small","",({quiet_hours:"免打扰期间暂缓投递",dedupe_retry:"等待相同通知的投递结果后重试",deduplicated:"窗口内相同通知已成功投递，本条不重复发送"})[item.deferredReason]||""));
         if(item.nextRetryAt)detail.append(element("small","","预计重试："+formatMailTime(item.nextRetryAt)));
         else if(item.state==="failed")detail.append(element("small","",item.kind==="test"?"测试不会自动重试，请修正配置后再次测试。":"暂无自动重试计划，请检查渠道配置。"));
         row.append(detail,element("span","ih-delivery-state",stateLabels[item.state]||"状态未知"));box.append(row);
@@ -962,6 +1004,23 @@
     }
   }
 
+  function renderConnectorCheck(result,box,prefix="") {
+    box.replaceChildren();
+    if(prefix)box.append(element("p","",prefix));
+    let missing=false;
+    for(const [provider,item] of Object.entries(result.results||{})) {
+      missing ||= item.ready===false;
+      const row=element("div","ih-connector-check");
+      row.append(element("b","",provider==="google"?"Google":"Microsoft"),element("p","",item.message||item.label||""));
+      for(const check of item.checks||[])row.append(element("p","",(check.ok?"✓ ":"待补充：")+check.label+(check.detail?"："+check.detail:"")));
+      if(item.hint)row.append(element("p","",item.hint));
+      const guide=element("button","ih-button ih-button-quiet","查看对应配置教程");guide.type="button";
+      guide.onclick=()=>{const target=document.getElementById(provider+"-long-term-guide");if(target){target.open=true;target.scrollIntoView({behavior:"smooth",block:"start"});}};
+      row.append(guide);box.append(row);
+    }
+    box.append(element("p","ih-section-copy",(result.limitations||["这里只检查本站已保存的配置，不验证服务商授权或应用发布状态。"]).join(" ")));
+    box.className=missing?"error":"success";
+  }
   async function loadConnectors() {
     const r = await request("/api/v1/connectors");
     const c = r.configuration;
@@ -999,11 +1058,7 @@
     document.getElementById("cx-copy").onclick = (event) =>
       copyText(c.googleCallbackUrl, event.currentTarget);
     const checkButton=document.getElementById("cx-check"), checkResult=document.getElementById("cx-result");
-    if(checkButton)checkButton.onclick=async()=>{checkButton.disabled=true;checkResult.textContent="正在检查…";try{const result=await request("/api/v1/connectors/check",{method:"POST",body:"{}"});const results=result.results||{}; const entries=Object.entries(results);
-        const notReady=entries.filter(([,item])=>item && item.ready===false);
-        const lines=entries.map(([name,item])=>{ const label=item?.label||item?.message||(item?.ready===false?"未就绪":"已就绪"); const hint=item?.hint||item?.limitations; return `${name}：${label}${hint?" — "+hint:""}`; });
-        checkResult.textContent=lines.join("；")||"配置检查已完成。";
-        checkResult.className=notReady.length?"error":"success";}catch(error){checkResult.textContent=error.message;checkResult.className="error";}finally{checkButton.disabled=false;}};
+    if(checkButton)checkButton.onclick=async()=>{checkButton.disabled=true;checkResult.textContent="正在检查…";try{const result=await request("/api/v1/connectors/check",{method:"POST",body:"{}"});renderConnectorCheck(result,checkResult);}catch(error){checkResult.textContent=error.message;checkResult.className="error";}finally{checkButton.disabled=false;}};
     const form = document.getElementById("cx-form");
     form.onsubmit = async (event) => {
       event.preventDefault();
@@ -1028,8 +1083,7 @@
           method: "POST",
           body: "{}",
         });
-        result.textContent = `保存成功。Microsoft：${check.results.microsoft.message} Google：${check.results.google.message}`;
-        result.className = "success";
+        renderConnectorCheck(check,result,"配置已保存。");
         secret.value = "";
         document.getElementById("cx-clear").checked = false;
         await loadConnectors();

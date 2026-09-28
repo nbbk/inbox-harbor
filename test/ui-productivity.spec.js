@@ -41,7 +41,7 @@ async function mockProductivity(page) {
   });
   await page.route("**/api/v1/notifications", route => route.fulfill({json:{catalog:{bark:{name:"Bark",icon:"●",fields:[],guide:"/guide"}},configuration:{shareLinkDays:30,channels:[{id:"channel-a",type:"bark",name:"Bark",enabled:true}]}}}));
   await page.route("**/api/v1/notifications/deliveries?*", route => route.fulfill({json:{deliveries:[],total:0,page:1,pageSize:20}}));
-  await page.route("**/api/v1/notification-rules", route => route.fulfill({json:{rules:[{id:"r1",enabled:true,sender:"",keyword:"",channelIds:["channel-a"]}],quietHours:{enabled:false,start:"22:00",end:"07:00",timeZone:"Asia/Shanghai"}}}));
+  await page.route("**/api/v1/notification-rules", route => route.fulfill({json:{policy:{rules:[{id:"r1",enabled:true,sender:"",keyword:"",channelIds:["channel-a"]}],quietHours:{enabled:false,start:"22:00",end:"07:00",timeZone:"Asia/Shanghai"},dedupeMinutes:5}}}));
   await page.route("**/api/v1/connectors/check", route => route.fulfill({json:{results:{google:{ready:true,label:"配置完整",hint:"可以授权"},microsoft:{ready:false,label:"未配置",hint:"填写 Client ID"}}}}));
   await page.reload();
   await expect(page.locator("#ih-mail-list")).toBeVisible();
@@ -58,10 +58,11 @@ test("batch state uses visible tenant ids and refreshes unread filter", async ({
   await page.getByRole("button", {name:"标记已读"}).click();
   await expect.poll(() => state.getBatch()).toMatchObject({ids:["m1"],state:{isRead:true}});
   await expect(page.locator("#ih-mail-list")).not.toContainText("账单提醒");
+  await page.selectOption("#ih-mail-unread", "");
   await page.selectOption("#ih-mail-starred", "true");
   await expect(page.locator("#ih-mail-list")).toContainText("登录验证码");
   await page.locator("#ih-mail-list input[type=checkbox]").first().check();
-  await page.getByRole("button", {name:"取消收藏"}).click();
+  await page.locator("#ih-mail-batch").getByRole("button", {name:"取消收藏",exact:true}).click();
   await expect.poll(() => state.getBatch()).toMatchObject({ids:["m2"],state:{isStarred:false}});
 });
 
@@ -70,19 +71,21 @@ test("notification rules save channel ids and quiet hours", async ({page}) => {
   await unlock(page); await mockProductivity(page);
   await page.unroute("**/api/v1/notification-rules");
   await page.route("**/api/v1/notification-rules", async route => {
-    if (route.request().method() === "PUT") { body=JSON.parse(route.request().postData()||"{}"); await route.fulfill({json:{success:true,...body}}); }
-    else await route.fulfill({json:{rules:[{id:"r1",enabled:true,channelIds:["channel-a"]}],quietHours:{enabled:false,start:"22:00",end:"07:00",timeZone:"Asia/Shanghai"}}});
+    if (route.request().method() === "PUT") { body=JSON.parse(route.request().postData()||"{}"); await route.fulfill({json:{success:true,policy:body}}); }
+    else await route.fulfill({json:{policy:{rules:[{id:"r1",enabled:true,channelIds:["channel-a"]}],quietHours:{enabled:false,start:"22:00",end:"07:00",timeZone:"Asia/Shanghai"},dedupeMinutes:5}}});
   });
   await page.locator("[data-page=notifications]").first().click();
   const row = page.locator(".ih-rule-row").first();
   await row.locator("input[placeholder=发件人]").fill("alerts@example.com");
-  await row.locator(".ih-rule-channels").selectOption("channel-a");
+  await row.locator(".ih-rule-channels input[value=channel-a]").check();
   await page.locator("#ih-quiet-enabled").check();
   await page.locator("#ih-quiet-start").fill("22:00"); await page.locator("#ih-quiet-end").fill("07:00");
   await page.getByRole("button",{name:"保存规则"}).click();
   await expect.poll(()=>body).toMatchObject({quietHours:{enabled:true,start:"22:00",end:"07:00",timeZone:"Asia/Shanghai"}});
   expect(body.rules[0].channelIds).toEqual(["channel-a"]);
   expect(body.rules[0].sender).toBe("alerts@example.com");
+  expect(body.dedupeMinutes).toBe(5);
+  await page.screenshot({path:"test-results/ui-policy-desktop.png",fullPage:true});
 });
 
 test("connector check exposes ready state and actionable limitation", async ({page}) => {
@@ -118,11 +121,19 @@ test("branding stays text safe, preserves logo, restores preferences, and fits m
   await expect.poll(()=>logo).toBe(png1x1);
   await page.getByRole("button",{name:"恢复默认 Logo"}).click();
   await expect.poll(()=>name).toBe(hostile.trim());
-  await page.locator("[data-page=overview]").first().click();
+  await page.locator(".ih-mobile [data-page=overview]").click();
   await page.selectOption("#ih-mail-unread","true"); await page.selectOption("#ih-mail-starred","false");
   await page.reload();
   await expect(page.locator("#ih-mail-unread")).toHaveValue("true");
   await expect(page.locator("#ih-mail-starred")).toHaveValue("false");
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=document.documentElement.clientWidth)).toBe(true);
   await page.screenshot({path:"test-results/ui-productivity-mobile.png",fullPage:true});
+  await page.locator(".ih-mobile [data-page=admin]").click();
+  const longName="x".repeat(60);
+  await page.locator("#ih-site-name").fill(longName);await page.getByRole("button",{name:"保存站点名称"}).click();
+  await expect(page).toHaveTitle(longName);
+  await page.getByRole("button",{name:"退出",exact:true}).click();
+  await expect(page.locator(".ih-lock h1")).toHaveText(longName);
+  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=document.documentElement.clientWidth)).toBe(true);
+  await page.screenshot({path:"test-results/ui-branding-mobile.png",fullPage:true});
 });
