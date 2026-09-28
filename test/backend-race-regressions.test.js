@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { UserRepository } = require('../repository');
+const { Storage } = require('../storage');
 
 function boot(prefix) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -82,4 +83,30 @@ test('concurrent notification callers acquire one durable delivery claim', async
   } finally {
     closeStorage();
   }
+});
+
+test('CAS version advances even when writes land in the same millisecond', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ih-cas-clock-'));
+  const storage = new Storage(dir, { key: Buffer.alloc(32, 9) });
+  try {
+    addUser(storage, 'clock'); const repo = new UserRepository(storage, 'clock');
+    const id = repo.insert('accounts', { username: 'clock@example.test', provider: 'google' }, { provider: 'google', address: 'clock@example.test' });
+    const first = repo.get('accounts', id); repo.update('accounts', id, first.payload, { provider: 'google', address: first.payload.username });
+    const second = repo.get('accounts', id); assert.ok(Date.parse(second.updated_at) > Date.parse(first.updated_at));
+  } finally { storage.close(); }
+});
+
+test('actual merge path scopes provider ids by account and honors a scoped deletion replay', () => {
+  const { mergeFetchedMails, closeStorage } = boot('ih-source-boundary-');
+  try {
+    const a = { id: 'account-a', username: 'a@example.test', provider: 'google' };
+    const b = { id: 'account-b', username: 'b@example.test', provider: 'google' };
+    const state = { mails: [], clearedMailIds: [] };
+    const first = mergeFetchedMails(a, state, [{ id: 'provider-1', provider: 'google', account: a.username, sender: 's@example.test', subject: 'code', receivedAt: '2026-01-01T00:00:00.000Z' }], false);
+    assert.equal(first.length, 1);
+    assert.equal(mergeFetchedMails(a, state, [{ id: 'provider-1', provider: 'google', account: a.username, sender: 's@example.test', subject: 'code', receivedAt: '2026-01-01T00:00:00.000Z' }], false).length, 0);
+    state.mails = []; state.clearedMailIds = [first[0].sourceKey];
+    assert.equal(mergeFetchedMails(a, state, [{ id: 'provider-1', provider: 'google', account: a.username, sender: 's@example.test', subject: 'code', receivedAt: '2026-01-01T00:00:00.000Z' }], false).length, 0);
+    assert.equal(mergeFetchedMails(b, state, [{ id: 'provider-1', provider: 'google', account: b.username, sender: 's@example.test', subject: 'code', receivedAt: '2026-01-01T00:00:00.000Z' }], false).length, 1);
+  } finally { closeStorage(); }
 });

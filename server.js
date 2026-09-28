@@ -164,6 +164,7 @@ const globalPushedFingerprints = new Set();
 const googleOAuthTransactions = new Map();
 const microsoftOAuthTransactions = new Map();
 const accountSyncFlights = new Map();
+const deliverySendFlights = new Map();
 
 function pruneOAuthTransactions(now = Date.now()) {
   for (const [key, transaction] of googleOAuthTransactions) {
@@ -209,7 +210,7 @@ function claimTenantDelivery(userId, channelId, messageId, now, claimTtlMs = 120
     let meta = row ? parseDeliveryStatus(row.status) : { state: 'pending', attempts: 0 };
     const retryAt = Number(meta.nextRetryAt || 0);
     const leaseUntil = Number(meta.claimedAt || 0) + claimTtlMs;
-    if (meta.state === 'delivered' || (meta.state === 'failed' && (Number(meta.attempts || 0) >= 3 || retryAt > now)) || (meta.state === 'sending' && leaseUntil > now)) {
+    if (meta.state === 'delivered' || (meta.state === 'failed' && (Number(meta.attempts || 0) >= 3 || retryAt > now)) || (meta.state === 'sending' && (Number(meta.attempts || 0) >= 3 || leaseUntil > now))) {
       storage.db.exec('COMMIT'); return null;
     }
     meta = { ...meta, state: 'sending', attempts: Number(meta.attempts || 0) + 1, nextRetryAt: null, claimedAt: now, claimId: crypto.randomUUID() };
@@ -243,18 +244,25 @@ async function pushTenantNotifications(events, deps = {}) {
     if (!user?.enabled) continue;
     const tenant = loadTenantState(storage, userId);
     for (const channel of tenant.channels.filter((c) => c.enabled && (!mail.__retryChannelId || c.id === mail.__retryChannelId))) {
+      const flightKey = `${userId}:${channel.id}:${mail.id}`;
+      if (deliverySendFlights.has(flightKey)) continue;
       const delivery = claimTenantDelivery(userId, channel.id, mail.id, now, claimTtlMs);
       if (!delivery) continue;
-      let ok = false;
-      try {
-        const share = getOrCreateShare(userId, mail.id, Number(storage.db.prepare('SELECT value FROM instance_settings WHERE key=?').get(`user:${userId}:shareLinkDays`)?.value) || 30);
-        validateChannelPolicy(channel, user.role);
-        await sendFn(channel, messageFn({ ...mail, appUrl: `${PUBLIC_BASE_URL}/shared/mail/${share.token}` }), user.role);
-        ok = true;
-      } catch (e) {
-        authService.audit(userId, 'notification.delivery.failed', 'notification_channel', channel.id, { type: channel.type });
-      }
-      finishTenantDelivery(userId, delivery, ok, now);
+      const flight = (async () => {
+        let ok = false;
+        try {
+          const share = getOrCreateShare(userId, mail.id, Number(storage.db.prepare('SELECT value FROM instance_settings WHERE key=?').get(`user:${userId}:shareLinkDays`)?.value) || 30);
+          validateChannelPolicy(channel, user.role);
+          await sendFn(channel, messageFn({ ...mail, appUrl: `${PUBLIC_BASE_URL}/shared/mail/${share.token}` }), user.role);
+          ok = true;
+        } catch (e) {
+          authService.audit(userId, 'notification.delivery.failed', 'notification_channel', channel.id, { type: channel.type });
+        } finally {
+          finishTenantDelivery(userId, delivery, ok, now);
+        }
+      })().finally(() => { if (deliverySendFlights.get(flightKey) === flight) deliverySendFlights.delete(flightKey); });
+      deliverySendFlights.set(flightKey, flight);
+      await flight;
     }
   }
 }
@@ -264,7 +272,7 @@ async function retryTenantNotifications(deps = {}) {
   const events = [];
   for (const row of rows) {
     const meta = parseDeliveryStatus(row.status);
-    const sendingExpired = meta.state === 'sending' && Number(meta.claimedAt || 0) + (deps.claimTtlMs || 120000) <= now;
+    const sendingExpired = meta.state === 'sending' && Number(meta.attempts || 0) < 3 && Number(meta.claimedAt || 0) + (deps.claimTtlMs || 120000) <= now;
     if ((meta.state === 'failed' && Number(meta.attempts || 0) < 3 && Number(meta.nextRetryAt || 0) <= now) || sendingExpired) events.push({ userId: row.user_id, mail: { ...storage.decrypt(row.payload), id: row.message_id, __retryChannelId: row.channel_id } });
   }
   await pushTenantNotifications(events, { ...deps, now });
@@ -938,7 +946,7 @@ async function fetchMicrosoftMails(acc, accessToken) {
   }
 }
 
-async function fetchGoogleMails(acc, accessToken) {
+async function fetchGoogleMails(acc, accessToken, persistBootstrap) {
   if (acc.isMock) {
     const mockCode = Math.floor(100000 + Math.random() * 900000).toString();
     const mockLink = `https://accounts.google.com/verify?token=${mockCode}&user=${acc.username}`;
@@ -979,9 +987,11 @@ async function fetchGoogleMails(acc, accessToken) {
             cursor: acc.syncCursor,
             fetchImpl: smartProxyFetch,
           });
-      if (!pendingBootstrap) stageGmailBootstrap(acc, incremental);
-      // The caller persists the account relation after the entire sync succeeds.
-      // Saving gData here would lose a tenant's pending bootstrap baseline.
+      if (!pendingBootstrap && stageGmailBootstrap(acc, incremental)) {
+        // Commit this checkpoint before detail requests. A transient detail failure
+        // can then replay the exact batch rather than advancing the baseline.
+        if (typeof persistBootstrap === 'function') await persistBootstrap(acc);
+      }
       for (const msg of incremental.messageIds.map((id) => ({ id }))) {
         const detailResp = await smartProxyFetch(
             `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`,
@@ -1200,7 +1210,7 @@ app.post("/api/auth/microsoft/device-code", async (req, res) => {
     if (resp.ok && data.user_code && data.device_code) {
       microsoftOAuthTransactions.set(data.device_code, {
         userId: req.user.id, sessionHash: crypto.createHash('sha256').update(readSessionToken(req)).digest('hex'),
-        accountId: requested.id, accountUpdatedAt: requested.storageUpdatedAt,
+        accountId: requested.id, oauthGeneration: Number(requested.oauthGeneration || 0),
         clientId,
         expiresAt: Date.now() + Number(data.expires_in || 600) * 1000,
       });
@@ -1244,7 +1254,7 @@ app.post("/api/auth/microsoft/poll-device-token", async (req, res) => {
   const tenant = loadTenantState(storage, req.user.id); const targetAcc = tenant.accounts.find(
     (account) => account.id === transaction.accountId,
   );
-  if (!targetAcc || targetAcc.provider !== "microsoft" || targetAcc.storageUpdatedAt !== transaction.accountUpdatedAt) {
+  if (!targetAcc || targetAcc.provider !== "microsoft") {
     microsoftOAuthTransactions.delete(deviceCode);
     return res.status(409).json({
       success: false,
@@ -1305,33 +1315,33 @@ app.post("/api/auth/microsoft/poll-device-token", async (req, res) => {
         } catch (e) {}
       }
 
-      const identity = validateOAuthIdentity(
-        tenant.accounts,
-        targetAcc,
-        userEmail,
-      );
+      const latestTenant = loadTenantState(storage, transaction.userId);
+      const latestAcc = latestTenant.accounts.find((account) => account.id === transaction.accountId);
+      if (!latestAcc || latestAcc.provider !== "microsoft" || Number(latestAcc.oauthGeneration || 0) !== Number(transaction.oauthGeneration || 0)) {
+        microsoftOAuthTransactions.delete(deviceCode);
+        return res.status(409).json({ success: false, status: "failed", error: "账户授权配置已变更，请重新发起授权。" });
+      }
+      const identity = validateOAuthIdentity(latestTenant.accounts, latestAcc, userEmail);
       if (!identity.ok) {
         microsoftOAuthTransactions.delete(deviceCode);
-        return res
-          .status(409)
-          .json({ success: false, status: "failed", error: identity.reason });
+        return res.status(409).json({ success: false, status: "failed", error: identity.reason });
       }
-
       const refreshToken = tokenData.refresh_token || "";
-
-      targetAcc.username = identity.identity;
-      targetAcc.status = "active";
-      targetAcc.note = refreshToken;
-      targetAcc.providerScopes =
-        tokenData.scope || targetAcc.providerScopes || "";
-      targetAcc.lastChecked = new Date().toISOString();
-
+      latestAcc.username = identity.identity;
+      latestAcc.status = "active";
+      latestAcc.note = refreshToken;
+      latestAcc.providerScopes = tokenData.scope || latestAcc.providerScopes || "";
+      latestAcc.lastChecked = new Date().toISOString();
+      const expected = latestAcc.storageUpdatedAt; delete latestAcc.storageUpdatedAt; delete latestAcc.storageCreatedAt;
+      if (!latestTenant.repo.updateIfUnchanged('accounts', latestAcc.id, latestAcc, { provider: latestAcc.provider, address: latestAcc.username }, expected)) {
+        microsoftOAuthTransactions.delete(deviceCode);
+        return res.status(409).json({ success: false, status: "failed", error: "账户在授权完成时已变更，请重新授权。" });
+      }
       microsoftOAuthTransactions.delete(deviceCode);
-      tenant.repo.update('accounts', targetAcc.id, targetAcc, { provider: targetAcc.provider, address: targetAcc.username });
       res.json({
         success: true,
         status: "completed",
-        account: publicAccount(targetAcc),
+        account: publicAccount(latestAcc),
       });
     } else {
       if (tokenData.error === "authorization_pending") {
@@ -1378,7 +1388,7 @@ app.get("/api/auth/google/url", (req, res) => {
   const redirectUri = `${PUBLIC_BASE_URL}/auth/google/callback`;
   googleOAuthTransactions.set(state, {
     userId: req.user.id, sessionHash: crypto.createHash('sha256').update(readSessionToken(req)).digest('hex'),
-    accountId, accountUpdatedAt: account.storageUpdatedAt,
+    accountId, oauthGeneration: Number(account.oauthGeneration || 0),
     verifier,
     clientId: GOOGLE_CLIENT_ID,
     clientSecret: GOOGLE_CLIENT_SECRET,
@@ -1454,7 +1464,7 @@ app.get("/auth/google/callback", async (req, res) => {
       const tenant = loadTenantState(storage, transaction.userId); const targetAcc = tenant.accounts.find(
         (a) => a.id === transaction.accountId,
       );
-      if (!targetAcc || targetAcc.provider !== "google" || targetAcc.storageUpdatedAt !== transaction.accountUpdatedAt) {
+      if (!targetAcc || targetAcc.provider !== "google") {
         return res
           .status(409)
           .send(
@@ -1462,24 +1472,25 @@ app.get("/auth/google/callback", async (req, res) => {
           );
       }
 
-      const identity = validateOAuthIdentity(
-        tenant.accounts,
-        targetAcc,
-        userEmail,
-      );
+      const latestTenant = loadTenantState(storage, transaction.userId);
+      const latestAcc = latestTenant.accounts.find((account) => account.id === transaction.accountId);
+      if (!latestAcc || latestAcc.provider !== "google" || Number(latestAcc.oauthGeneration || 0) !== Number(transaction.oauthGeneration || 0)) {
+        return res.status(409).send("账户授权配置已变更，请重新发起授权。");
+      }
+      const identity = validateOAuthIdentity(latestTenant.accounts, latestAcc, userEmail);
       if (!identity.ok)
         return res.status(409).send(escapeHtml(identity.reason));
 
-      const refreshToken =
-        tokenData.refresh_token || parseCredentials(targetAcc).refreshToken;
-      targetAcc.username = identity.identity;
-      targetAcc.status = "active";
-      targetAcc.note = refreshToken;
-      targetAcc.providerScopes =
-        tokenData.scope || targetAcc.providerScopes || "";
-      targetAcc.lastChecked = new Date().toISOString();
-
-      tenant.repo.update('accounts', targetAcc.id, targetAcc, { provider: targetAcc.provider, address: targetAcc.username });
+      const refreshToken = tokenData.refresh_token || parseCredentials(latestAcc).refreshToken;
+      latestAcc.username = identity.identity;
+      latestAcc.status = "active";
+      latestAcc.note = refreshToken;
+      latestAcc.providerScopes = tokenData.scope || latestAcc.providerScopes || "";
+      latestAcc.lastChecked = new Date().toISOString();
+      const expected = latestAcc.storageUpdatedAt; delete latestAcc.storageUpdatedAt; delete latestAcc.storageCreatedAt;
+      if (!latestTenant.repo.updateIfUnchanged('accounts', latestAcc.id, latestAcc, { provider: latestAcc.provider, address: latestAcc.username }, expected)) {
+        return res.status(409).send("账户在授权完成时已变更，请重新授权。");
+      }
 
       res.send(`
         <div style="font-family: sans-serif; text-align: center; padding: 50px; background: #0f172a; color: #10b981;">
@@ -1566,10 +1577,14 @@ app.put("/api/accounts/:id/permissions", (req, res) => {
   const tenant = loadTenantState(storage, req.user.id); const account = tenant.accounts.find((a) => a.id === req.params.id);
   if (!account)
     return res.status(404).json({ success: false, message: "账号不存在" });
+  const oauthPermissionChanged =
+    (typeof req.body.readEnabled === "boolean" && req.body.readEnabled !== account.readEnabled) ||
+    (typeof req.body.sendEnabled === "boolean" && req.body.sendEnabled !== account.sendEnabled);
   if (typeof req.body.readEnabled === "boolean")
     account.readEnabled = req.body.readEnabled;
   if (typeof req.body.sendEnabled === "boolean")
     account.sendEnabled = req.body.sendEnabled;
+  if (oauthPermissionChanged) account.oauthGeneration = Number(account.oauthGeneration || 0) + 1;
   if (typeof req.body.syncEnabled === "boolean")
     account.syncEnabled = req.body.syncEnabled;
   if (req.body.pollIntervalSeconds !== undefined) {
@@ -1591,6 +1606,7 @@ app.post("/api/accounts/:id/revoke", (req, res) => {
   if (!account)
     return res.status(404).json({ success: false, message: "账号不存在" });
   clearOAuthSecrets(account);
+  account.oauthGeneration = Number(account.oauthGeneration || 0) + 1;
   account.status = "pending";
   account.syncStatus = "pending";
   account.lastSyncError = "授权已由用户撤销";
@@ -1839,6 +1855,7 @@ app.post("/api/accounts/add", (req, res) => {
   const account = {
     username,
     provider,
+    oauthGeneration: 0,
     status: "pending",
     readEnabled: true,
     sendEnabled: false,
@@ -1930,6 +1947,27 @@ app.post("/api/accounts/check-status", async (req, res) => {
   });
 });
 
+function mergeFetchedMails(acc, dataStore, fetched, bootstrap) {
+  const newMails = [];
+  const existingSourceKeys = new Set(dataStore.mails.map((mail) => mail.sourceKey || mailSourceIdentity(mail, mail.accountId).sourceKey));
+  const existingFps = new Set(dataStore.mails.map((mail) => getMailFingerprint(mail)));
+  const clearedSet = new Set(dataStore.clearedMailIds || []);
+  for (const mail of [...fetched].sort((a, b) => new Date(b.receivedAt) - new Date(a.receivedAt))) {
+    const identity = mailSourceIdentity(mail, acc.id);
+    mail.sourceId = identity.sourceId; mail.providerMessageId = identity.sourceId; mail.sourceKey = identity.sourceKey;
+    const fingerprint = getMailFingerprint(mail);
+    // Raw source ids remain read-only compatibility for old tombstones. New writes
+    // use sourceKey, which includes the local account id and cannot cross-suppress.
+    if (existingSourceKeys.has(identity.sourceKey) || existingFps.has(fingerprint) || clearedSet.has(identity.sourceId) || clearedSet.has(identity.sourceKey) || clearedSet.has(fingerprint)) continue;
+    dataStore.mails.unshift(mail);
+    if (!bootstrap) newMails.push(mail);
+    existingSourceKeys.add(identity.sourceKey);
+    existingFps.add(fingerprint);
+  }
+  dataStore.mails = sortMailsNewestFirst(dataStore.mails).slice(0, 200);
+  return newMails;
+}
+
 // Single-account incremental fetcher core; accountSyncFlights supplies the single-flight lock.
 async function processSingleAccountFetchCore(acc, dataStore) {
   if (acc.readEnabled === false || acc.syncEnabled === false) return [];
@@ -1956,30 +1994,11 @@ async function processSingleAccountFetchCore(acc, dataStore) {
     try {
     const fetchResult =
       acc.provider === "google"
-        ? await fetchGoogleMails(acc, verify.accessToken)
+        ? await fetchGoogleMails(acc, verify.accessToken, dataStore.persistAccount)
         : await fetchMicrosoftMails(acc, verify.accessToken);
     const fetched = fetchResult.mails;
 
-    fetched.sort((a, b) => new Date(b.receivedAt) - new Date(a.receivedAt));
-    const existingSourceKeys = new Set(dataStore.mails.map((mail) => mail.sourceKey || mailSourceIdentity(mail, mail.accountId).sourceKey));
-    const existingFps = new Set(dataStore.mails.map((mail) => getMailFingerprint(mail)));
-    const clearedSet = new Set(dataStore.clearedMailIds || []);
-
-    for (const m of fetched) {
-      const identity = mailSourceIdentity(m, acc.id);
-      m.sourceId = identity.sourceId; m.providerMessageId = identity.sourceId; m.sourceKey = identity.sourceKey;
-      const fp = getMailFingerprint(m);
-      if (!existingSourceKeys.has(identity.sourceKey) && !existingFps.has(fp) && !clearedSet.has(identity.sourceId) && !clearedSet.has(identity.sourceKey) && !clearedSet.has(fp)) {
-        dataStore.mails.unshift(m);
-        if (!fetchResult.bootstrap) newMails.push(m);
-        existingSourceKeys.add(identity.sourceKey);
-        existingFps.add(fp);
-      }
-    }
-    dataStore.mails = sortMailsNewestFirst(dataStore.mails);
-    if (dataStore.mails.length > 200) {
-      dataStore.mails = dataStore.mails.slice(0, 200);
-    }
+    newMails.push(...mergeFetchedMails(acc, dataStore, fetched, fetchResult.bootstrap));
       acc.mailCount = (acc.mailCount || 0) + newMails.length;
       acc.syncStatus = "idle";
       acc.syncFailures = 0;
@@ -2028,7 +2047,14 @@ function syncAndPersistAccount(userId, accountId) {
     const account = tenant.accounts.find((item) => item.id === accountId);
     if (!account) throw new Error('账号不存在或不属于当前用户');
     const before = new Set(tenant.mails.map((mail) => mail.sourceKey || mailSourceIdentity(mail, mail.accountId).sourceKey));
-    const notifiableMails = await syncCoreForTest(account, { userId, mails: tenant.mails, clearedMailIds: tenant.tombstones });
+    const persistAccount = (checkpoint) => {
+      const expected = checkpoint.storageUpdatedAt;
+      if (!tenant.repo.updateIfUnchanged('accounts', checkpoint.id, checkpoint, { provider: checkpoint.provider, address: checkpoint.username }, expected)) throw new Error('账户在同步期间已变更');
+      const committed = tenant.repo.get('accounts', checkpoint.id);
+      checkpoint.storageUpdatedAt = committed.updated_at;
+      checkpoint.storageCreatedAt = committed.created_at;
+    };
+    const notifiableMails = await syncCoreForTest(account, { userId, mails: tenant.mails, clearedMailIds: tenant.tombstones, persistAccount });
     const current = tenant.repo.get('accounts', accountId);
     if (!current || current.updated_at !== account.storageUpdatedAt) return { persistedNewMails: [], notifiableMails: [], account: current ? { ...current.payload, id: current.id } : null, stale: true };
     const persistedNewMails = tenant.mails.filter((mail) => !before.has(mail.sourceKey || mailSourceIdentity(mail, account.id).sourceKey));
@@ -2351,7 +2377,6 @@ app.delete("/api/mails/:id", (req, res) => {
   storage.db.prepare('UPDATE share_links SET revoked_at=? WHERE user_id=? AND mail_id=? AND revoked_at IS NULL').run(new Date().toISOString(), req.user.id, id);
   tenant.repo.insert('tombstones', {}, { mail_id: id });
   const source = mailSourceIdentity(removed, removed.accountId);
-  if (source.sourceId) tenant.repo.insert('tombstones', {}, { mail_id: source.sourceId });
   if (source.sourceKey) tenant.repo.insert('tombstones', {}, { mail_id: source.sourceKey });
   const fingerprint = getMailFingerprint(removed);
   if (fingerprint) tenant.repo.insert('tombstones', {}, { mail_id: fingerprint });
@@ -2371,7 +2396,6 @@ app.post("/api/mails/clear", (req, res) => {
   for (let m of tenant.mails) {
     if (m.id) tenant.repo.insert('tombstones', {}, { mail_id: m.id });
     const source = mailSourceIdentity(m, m.accountId);
-    if (source.sourceId) tenant.repo.insert('tombstones', {}, { mail_id: source.sourceId });
     if (source.sourceKey) tenant.repo.insert('tombstones', {}, { mail_id: source.sourceKey });
     const fp = getMailFingerprint(m);
     if (fp) tenant.repo.insert('tombstones', {}, { mail_id: fp });
@@ -2440,4 +2464,4 @@ function shutdown(server, done = () => {}) {
   server.close(() => { clearTimeout(timer); finish(); });
 }
 if(require.main===module)startServer();
-module.exports={app,startServer,shutdown,syncAndPersistAccount,pushTenantNotifications,retryTenantNotifications,getOrCreateShare,setSyncCoreForTest:(fn)=>{syncCoreForTest=fn||processSingleAccountFetchCore;},__storage:storage,__auth:authService,__instanceLock:()=>instanceLock,closeStorage:()=>{clearInterval(backgroundPollTimer);storage.close();instanceLock?.release();}};
+module.exports={app,startServer,shutdown,syncAndPersistAccount,pushTenantNotifications,retryTenantNotifications,getOrCreateShare,mergeFetchedMails,setSyncCoreForTest:(fn)=>{syncCoreForTest=fn||processSingleAccountFetchCore;},__storage:storage,__auth:authService,__instanceLock:()=>instanceLock,closeStorage:()=>{clearInterval(backgroundPollTimer);storage.close();instanceLock?.release();}};

@@ -79,9 +79,15 @@ class Storage {
     if (!this.db.prepare('SELECT 1 FROM schema_migrations WHERE version=7').get()) { this.db.exec('BEGIN IMMEDIATE'); try { this.db.exec('ALTER TABLE share_links ADD COLUMN token_ciphertext TEXT'); this.db.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?,?)').run(7,new Date().toISOString()); this.db.exec('COMMIT'); } catch(error){this.db.exec('ROLLBACK');throw error;} }
     if (!this.db.prepare('SELECT 1 FROM schema_migrations WHERE version=8').get()) { this.db.exec('BEGIN IMMEDIATE'); try { this.db.exec('CREATE TABLE recovery_codes (id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,code_hash TEXT UNIQUE NOT NULL,created_at TEXT NOT NULL,used_at TEXT); CREATE INDEX idx_recovery_codes_user ON recovery_codes(user_id);'); this.db.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?,?)').run(8,new Date().toISOString()); this.db.exec('COMMIT'); } catch(error){this.db.exec('ROLLBACK');throw error;} }
     if (!this.db.prepare('SELECT 1 FROM schema_migrations WHERE version=9').get()) { this.db.exec('BEGIN IMMEDIATE'); try {
-      // A delivery is the durable claim for one user/channel/message. Collapse any
-      // historical duplicates before making the natural key unique.
-      this.db.exec(`DELETE FROM notification_deliveries WHERE channel_id IS NOT NULL AND message_id IS NOT NULL AND rowid NOT IN (SELECT MAX(rowid) FROM notification_deliveries WHERE channel_id IS NOT NULL AND message_id IS NOT NULL GROUP BY user_id,channel_id,message_id);
+      // Retain a delivered row when collapsing historical duplicate deliveries.
+      this.db.exec(`DELETE FROM notification_deliveries WHERE channel_id IS NOT NULL AND message_id IS NOT NULL AND rowid NOT IN (
+          SELECT rowid FROM (
+            SELECT rowid, ROW_NUMBER() OVER (
+              PARTITION BY user_id,channel_id,message_id
+              ORDER BY CASE WHEN status LIKE '%"state":"delivered"%' THEN 0 ELSE 1 END, rowid DESC
+            ) AS rank FROM notification_deliveries WHERE channel_id IS NOT NULL AND message_id IS NOT NULL
+          ) WHERE rank=1
+        );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_deliveries_once ON notification_deliveries(user_id,channel_id,message_id);`);
       this.db.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?,?)').run(9,new Date().toISOString()); this.db.exec('COMMIT');
     } catch(error){this.db.exec('ROLLBACK');throw error;} }

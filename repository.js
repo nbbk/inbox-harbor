@@ -44,7 +44,13 @@ class UserRepository {
     const persistedPayload = { ...payload }; delete persistedPayload.storageUpdatedAt; delete persistedPayload.storageCreatedAt;
     const sets = encryptedKinds.includes(kind) ? ['payload=?'] : [], params = encryptedKinds.includes(kind) ? [this.storage.encrypt(persistedPayload)] : [];
     for (const field of fields) if (Object.hasOwn(values, field)) { sets.push(`${field}=?`); params.push(values[field]); }
-    if (['accounts', 'channels', 'rules'].includes(kind)) { sets.push('updated_at=?'); params.push(new Date().toISOString()); }
+    // Date.now() alone can repeat within a millisecond. Move forward from the
+    // stored version so every account mutation has a distinct CAS token.
+    if (['accounts', 'channels', 'rules'].includes(kind)) {
+      const prior = Date.parse(current.updated_at || '');
+      const updatedAt = new Date(Math.max(Date.now(), Number.isFinite(prior) ? prior + 1 : 0)).toISOString();
+      sets.push('updated_at=?'); params.push(updatedAt);
+    }
     if (!sets.length) return false;
     params.push(id, this.userId);
     let where = 'id=? AND user_id=?';
