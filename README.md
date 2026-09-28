@@ -165,6 +165,10 @@ Docker 环境无需在宿主机安装 Node.js。直接运行模式才需要 Node
 
 每个渠道都提供独立“测试”按钮。请先填参数并测试，再启用并保存。
 
+## 站点 Logo
+
+Owner 可在“管理后台 → 站点 Logo”上传 PNG、JPEG 或 WebP 图片（最大 128 KB），保存后统一显示在登录页和侧边栏；“恢复默认 Logo”切回 IH 标志。管理员和普通成员不能修改全局 Logo。
+
 ## 开发验证
 
 ```bash
@@ -172,7 +176,7 @@ npm test
 npm run test:ui
 ```
 
-UI 测试覆盖 1440px 桌面和 390px 手机布局，需要先以 `INBOXHARBOR_ADMIN_TOKEN=qa-local-token` 启动服务。
+UI 测试覆盖桌面与 390px 手机布局，由 Playwright 自动启动隔离的测试服务与临时数据目录。运行全部浏览器测试可执行 `npx playwright test`（首次需 `npx playwright install chromium`）。GitHub Actions 自动执行后端和浏览器测试，截图与报告保存在每次运行的 `ui-evidence` 附件中，无需在个人电脑检出项目。
 
 ---
 

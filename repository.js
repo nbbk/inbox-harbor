@@ -31,15 +31,31 @@ class UserRepository {
   }
   list(kind) { const { table } = this.schema(kind); return this.db.prepare(`SELECT * FROM ${table} WHERE user_id=? ORDER BY created_at DESC`).all(this.userId).map((row) => this.decode(kind, row)); }
   get(kind, id) { const { table } = this.schema(kind); return this.decode(kind, this.db.prepare(`SELECT * FROM ${table} WHERE id=? AND user_id=?`).get(id, this.userId)); }
-  update(kind, id, payload, values = {}) {
+  update(kind, id, payload, values = {}) { return this.write(kind, id, payload, values); }
+  // Async provider work must never overwrite a later revoke, permission edit, or
+  // account deletion. updated_at is the optimistic concurrency token for payload rows.
+  updateIfUnchanged(kind, id, payload, values = {}, expectedUpdatedAt) {
+    return this.write(kind, id, payload, values, expectedUpdatedAt);
+  }
+  write(kind, id, payload, values = {}, expectedUpdatedAt) {
     const { table, fields } = this.schema(kind); const current = this.get(kind, id); if (!current) return false;
     this.validateRelations(kind, values);
     const encryptedKinds = ['accounts', 'messages', 'channels', 'rules', 'shares'];
-    const sets = encryptedKinds.includes(kind) ? ['payload=?'] : [], params = encryptedKinds.includes(kind) ? [this.storage.encrypt(payload)] : [];
+    const persistedPayload = { ...payload }; delete persistedPayload.storageUpdatedAt; delete persistedPayload.storageCreatedAt;
+    const sets = encryptedKinds.includes(kind) ? ['payload=?'] : [], params = encryptedKinds.includes(kind) ? [this.storage.encrypt(persistedPayload)] : [];
     for (const field of fields) if (Object.hasOwn(values, field)) { sets.push(`${field}=?`); params.push(values[field]); }
-    if (['accounts', 'channels', 'rules'].includes(kind)) { sets.push('updated_at=?'); params.push(new Date().toISOString()); }
+    // Date.now() alone can repeat within a millisecond. Move forward from the
+    // stored version so every account mutation has a distinct CAS token.
+    if (['accounts', 'channels', 'rules'].includes(kind)) {
+      const prior = Date.parse(current.updated_at || '');
+      const updatedAt = new Date(Math.max(Date.now(), Number.isFinite(prior) ? prior + 1 : 0)).toISOString();
+      sets.push('updated_at=?'); params.push(updatedAt);
+    }
     if (!sets.length) return false;
-    params.push(id, this.userId); return this.db.prepare(`UPDATE ${table} SET ${sets.join(',')} WHERE id=? AND user_id=?`).run(...params).changes === 1;
+    params.push(id, this.userId);
+    let where = 'id=? AND user_id=?';
+    if (expectedUpdatedAt !== undefined) { where += ' AND updated_at=?'; params.push(expectedUpdatedAt); }
+    return this.db.prepare(`UPDATE ${table} SET ${sets.join(',')} WHERE ${where}`).run(...params).changes === 1;
   }
   delete(kind, id) {
     const { table } = this.schema(kind);

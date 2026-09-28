@@ -69,3 +69,43 @@ body.dark-theme,
   .ih-guide-close { display: block; float: right; border: 0; background: transparent; color: #526c7b; padding: 4px; }
   .ih-mobile { padding-bottom: calc(7px + env(safe-area-inset-bottom)); }
 }
+
+/* Authentication actions retain a clear primary action at every viewport. */
+.ih-lock { padding: 24px 0; }
+.ih-lock > div { text-align: center; }
+.ih-lock > div > .ih-mark { margin-inline: auto; width: 48px; height: 48px; }
+.ih-mark { flex-shrink: 0; overflow: hidden; }
+.ih-mark img { display: block; width: 100%; height: 100%; object-fit: contain; background: #fff; }
+.ih-auth-form { display: grid; gap: 14px; margin-top: 24px; }
+.ih-lock .ih-auth-form input { margin: 0; min-height: 44px; min-width: 0; }
+.ih-auth-primary { width: 100%; min-height: 44px; margin-top: 4px; }
+.ih-auth-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+.ih-auth-actions .ih-button { flex: 1 1 120px; min-height: 44px; }
+.ih-auth-form > .ih-button { min-height: 44px; }
+.ih-logo-preview { margin: 18px 0; }
+.ih-logo-preview > img, .ih-logo-preview .ih-mark { width: 64px; height: 64px; object-fit: contain; border-radius: 12px; }
+.ih-branding-settings input[type=file] { max-width: 100%; }
+dialog.ih-recovery-notice {
+  position: fixed; inset: 0; margin: auto; width: min(580px, calc(100% - 32px));
+  max-height: calc(100dvh - 32px); overflow: auto; padding: 28px;
+  border: 1px solid #dbe6eb; border-radius: 16px; background: #fff; color: #10223b;
+  box-shadow: 0 24px 80px #10223b33;
+}
+dialog.ih-recovery-notice::backdrop { background: #0d223980; }
+.ih-recovery-notice h2 { font-size: 22px; margin: 0 0 12px; }
+.ih-recovery-codes {
+  padding: 16px; margin: 20px 0; border-radius: 8px; background: #f3f7f9;
+  font: 13px/1.9 ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere;
+  user-select: text;
+}
+.ih-recovery-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.ih-recovery-actions .ih-button { min-height: 44px; flex: 1 1 auto; }
+.ih-recovery-status { margin: 12px 0; font-size: 13px; line-height: 1.6; color: #567082; }
+body:has(dialog.ih-recovery-notice[open]) { overflow: hidden; }
+.ih-button:focus-visible { outline: 3px solid #64b5d1; outline-offset: 3px; }
+@media (max-width: 480px) {
+  .ih-lock > div { padding: 30px 24px; }
+  dialog.ih-recovery-notice { padding: 22px 18px; }
+  .ih-recovery-codes { padding: 12px; font-size: 12px; }
+  .ih-recovery-actions .ih-button:last-child { flex-basis: 100%; }
+}

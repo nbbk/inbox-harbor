@@ -5,8 +5,15 @@ const { UserRepository } = require('./repository');
 // used to authorize a tenant resource.
 function loadTenantState(storage, userId) {
   const repo = new UserRepository(storage, userId);
-  const accounts = repo.list('accounts').map((row) => ({ ...row.payload, id: row.id }));
-  const mails = repo.list('messages').map((row) => ({ ...row.payload, id: row.id, accountId: row.account_id || row.payload.accountId }));
+  const accounts = repo.list('accounts').map((row) => ({ ...row.payload, id: row.id, storageCreatedAt: row.created_at, storageUpdatedAt: row.updated_at }));
+  const mails = repo.list('messages').map((row) => {
+    // id is the local relational id used by the API. Preserve the provider's id
+    // separately so dedupe and tombstones survive a database UUID assignment.
+    const sourceId = String(row.payload.sourceId || row.payload.providerMessageId || row.payload.id || row.id);
+    const provider = row.payload.provider || '';
+    const accountId = row.account_id || row.payload.accountId || null;
+    return { ...row.payload, id: row.id, sourceId, providerMessageId: sourceId, sourceKey: row.payload.sourceKey || `${accountId || ''}:${provider}:${sourceId}`, accountId, storageCreatedAt: row.created_at, storageUpdatedAt: row.updated_at };
+  });
   const channels = repo.list('channels').map((row) => ({ ...row.payload, id: row.id, type: row.type }));
   const rules = repo.list('rules').map((row) => ({ ...row.payload, id: row.id }));
   const tombstones = repo.list('tombstones').map((row) => row.mail_id);

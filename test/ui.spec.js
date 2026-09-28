@@ -19,6 +19,8 @@ async function unlock(page) {
     await page.getByRole("button", { name: "登录" }).click();
   }
   await expect(page.getByRole("heading", { name: "邮件中心" })).toBeVisible();
+  const recoveryNotice = page.getByRole("dialog", { name: "请保存恢复码" });
+  if (await recoveryNotice.isVisible()) await recoveryNotice.getByRole("button", { name: "我已安全保存" }).click();
 }
 
 test("owner creates an invitation and a member has no management entry on mobile", async ({ page }) => {
@@ -37,6 +39,8 @@ test("owner creates an invitation and a member has no management entry on mobile
   await page.getByPlaceholder("至少 12 位密码").fill("invited safe password");
   await page.getByRole("button", { name: "继续" }).click();
   await expect(page.getByRole("heading", { name: "邮件中心" })).toBeVisible();
+  const recoveryNotice = page.getByRole("dialog", { name: "请保存恢复码" });
+  if (await recoveryNotice.isVisible()) await recoveryNotice.getByRole("button", { name: "我已安全保存" }).click();
   await expect(page.getByRole("button", { name: "管理后台" })).toHaveCount(0);
   expect(await page.evaluate(() => fetch('/api/auth/users').then(response => response.status))).toBe(403);
   await page.setViewportSize({ width: 390, height: 844 });
@@ -60,7 +64,7 @@ test("desktop notification settings render and expose channel guidance", async (
   await expect(page.locator("#ih-channel-guide")).toContainText("Device Key");
   await expect(page.getByLabel("查看链接有效期（天）")).toHaveValue("30");
   await page.screenshot({
-    path: "../qa/inboxharbor-desktop.png",
+    path: "test-results/qa/inboxharbor-desktop.png",
     fullPage: true,
   });
   expect(errors).toEqual([]);
@@ -83,7 +87,7 @@ test("mobile layout has bottom navigation and no horizontal overflow", async ({
   );
   expect(overflows).toBe(false);
   await page.screenshot({
-    path: "../qa/inboxharbor-mobile.png",
+    path: "test-results/qa/inboxharbor-mobile.png",
     fullPage: true,
   });
 });
@@ -152,7 +156,7 @@ test("account page exposes read and send permission switches", async ({
     page.locator(".ih-account-row:not(.ih-account-row-head)"),
   ).toHaveCount(12);
   await page.screenshot({
-    path: "../qa/inboxharbor-accounts-desktop.png",
+    path: "test-results/qa/inboxharbor-accounts-desktop.png",
     fullPage: true,
   });
   await page.getByRole("button", { name: "添加邮箱" }).click();
@@ -162,7 +166,7 @@ test("account page exposes read and send permission switches", async ({
     .getByLabel("邮箱地址")
     .fill("first@outlook.com\nsecond@company.example");
   await page.screenshot({
-    path: "../qa/inboxharbor-add-accounts.png",
+    path: "test-results/qa/inboxharbor-add-accounts.png",
     fullPage: true,
   });
   await page.getByRole("button", { name: "添加账户" }).click();
@@ -274,7 +278,7 @@ test("account authorization errors are visible and mobile account layout does no
     });
   expect(separated).toBe(true);
   await page.screenshot({
-    path: "../qa/inboxharbor-accounts-mobile.png",
+    path: "test-results/qa/inboxharbor-accounts-mobile.png",
     fullPage: true,
   });
 });
@@ -367,7 +371,7 @@ test("connector setup guides beginners, saves once, and supports multiple mailbo
     "可授权多个 Google 邮箱",
   );
   await page.screenshot({
-    path: "../qa/inboxharbor-connectors-desktop.png",
+    path: "test-results/qa/inboxharbor-connectors-desktop.png",
     fullPage: true,
   });
   await page.setViewportSize({ width: 390, height: 844 });
@@ -381,7 +385,7 @@ test("connector setup guides beginners, saves once, and supports multiple mailbo
   );
   expect(overflows).toBe(false);
   await page.screenshot({
-    path: "../qa/inboxharbor-connectors-mobile.png",
+    path: "test-results/qa/inboxharbor-connectors-mobile.png",
     fullPage: true,
   });
 });
@@ -493,6 +497,8 @@ test("mail center filters, reads verification codes, and sends composed mail", a
   await page.setViewportSize({ width: 1440, height: 960 });
   await unlock(page);
   await expect(page.getByRole("heading", { name: "邮件中心" })).toBeVisible();
+  const recoveryNotice = page.getByRole("dialog", { name: "请保存恢复码" });
+  if (await recoveryNotice.isVisible()) await recoveryNotice.getByRole("button", { name: "我已安全保存" }).click();
   await expect(page.locator(".ih-side")).toHaveCSS("position", "fixed");
   await page.getByRole("button", { name: "验证码 1" }).click();
   await expect(page.locator("#ih-mail-list")).toContainText("登录验证码");
@@ -514,7 +520,7 @@ test("mail center filters, reads verification codes, and sends composed mail", a
   await expect(page.locator(".ih-dialog-help")).toContainText("发信授权无效");
   await page.getByLabel("收件人").fill("friend@example.com");
   await page.screenshot({
-    path: "../qa/inboxharbor-compose-desktop.png",
+    path: "test-results/qa/inboxharbor-compose-desktop.png",
     fullPage: false,
   });
   await page.getByRole("button", { name: "发送邮件" }).click();
@@ -528,14 +534,14 @@ test("mail center filters, reads verification codes, and sends composed mail", a
   await expect(page.locator("#ih-mail-reader")).toContainText("发送至 friend@example.com");
   await expect(page.locator(".ih-mail-reader")).toHaveCSS("overflow-y", "auto");
   await page.screenshot({
-    path: "../qa/inboxharbor-mail-center-sent-desktop.png",
+    path: "test-results/qa/inboxharbor-mail-center-sent-desktop.png",
     fullPage: true,
   });
   await page.getByRole("button", { name: "删除邮件" }).click();
   await expect.poll(() => deleted.length).toBe(1);
   await expect(page.getByRole("button", { name: "已发送 0" })).toBeVisible();
   await page.screenshot({
-    path: "../qa/inboxharbor-mail-center-desktop.png",
+    path: "test-results/qa/inboxharbor-mail-center-desktop.png",
     fullPage: true,
   });
   await page.setViewportSize({ width: 390, height: 844 });
@@ -544,7 +550,7 @@ test("mail center filters, reads verification codes, and sends composed mail", a
   );
   expect(overflows).toBe(false);
   await page.screenshot({
-    path: "../qa/inboxharbor-mail-center-mobile.png",
+    path: "test-results/qa/inboxharbor-mail-center-mobile.png",
     fullPage: true,
   });
 });
@@ -565,7 +571,7 @@ test("deployment guide shows corrected update and manual startup commands respon
   );
   await expect(page.locator("#ih-guide")).toContainText("npm ci --omit=dev");
   await page.screenshot({
-    path: "../qa/inboxharbor-guide-desktop.png",
+    path: "test-results/qa/inboxharbor-guide-desktop.png",
     fullPage: true,
   });
   await page.setViewportSize({ width: 390, height: 844 });
@@ -577,7 +583,7 @@ test("deployment guide shows corrected update and manual startup commands respon
   );
   expect(overflows).toBe(false);
   await page.screenshot({
-    path: "../qa/inboxharbor-guide-mobile.png",
+    path: "test-results/qa/inboxharbor-guide-mobile.png",
     fullPage: true,
   });
 });

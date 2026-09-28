@@ -2,6 +2,7 @@
   const root = document.getElementById("harbor-ui");
   let currentUser = null;
   let pendingRecoveryCodes = null;
+  let branding = { logoDataUrl: "" };
   let authConfig = { ownerInitialized: true, allowPublicRegistration: false };
   const pendingInviteToken = new URLSearchParams(location.search).get("invite") || "";
   if (pendingInviteToken) history.replaceState({}, "", location.pathname);
@@ -45,48 +46,103 @@
   }
   function lock() {
     currentUser = null;
+    pendingRecoveryCodes = null;
+    root.querySelector(".ih-recovery-notice")?.remove();
     renderLock();
+  }
+  function brandMark() {
+    const mark = element("span", "ih-mark");
+    if (branding.logoDataUrl) {
+      const image = document.createElement("img");
+      image.src = branding.logoDataUrl;
+      image.alt = "InboxHarbor Logo";
+      mark.append(image);
+    } else mark.textContent = "IH";
+    return mark;
+  }
+  function refreshBrandMarks() {
+    root.querySelectorAll(".ih-mark:not(.ih-logo-preview .ih-mark)").forEach(mark => mark.replaceWith(brandMark()));
   }
   function renderLock() {
     root.innerHTML = "";
-    const box = document.createElement("div");
-    box.className = "ih-lock";
-    const card = document.createElement("div");
-    card.innerHTML = '<span class="ih-mark">IH</span><h1>InboxHarbor</h1><p>私有、克制的邮件工作台。</p>';
-    const form = document.createElement("form");
+    const box = element("div", "ih-lock");
+    const card = element("div");
+    card.append(brandMark(), element("h1", "", "InboxHarbor"), element("p", "", "私有、克制的邮件工作台。"));
+    const form = element("form", "ih-auth-form");
     const email = document.createElement("input");
-    email.type = "email";
-    email.placeholder = "邮箱地址";
-    email.required = true;
-    const input = document.createElement("input"); input.type = "password"; input.placeholder = "密码"; input.required = true;
-    const button = document.createElement("button");
-    button.className = "ih-button";
-    button.textContent = "登录";
+    email.type = "email"; email.placeholder = "邮箱地址"; email.required = true;
+    email.autocomplete = "username"; email.setAttribute("aria-label", "邮箱地址");
+    const input = document.createElement("input");
+    input.type = "password"; input.placeholder = "密码"; input.required = true;
+    input.autocomplete = "current-password"; input.setAttribute("aria-label", "密码");
+    const button = element("button", "ih-button ih-auth-primary", "登录");
+    button.type = "submit";
     form.append(email, input, button);
-    form.onsubmit = (e) => {
-      e.preventDefault();
-      request("/api/auth/login", {method:"POST",body:JSON.stringify({email:email.value,password:input.value})})
-        .then((result) => { currentUser=result.user; render(); })
-        .catch((err) => alert(err.message));
+    form.onsubmit = async (e) => {
+      e.preventDefault(); button.disabled = true;
+      try {
+        const result = await request("/api/auth/login", {method:"POST",body:JSON.stringify({email:email.value,password:input.value})});
+        currentUser = result.user; render();
+      } catch (error) { alert(error.message); button.disabled = false; }
     };
-    if (!authConfig.ownerInitialized) {
-      const bootstrap = element("button", "ih-button ih-button-quiet", "首次设置 Owner");
-      bootstrap.type="button"; bootstrap.onclick=()=>renderBootstrap(); form.append(bootstrap);
-    }
-    if (authConfig.allowPublicRegistration) { const register=element("button","ih-button ih-button-quiet","创建账号");register.type="button";register.onclick=()=>renderRegistration();form.append(register); }
-    const invite = pendingInviteToken;
-    if(invite){const accept=element("button","ih-button ih-button-quiet","接受邀请");accept.type="button";accept.onclick=()=>renderRegistration(invite);form.append(accept);}
-    card.append(form);
-    const forgot=element("button","ih-button ih-button-quiet","忘记密码");forgot.type="button";forgot.onclick=renderRecoveryReset;card.append(forgot);
-    box.append(card);
-    root.append(box);
+    const actions = element("div", "ih-auth-actions");
+    const action = (label, handler) => {
+      const control = element("button", "ih-button ih-button-quiet", label);
+      control.type = "button"; control.onclick = handler; actions.append(control);
+    };
+    if (!authConfig.ownerInitialized) action("首次设置 Owner", renderBootstrap);
+    if (authConfig.allowPublicRegistration) action("创建账号", () => renderRegistration());
+    if (pendingInviteToken) action("接受邀请", () => renderRegistration(pendingInviteToken));
+    action("忘记密码", renderRecoveryReset);
+    card.append(form, actions); box.append(card); root.append(box);
   }
   function displayRecoveryCodes(codes){pendingRecoveryCodes=Array.isArray(codes)?codes.filter(Boolean):[];}
-  function renderRecoveryNotice(){if(!pendingRecoveryCodes?.length)return;const box=element('section','ih-card ih-recovery-notice');box.setAttribute('role','status');box.append(element('h2','','请保存恢复码'),element('p','ih-section-copy','这些恢复码只显示这一次。请复制或下载到离线密码管理器。'),element('pre','ih-recovery-codes',pendingRecoveryCodes.join('\n')));const copy=element('button','ih-button ih-button-quiet','复制恢复码');copy.type='button';copy.onclick=async()=>{await navigator.clipboard?.writeText(pendingRecoveryCodes.join('\n'));copy.textContent='已复制';};const download=element('button','ih-button ih-button-quiet','下载恢复码');download.type='button';download.onclick=()=>{const link=document.createElement('a');link.href=URL.createObjectURL(new Blob([pendingRecoveryCodes.join('\n')+'\n'],{type:'text/plain'}));link.download='inboxharbor-recovery-codes.txt';link.click();URL.revokeObjectURL(link.href);};const close=element('button','ih-button','我已安全保存');close.type='button';close.onclick=()=>{pendingRecoveryCodes=null;box.remove();};box.append(copy,download,close);root.append(box);}
+  function renderRecoveryNotice() {
+    root.querySelector(".ih-recovery-notice")?.remove();
+    if (!pendingRecoveryCodes?.length) return;
+    const previousFocus = document.activeElement;
+    const box = element("dialog", "ih-recovery-notice");
+    box.setAttribute("aria-labelledby", "ih-recovery-title");
+    box.setAttribute("aria-describedby", "ih-recovery-description");
+    const title = element("h2", "", "请保存恢复码"); title.id = "ih-recovery-title";
+    const description = element("p", "ih-section-copy", "这些恢复码只显示这一次。请复制或下载到离线密码管理器。");
+    description.id = "ih-recovery-description";
+    const codes = element("pre", "ih-recovery-codes", pendingRecoveryCodes.join("\n"));
+    const status = element("p", "ih-recovery-status"); status.setAttribute("role", "status");
+    const actions = element("div", "ih-recovery-actions");
+    const copy = element("button", "ih-button ih-button-quiet", "复制恢复码");
+    copy.type = "button";
+    copy.onclick = async () => {
+      try {
+        if (!navigator.clipboard) throw new Error("clipboard unavailable");
+        await navigator.clipboard.writeText(pendingRecoveryCodes.join("\n"));
+        status.textContent = "已复制恢复码。";
+      } catch { status.textContent = "无法自动复制，请选择恢复码复制，或点击下载。"; }
+    };
+    const download = element("button", "ih-button ih-button-quiet", "下载恢复码");
+    download.type = "button";
+    download.onclick = () => {
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(new Blob([pendingRecoveryCodes.join("\n") + "\n"], {type:"text/plain"}));
+      link.download = "inboxharbor-recovery-codes.txt";
+      link.click(); setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+    };
+    const close = element("button", "ih-button", "我已安全保存");
+    close.type = "button";
+    close.onclick = () => {
+      pendingRecoveryCodes = null; box.close(); box.remove();
+      if (previousFocus?.isConnected && previousFocus !== document.body) previousFocus.focus();
+      else root.querySelector(".ih-head button")?.focus();
+    };
+    box.addEventListener("cancel", event => { event.preventDefault(); status.textContent = "保存恢复码后，请点击“我已安全保存”。"; });
+    actions.append(copy, download, close);
+    box.append(title, description, codes, status, actions);
+    root.append(box); box.showModal(); copy.focus();
+  }
   function renderBootstrap(){renderAuthForm("初始化收件港","用启动终端显示的本机管理口令，创建唯一 Owner。",async values=>{const created=await request("/api/auth/bootstrap",{method:"POST",headers:{Authorization:`Bearer ${values.recovery}`},body:JSON.stringify({email:values.email,password:values.password})});displayRecoveryCodes(created.user.recoveryCodes);const result=await request("/api/auth/login",{method:"POST",body:JSON.stringify({email:values.email,password:values.password})});currentUser=result.user;authConfig.ownerInitialized=true;render();},true);}
   function renderRecoveryReset(){renderAuthForm("恢复访问","输入邮箱、一次性恢复码和新密码。使用后会退出所有设备。",async values=>{await request('/api/auth/recovery/reset',{method:'POST',body:JSON.stringify({email:values.email,code:values.recovery,newPassword:values.password})});alert('密码已重置，请登录');renderLock();},true);}
   function renderRegistration(inviteToken=""){renderAuthForm(inviteToken?"接受邀请":"创建账号",inviteToken?"设置你的登录邮箱和密码。":"公开注册已由管理员开启。",async values=>{const endpoint=inviteToken?"/api/auth/invitations/accept":"/api/auth/register";const created=await request(endpoint,{method:"POST",body:JSON.stringify(inviteToken?{token:inviteToken,email:values.email,password:values.password}:{email:values.email,password:values.password})});displayRecoveryCodes(created.user.recoveryCodes);const result=await request("/api/auth/login",{method:"POST",body:JSON.stringify({email:values.email,password:values.password})});currentUser=result.user;render();});}
-  function renderAuthForm(title,description,submit,needsRecovery=false){root.innerHTML="";const box=element("div","ih-lock"),card=element("div");card.append(element("span","ih-mark","IH"),element("h1","",title),element("p","",description));const form=element("form");const email=document.createElement("input");email.type="email";email.placeholder="邮箱地址";email.required=true;const password=document.createElement("input");password.type="password";password.placeholder="至少 12 位密码";password.minLength=12;password.required=true;form.append(email,password);let recovery;if(needsRecovery){recovery=document.createElement("input");recovery.type="password";recovery.placeholder="本机管理口令（仅首次使用）";recovery.required=true;form.append(recovery);}const button=element("button","ih-button","继续");form.append(button);form.onsubmit=async e=>{e.preventDefault();button.disabled=true;try{await submit({email:email.value,password:password.value,recovery:recovery?.value});}catch(error){alert(error.message);button.disabled=false;}};const back=element("button","ih-button ih-button-quiet","返回登录");back.type="button";back.onclick=renderLock;form.append(back);card.append(form);box.append(card);root.append(box);}
+  function renderAuthForm(title,description,submit,needsRecovery=false){root.innerHTML="";const box=element("div","ih-lock"),card=element("div");card.append(brandMark(),element("h1","",title),element("p","",description));const form=element("form","ih-auth-form");const email=document.createElement("input");email.type="email";email.placeholder="邮箱地址";email.required=true;const password=document.createElement("input");password.type="password";password.placeholder="至少 12 位密码";password.minLength=12;password.required=true;form.append(email,password);let recovery;if(needsRecovery){recovery=document.createElement("input");recovery.type="password";recovery.placeholder=title==="恢复访问"?"一次性恢复码":"本机管理口令（仅首次使用）";recovery.required=true;form.append(recovery);}const button=element("button","ih-button ih-auth-primary","继续");form.append(button);form.onsubmit=async e=>{e.preventDefault();button.disabled=true;try{await submit({email:email.value,password:password.value,recovery:recovery?.value});}catch(error){alert(error.message);button.disabled=false;}};const back=element("button","ih-button ih-button-quiet","返回登录");back.type="button";back.onclick=renderLock;form.append(back);card.append(form);box.append(card);root.append(box);}
   function element(tag, cls, text) {
     const n = document.createElement(tag);
     if (cls) n.className = cls;
@@ -104,7 +160,8 @@
     const side = element("aside", "ih-side");
     const brand = element("div", "ih-brand");
     brand.innerHTML =
-      '<span class="ih-mark">IH</span><div><b>InboxHarbor</b><small>收件港</small></div>';
+      '<div><b>InboxHarbor</b><small>收件港</small></div>';
+    brand.prepend(brandMark());
     const nav = element("nav", "ih-nav");
     [
       "概览|overview",
@@ -554,7 +611,50 @@
     if(currentUser?.role==='user'){const danger=element('button','ih-button ih-button-danger','永久删除我的账户');danger.id='ih-delete-account';danger.type='button';s.append(danger);}s.querySelector('#ih-password-form').onsubmit=async e=>{e.preventDefault();try{await request('/api/auth/change-password',{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(e.currentTarget)))});alert('密码已更新，请重新登录');lock();}catch(error){alert(error.message);}};
     s.querySelector('#ih-logout-all').onclick=async()=>{await request('/api/auth/logout-all',{method:'POST'});lock();}; return s;
   }
-  function admin(){const s=element('section','ih-page');s.id='ih-admin';s.innerHTML='<div class="ih-section-head"><div><h1>管理后台</h1><p class="ih-section-copy">仅展示必要的成员、邀请与实例审计信息。</p></div></div><div class="ih-admin-grid"><section class="ih-card"><h2>成员</h2><div id="ih-users" class="ih-simple-list"></div></section><section class="ih-card"><h2>创建邀请</h2><form id="ih-invite-form"><label class="ih-field-label">邮箱（可留空）<input name="email" type="email" placeholder="member@example.com"></label><label class="ih-field-label">角色<select name="role"><option value="user">成员</option><option value="admin">管理员</option></select></label><label class="ih-field-label">有效期（小时）<input name="ttlHours" type="number" min="1" max="720" value="72"></label><button class="ih-button" type="submit">生成邀请链接</button></form><div id="ih-invite-result" class="ih-invite-result"></div><div id="ih-invites" class="ih-simple-list"></div></section></div><section class="ih-card ih-owner-only" id="ih-public-registration"><h2>公开注册</h2><p>关闭时仅可通过邀请创建成员。</p><label class="ih-switch"><input type="checkbox" id="ih-public-toggle"><span class="ih-switch-track"></span><span class="ih-switch-label">允许公开注册</span></label></section><section class="ih-card"><h2>审计日志</h2><div id="ih-audit" class="ih-simple-list"></div></section>';return s;}
+  function admin(){const s=element('section','ih-page');s.id='ih-admin';s.innerHTML='<div class="ih-section-head"><div><h1>管理后台</h1><p class="ih-section-copy">仅展示必要的成员、邀请与实例审计信息。</p></div></div><div class="ih-admin-grid"><section class="ih-card"><h2>成员</h2><div id="ih-users" class="ih-simple-list"></div></section><section class="ih-card"><h2>创建邀请</h2><form id="ih-invite-form"><label class="ih-field-label">邮箱（可留空）<input name="email" type="email" placeholder="member@example.com"></label><label class="ih-field-label">角色<select name="role"><option value="user">成员</option><option value="admin">管理员</option></select></label><label class="ih-field-label">有效期（小时）<input name="ttlHours" type="number" min="1" max="720" value="72"></label><button class="ih-button" type="submit">生成邀请链接</button></form><div id="ih-invite-result" class="ih-invite-result"></div><div id="ih-invites" class="ih-simple-list"></div></section></div><section class="ih-card ih-owner-only" id="ih-public-registration"><h2>公开注册</h2><p>关闭时仅可通过邀请创建成员。</p><label class="ih-switch"><input type="checkbox" id="ih-public-toggle"><span class="ih-switch-track"></span><span class="ih-switch-label">允许公开注册</span></label></section><section class="ih-card"><h2>审计日志</h2><div id="ih-audit" class="ih-simple-list"></div></section>';if(currentUser?.role==='owner')s.append(brandingSettings());return s;}
+  function brandingSettings() {
+    const section = element("section", "ih-card ih-branding-settings");
+    section.append(element("h2", "", "站点 Logo"), element("p", "ih-section-copy", "统一显示在登录页和侧边栏。支持 PNG、JPEG、WebP，最大 128 KB；留空使用默认 IH 标志。"));
+    const preview = element("div", "ih-logo-preview"); preview.append(brandMark());
+    const label = element("label", "ih-field-label", "上传 Logo");
+    const input = document.createElement("input"); input.type = "file";
+    input.accept = "image/png,image/jpeg,image/webp"; input.id = "ih-logo-upload";
+    label.htmlFor = input.id; label.append(input);
+    const status = element("p", "ih-section-copy"); status.setAttribute("role", "status");
+    const actions = element("div", "ih-section-actions");
+    const save = element("button", "ih-button", "保存 Logo"); save.type = "button"; save.disabled = true;
+    const reset = element("button", "ih-button ih-button-quiet", "恢复默认 Logo"); reset.type = "button";
+    let candidate = branding.logoDataUrl, reading = 0;
+    function showPreview(value) {
+      preview.replaceChildren();
+      if (value) { const image = document.createElement("img"); image.src = value; image.alt = "Logo 预览"; preview.append(image); }
+      else preview.append(element("span", "ih-mark", "IH"));
+    }
+    input.onchange = async () => {
+      const version = ++reading, file = input.files[0]; save.disabled = true;
+      if (!file) return;
+      if (!["image/png","image/jpeg","image/webp"].includes(file.type) || file.size > 128 * 1024) {
+        status.textContent = "请选择不超过 128 KB 的 PNG、JPEG 或 WebP 图片。"; input.value = ""; return;
+      }
+      try {
+        const value = await new Promise((resolve,reject) => { const reader = new FileReader(); reader.onload=()=>resolve(reader.result); reader.onerror=reject; reader.readAsDataURL(file); });
+        const image = new Image(); image.src = value; await image.decode();
+        if (version !== reading) return;
+        candidate = value; showPreview(candidate); save.disabled = false; status.textContent = "预览已更新，点击保存后全站生效。";
+      } catch { if (version === reading) status.textContent = "图片无法读取，请选择有效图片。"; }
+    };
+    async function persist(value) {
+      ++reading; save.disabled = true; reset.disabled = true; input.disabled = true;
+      try {
+        branding = await request("/api/v1/branding", {method:"PUT",body:JSON.stringify({logoDataUrl:value})});
+        candidate = branding.logoDataUrl; showPreview(candidate); refreshBrandMarks(); input.value = "";
+        status.textContent = value ? "Logo 已保存，登录页和侧边栏已同步更新。" : "已恢复默认 IH 标志。";
+      } catch (error) { status.textContent = error.message; save.disabled = false; }
+      finally { reset.disabled = false; input.disabled = false; }
+    }
+    save.onclick = () => persist(candidate); reset.onclick = () => persist("");
+    actions.append(save,reset); section.append(preview,label,actions,status); return section;
+  }
   async function loadUserAreas(){
     const profileIdentity=document.getElementById('ih-profile-identity'); if(profileIdentity){profileIdentity.textContent=`${currentUser.email} · ${currentUser.role}`;const quota=await request(`/api/auth/users/${encodeURIComponent(currentUser.id)}/quota`).catch(()=>({quota:null}));const q=quota.quota||{};document.getElementById('ih-profile-quota').textContent=`邮箱账户：${q.mail_account_limit??'未限制'} · 通知渠道：${q.notification_limit??'未限制'}`;const links=await request('/api/share-links').catch(()=>({links:[]}));const box=document.getElementById('ih-shares');box.replaceChildren();(links.links||[]).forEach(link=>{const row=element('div','ih-simple-row');row.append(element('span','',`${link.mailSubject||'邮件'} · ${link.expiresAt||'无期限'}`));const revoke=element('button','ih-button ih-button-quiet','撤销');revoke.onclick=async()=>{await request(`/api/share-links/${link.id}/revoke`,{method:'POST'});loadUserAreas();};row.append(revoke);box.append(row);});if(!(links.links||[]).length)box.textContent='暂无共享链接。';}
     if(!(currentUser.role==='owner'||currentUser.role==='admin'))return;
@@ -719,7 +819,7 @@
         renderChannels();
       }
       loadUserAreas().catch(() => {});
-      setTimeout(()=>{const recovery=document.getElementById('ih-recovery');if(recovery)recovery.onclick=async()=>{const currentPassword=prompt('输入当前密码以生成新恢复码');if(!currentPassword)return;try{const result=await request('/api/auth/recovery/regenerate',{method:'POST',body:JSON.stringify({currentPassword})});alert(`请立即保存以下恢复码（仅显示一次）：\n${result.recoveryCodes.join('\n')}`);}catch(error){alert(error.message);}};const remove=document.getElementById('ih-delete-account');if(remove)remove.onclick=async()=>{const currentPassword=prompt('输入当前密码以永久删除账户');if(!currentPassword)return;if(!confirm('邮件、账户、通知和共享链接将被永久删除。'))return;try{await request('/api/auth/me',{method:'DELETE',body:JSON.stringify({currentPassword})});lock();}catch(error){alert(error.message);}};},0);
+      setTimeout(()=>{const recovery=document.getElementById('ih-recovery');if(recovery)recovery.onclick=async()=>{const currentPassword=prompt('输入当前密码以生成新恢复码');if(!currentPassword)return;try{const result=await request('/api/auth/recovery/regenerate',{method:'POST',body:JSON.stringify({currentPassword})});displayRecoveryCodes(result.recoveryCodes);renderRecoveryNotice();}catch(error){alert(error.message);}};const remove=document.getElementById('ih-delete-account');if(remove)remove.onclick=async()=>{const currentPassword=prompt('输入当前密码以永久删除账户');if(!currentPassword)return;if(!confirm('邮件、账户、通知和共享链接将被永久删除。'))return;try{await request('/api/auth/me',{method:'DELETE',body:JSON.stringify({currentPassword})});lock();}catch(error){alert(error.message);}};},0);
     } catch (err) {
       alert(err.message);
       if (/口令/.test(err.message)) lock();
@@ -1288,5 +1388,5 @@
       }
     };
   }
-  (async()=>{try{authConfig=await request("/api/auth/config");if(authConfig.user){currentUser=authConfig.user;render();}else renderLock();}catch(error){renderLock();}})();
+  (async()=>{try{[authConfig,branding]=await Promise.all([request("/api/auth/config"),request("/api/auth/branding").catch(()=>({logoDataUrl:""}))]);if(authConfig.user){currentUser=authConfig.user;render();}else renderLock();}catch(error){renderLock();}})();
 })();
