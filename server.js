@@ -1801,11 +1801,27 @@ app.get("/api/v1/notifications/deliveries", (req, res) => {
   res.json({ success: true, deliveries, total, page, pageSize });
 });
 
-app.get("/api/v1/connectors", (req, res) =>
-  res.json({ success: true, configuration: publicConnectorConfig() }),
-);
+function requireConnectorOwner(req, res) {
+  if (req.user?.role === "owner") return true;
+  res.status(403).json({ success: false, message: "仅 Owner 可以管理连接器配置" });
+  return false;
+}
+app.get("/api/v1/connectors/status", (req, res) => {
+  const configuration = publicConnectorConfig();
+  res.json({
+    success: true,
+    providers: {
+      google: { configured: Boolean(configuration.google.clientIdConfigured && configuration.google.clientSecretConfigured) },
+      microsoft: { configured: Boolean(configuration.microsoft.configured) },
+    },
+  });
+});
+app.get("/api/v1/connectors", (req, res) => {
+  if (!requireConnectorOwner(req, res)) return;
+  res.json({ success: true, configuration: publicConnectorConfig() });
+});
 app.put("/api/v1/connectors", (req, res) => {
-  if (req.user?.role !== 'owner') return res.status(403).json({ success: false, message: '仅 Owner 可以修改连接器配置' });
+  if (!requireConnectorOwner(req, res)) return;
   try {
     const previous = gData.connectorConfig;
     const candidate = updateStoredConnectorConfig(
@@ -1828,6 +1844,7 @@ app.put("/api/v1/connectors", (req, res) => {
 });
 
 function connectorCheck(req, res) {
+  if (!requireConnectorOwner(req, res)) return;
   const configuration = publicConnectorConfig();
   const microsoftReady = configuration.microsoft.configured;
   const googleReady = configuration.google.clientIdConfigured && configuration.google.clientSecretConfigured;
