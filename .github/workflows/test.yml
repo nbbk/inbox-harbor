@@ -22,8 +22,10 @@ jobs:
       - name: Unit and HTTP regression tests
         run: npm test
       - name: Install Chromium
+        if: ${{ !cancelled() }}
         run: npx playwright install --with-deps chromium
       - name: Browser regression tests
+        if: ${{ !cancelled() }}
         run: npx playwright test
       - name: Upload UI evidence
         if: always()
