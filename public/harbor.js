@@ -268,10 +268,17 @@
     root
       .querySelectorAll("[data-page]")
       .forEach((b) => (b.onclick = () => show(b.dataset.page)));
+    let savedPage = "overview";
+    try { savedPage = sessionStorage.getItem(`inboxharbor.active-page.${currentUser.id}`) || savedPage; } catch {}
+    show(savedPage);
     load();
     renderRecoveryNotice();
   }
   function show(page) {
+    if (!currentUser) return;
+    const allowed = new Set([...root.querySelectorAll("[data-page]")].map(button => button.dataset.page));
+    if (!allowed.has(page)) page = "overview";
+    try { sessionStorage.setItem(`inboxharbor.active-page.${currentUser.id}`, page); } catch {}
     root
       .querySelectorAll(".ih-page")
       .forEach((n) => n.classList.toggle("active", n.id === "ih-" + page));
