@@ -289,7 +289,9 @@ test("connector check stays secret-free and only an owner may change connector c
       googleClientId: "123456789012-abcdef.apps.googleusercontent.com", googleClientSecret: "GOCSPX-secret-value",
     });
     assert.equal(saved.response.status, 200);
-    const checked = await api(base, memberCookie, "/api/v1/connectors/check");
+    const memberCheck = await api(base, memberCookie, "/api/v1/connectors/check");
+    assert.equal(memberCheck.response.status, 403);
+    const checked = await api(base, ownerCookie, "/api/v1/connectors/check");
     assert.equal(checked.response.status, 200);
     assert.equal(checked.body.results.google.ready, true);
     assert.equal(JSON.stringify(checked.body).includes("GOCSPX-secret-value"), false);
