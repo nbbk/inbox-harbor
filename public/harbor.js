@@ -14,14 +14,49 @@
     category: "全部",
     account: "全部",
     query: "",
+    sender: "",
+    dateFrom: "",
+    dateTo: "",
     selectedId: "",
     page: 1,
     pageSize: 50,
     pagination: { page: 1, pageSize: 50, total: 0, totalPages: 1 },
     facets: {},
   };
+  let mailRequestSequence = 0;
+  let activeLoadSequence = 0;
+  let sessionEpoch = 0;
+  let historySequence = 0;
+  let historyPage = 1;
+  const preferenceKey = () => currentUser ? `inboxharbor.mail-preferences.${currentUser.id}` : "";
+  function readPreferences() {
+    try { const value = JSON.parse(localStorage.getItem(preferenceKey()) || "{}"); return value && typeof value === "object" && !Array.isArray(value) ? value : {}; } catch { return {}; }
+  }
+  function writePreferences() {
+    try {
+      const value = { category: mailState.category, account: mailState.account, query: mailState.query, sender: mailState.sender, dateFrom: mailState.dateFrom, dateTo: mailState.dateTo, pageSize: mailState.pageSize };
+      localStorage.setItem(preferenceKey(), JSON.stringify(value));
+    } catch {}
+  }
+  function restorePreferences() {
+    const value = readPreferences();
+    for (const key of ["category","account","query","sender","dateFrom","dateTo","pageSize"]) if (value[key] !== undefined) mailState[key] = value[key];
+    if (!["全部","已发送","验证码","通知","账单","社交","推广","其他"].includes(mailState.category)) mailState.category = "全部";
+    for (const key of ["account","query","sender","dateFrom","dateTo"]) mailState[key] = typeof mailState[key] === "string" ? mailState[key].slice(0,500) : (key === "account" ? "全部" : "");
+    for (const key of ["dateFrom","dateTo"]) if (!/^\d{4}-\d{2}-\d{2}$/.test(mailState[key])) mailState[key] = "";
+    mailState.pageSize = [20,50,100].includes(Number(mailState.pageSize)) ? Number(mailState.pageSize) : 50;
+    mailState.page = 1; mailState.selectedId = "";
+  }
+  function resetMailState() {
+    clearTimeout(mailState.searchTimer);
+    mailState = { mails: [], accounts: [], category:"全部", account:"全部", query:"", sender:"", dateFrom:"", dateTo:"", selectedId:"", page:1, pageSize:50, pagination:{page:1,pageSize:50,total:0,totalPages:1}, facets:{} };
+    ++activeLoadSequence; ++mailRequestSequence; ++historySequence;
+    allAccounts = []; providerFilter = "all"; statusFilter = "all"; searchQuery = ""; accountPage = 1;
+    catalog = {}; config = { includeFullBody:false, shareLinkDays:30, channels:[] };
+  }
   const esc = (value) => String(value || "");
   function request(url, opts = {}) {
+    const epoch = sessionEpoch;
     return fetch(url, {
       ...opts,
       headers: {
@@ -31,6 +66,7 @@
       credentials: "same-origin",
     }).then(async (r) => {
       const text = await r.text();
+      if (epoch !== sessionEpoch) throw new Error("会话已切换，请使用当前页面。");
       let body = {};
       try {
         body = text ? JSON.parse(text) : {};
@@ -39,14 +75,17 @@
       }
       if (!r.ok) {
         if (r.status === 401 && !url.startsWith("/api/auth/")) lock();
-        throw new Error(body.message || "请求失败");
+        throw new Error([body.message || body.error?.label || "请求失败", body.error?.hint].filter(Boolean).join("："));
       }
       return body;
     });
   }
   function lock() {
+    ++sessionEpoch;
     currentUser = null;
     pendingRecoveryCodes = null;
+    resetMailState();
+    try { localStorage.removeItem("inboxharbor.active-user"); } catch {}
     root.querySelector(".ih-recovery-notice")?.remove();
     renderLock();
   }
@@ -82,7 +121,7 @@
       e.preventDefault(); button.disabled = true;
       try {
         const result = await request("/api/auth/login", {method:"POST",body:JSON.stringify({email:email.value,password:input.value})});
-        currentUser = result.user; render();
+        currentUser = result.user; try { localStorage.setItem("inboxharbor.active-user", currentUser.id); } catch {} restorePreferences(); render();
       } catch (error) { alert(error.message); button.disabled = false; }
     };
     const actions = element("div", "ih-auth-actions");
@@ -139,9 +178,9 @@
     box.append(title, description, codes, status, actions);
     root.append(box); box.showModal(); copy.focus();
   }
-  function renderBootstrap(){renderAuthForm("初始化收件港","用启动终端显示的本机管理口令，创建唯一 Owner。",async values=>{const created=await request("/api/auth/bootstrap",{method:"POST",headers:{Authorization:`Bearer ${values.recovery}`},body:JSON.stringify({email:values.email,password:values.password})});displayRecoveryCodes(created.user.recoveryCodes);const result=await request("/api/auth/login",{method:"POST",body:JSON.stringify({email:values.email,password:values.password})});currentUser=result.user;authConfig.ownerInitialized=true;render();},true);}
+  function renderBootstrap(){renderAuthForm("初始化收件港","用启动终端显示的本机管理口令，创建唯一 Owner。",async values=>{const created=await request("/api/auth/bootstrap",{method:"POST",headers:{Authorization:`Bearer ${values.recovery}`},body:JSON.stringify({email:values.email,password:values.password})});displayRecoveryCodes(created.user.recoveryCodes);const result=await request("/api/auth/login",{method:"POST",body:JSON.stringify({email:values.email,password:values.password})});currentUser=result.user; try { localStorage.setItem("inboxharbor.active-user", currentUser.id); } catch {} authConfig.ownerInitialized=true; restorePreferences(); render();},true);}
   function renderRecoveryReset(){renderAuthForm("恢复访问","输入邮箱、一次性恢复码和新密码。使用后会退出所有设备。",async values=>{await request('/api/auth/recovery/reset',{method:'POST',body:JSON.stringify({email:values.email,code:values.recovery,newPassword:values.password})});alert('密码已重置，请登录');renderLock();},true);}
-  function renderRegistration(inviteToken=""){renderAuthForm(inviteToken?"接受邀请":"创建账号",inviteToken?"设置你的登录邮箱和密码。":"公开注册已由管理员开启。",async values=>{const endpoint=inviteToken?"/api/auth/invitations/accept":"/api/auth/register";const created=await request(endpoint,{method:"POST",body:JSON.stringify(inviteToken?{token:inviteToken,email:values.email,password:values.password}:{email:values.email,password:values.password})});displayRecoveryCodes(created.user.recoveryCodes);const result=await request("/api/auth/login",{method:"POST",body:JSON.stringify({email:values.email,password:values.password})});currentUser=result.user;render();});}
+  function renderRegistration(inviteToken=""){renderAuthForm(inviteToken?"接受邀请":"创建账号",inviteToken?"设置你的登录邮箱和密码。":"公开注册已由管理员开启。",async values=>{const endpoint=inviteToken?"/api/auth/invitations/accept":"/api/auth/register";const created=await request(endpoint,{method:"POST",body:JSON.stringify(inviteToken?{token:inviteToken,email:values.email,password:values.password}:{email:values.email,password:values.password})});displayRecoveryCodes(created.user.recoveryCodes);const result=await request("/api/auth/login",{method:"POST",body:JSON.stringify({email:values.email,password:values.password})});currentUser=result.user; try { localStorage.setItem("inboxharbor.active-user", currentUser.id); } catch {} restorePreferences(); render();});}
   function renderAuthForm(title,description,submit,needsRecovery=false){root.innerHTML="";const box=element("div","ih-lock"),card=element("div");card.append(brandMark(),element("h1","",title),element("p","",description));const form=element("form","ih-auth-form");const email=document.createElement("input");email.type="email";email.placeholder="邮箱地址";email.required=true;const password=document.createElement("input");password.type="password";password.placeholder="至少 12 位密码";password.minLength=12;password.required=true;form.append(email,password);let recovery;if(needsRecovery){recovery=document.createElement("input");recovery.type="password";recovery.placeholder=title==="恢复访问"?"一次性恢复码":"本机管理口令（仅首次使用）";recovery.required=true;form.append(recovery);}const button=element("button","ih-button ih-auth-primary","继续");form.append(button);form.onsubmit=async e=>{e.preventDefault();button.disabled=true;try{await submit({email:email.value,password:password.value,recovery:recovery?.value});}catch(error){alert(error.message);button.disabled=false;}};const back=element("button","ih-button ih-button-quiet","返回登录");back.type="button";back.onclick=renderLock;form.append(back);card.append(form);box.append(card);root.append(box);}
   function element(tag, cls, text) {
     const n = document.createElement(tag);
@@ -155,6 +194,8 @@
     return b;
   }
   function render() {
+    ++sessionEpoch;
+    restorePreferences();
     root.innerHTML = "";
     const shell = element("div", "ih-shell");
     const side = element("aside", "ih-side");
@@ -234,7 +275,14 @@
     s.id = "ih-overview";
     s.innerHTML = `<div class="ih-mail-head"><div><h1>邮件中心</h1><p>聚合查看所有账户的重要邮件与验证码。</p></div><div class="ih-mail-head-actions"><span id="ih-mail-summary">0 封邮件</span><button id="ih-mail-refresh" class="ih-button ih-button-quiet">刷新列表</button><button id="ih-compose" class="ih-button">写邮件</button></div></div>
       <div class="ih-mail-categories" id="ih-mail-categories" aria-label="邮件分类"></div>
-      <div class="ih-mail-tools"><label class="ih-mail-search"><span>搜索</span><input id="ih-mail-search" placeholder="搜索主题、发件人或正文"></label><label><span>邮箱账户</span><select id="ih-mail-account"><option value="全部">全部账户</option></select></label></div>
+      <div class="ih-mail-tools">
+        <label class="ih-mail-search"><span>搜索</span><input id="ih-mail-search" placeholder="搜索主题、发件人或正文"></label>
+        <label><span>发件人</span><input id="ih-mail-sender" placeholder="例如 alerts@example.com"></label>
+        <label><span>邮箱账户</span><select id="ih-mail-account"><option value="全部">全部账户</option></select></label>
+        <label><span>起始日期</span><input id="ih-mail-date-from" type="date"></label>
+        <label><span>结束日期</span><input id="ih-mail-date-to" type="date"></label>
+        <button id="ih-mail-reset" class="ih-button ih-button-quiet" type="button">重置筛选</button>
+      </div>
       <div class="ih-mail-workspace"><div class="ih-mail-list" id="ih-mail-list"></div><article class="ih-mail-reader" id="ih-mail-reader"><div class="ih-mail-empty"><b>选择一封邮件</b><span>正文会在这里清晰呈现。</span></div></article></div><div class="ih-mail-pager" id="ih-mail-pager"></div>`;
     s.querySelector("#ih-mail-refresh").onclick = async () => {
       const button = s.querySelector("#ih-mail-refresh");
@@ -247,13 +295,17 @@
       finally { button.disabled = false; button.textContent = "刷新列表"; }
     };
     s.querySelector("#ih-compose").onclick = openCompose;
-    s.querySelector("#ih-mail-search").oninput = (event) => {
-      mailState.query = event.target.value.trim().toLowerCase();
-      clearTimeout(mailState.searchTimer);
-      mailState.searchTimer = setTimeout(() => loadMailPage(1), 250);
-    };
-    s.querySelector("#ih-mail-account").onchange = (event) => {
-      mailState.account = event.target.value;
+    const scheduleFilter = () => { ++mailRequestSequence; writePreferences(); clearTimeout(mailState.searchTimer); mailState.searchTimer = setTimeout(() => loadMailPage(1), 250); };
+    s.querySelector("#ih-mail-search").oninput = (event) => { mailState.query = event.target.value.trim(); scheduleFilter(); };
+    s.querySelector("#ih-mail-sender").oninput = (event) => { mailState.sender = event.target.value.trim(); scheduleFilter(); };
+    s.querySelector("#ih-mail-account").onchange = (event) => { mailState.account = event.target.value; writePreferences(); loadMailPage(1); };
+    s.querySelector("#ih-mail-date-from").onchange = (event) => { mailState.dateFrom = event.target.value; writePreferences(); loadMailPage(1); };
+    s.querySelector("#ih-mail-date-to").onchange = (event) => { mailState.dateTo = event.target.value; writePreferences(); loadMailPage(1); };
+    s.querySelector("#ih-mail-reset").onclick = () => {
+      mailState.category="全部"; mailState.account="全部"; mailState.query=""; mailState.sender=""; mailState.dateFrom=""; mailState.dateTo=""; mailState.page=1; mailState.selectedId="";
+      writePreferences();
+      ["#ih-mail-search","#ih-mail-sender","#ih-mail-date-from","#ih-mail-date-to"].forEach(sel => { const input=s.querySelector(sel); if(input) input.value=""; });
+      const account=s.querySelector("#ih-mail-account"); if(account) account.value="全部";
       loadMailPage(1);
     };
     return s;
@@ -283,20 +335,12 @@
   }
 
   function visibleMails() {
-    return mailState.mails.filter((mail) => {
-      if (mailState.category === "全部" && mail.direction === "sent") return false;
-      if (mailState.category !== "全部" && mail.category !== mailState.category)
-        return false;
-      if (mailState.account !== "全部" && mail.account !== mailState.account)
-        return false;
-      if (!mailState.query) return true;
-      return `${mail.subject || ""} ${mail.sender || ""} ${mail.content || ""}`
-        .toLowerCase()
-        .includes(mailState.query);
-    });
+    return mailState.mails;
   }
 
   function renderMailCenter(mails, accounts) {
+    const search=document.getElementById("ih-mail-search"), sender=document.getElementById("ih-mail-sender"), from=document.getElementById("ih-mail-date-from"), to=document.getElementById("ih-mail-date-to");
+    if(search) search.value=mailState.query; if(sender) sender.value=mailState.sender; if(from) from.value=mailState.dateFrom; if(to) to.value=mailState.dateTo;
     if (mails) mailState.mails = mails;
     if (accounts) mailState.accounts = accounts;
     const list = document.getElementById("ih-mail-list");
@@ -312,6 +356,7 @@
       );
       button.onclick = () => {
         mailState.category = category;
+        writePreferences();
         mailState.selectedId = "";
         loadMailPage(1);
       };
@@ -323,9 +368,10 @@
     [...new Set(mailState.accounts.map((account) => account.username))].forEach(
       (username) => accountSelect.append(new Option(username, username)),
     );
-    accountSelect.value = current;
+    accountSelect.value = [...accountSelect.options].some(o => o.value === current) ? current : "全部";
+    if (accountSelect.value !== current) { mailState.account = "全部"; writePreferences(); }
     const filtered = visibleMails();
-    document.getElementById("ih-mail-summary").textContent = `${filtered.length} 封邮件`;
+    document.getElementById("ih-mail-summary").textContent = `共 ${mailState.pagination.total || 0} 封 · 本页 ${filtered.length} 封`;
     list.replaceChildren();
     if (!filtered.length) {
       const empty = element("div", "ih-mail-empty");
@@ -388,24 +434,29 @@
   }
 
   async function loadMailPage(page) {
+    clearTimeout(mailState.searchTimer);
+    const sequence = ++mailRequestSequence;
+    if (!currentUser) return;
+    if (mailState.dateFrom && mailState.dateTo && mailState.dateFrom > mailState.dateTo) { document.getElementById("ih-mail-summary").textContent = "起始日期不能晚于结束日期"; return; }
     try {
       const params = new URLSearchParams({ page: String(page), pageSize: String(mailState.pageSize) });
       if (mailState.query) params.set("q", mailState.query);
+      if (mailState.sender) params.set("sender", mailState.sender);
       if (mailState.account !== "全部") params.set("account", mailState.account);
+      if (mailState.dateFrom) params.set("dateFrom", mailState.dateFrom);
+      if (mailState.dateTo) params.set("dateTo", mailState.dateTo);
       if (mailState.category === "已发送") params.set("direction", "sent");
-      else {
-        params.set("direction", "received");
-        if (mailState.category !== "全部") params.set("category", mailState.category);
-      }
+      else { params.set("direction", "received"); if (mailState.category !== "全部") params.set("category", mailState.category); }
       const result = await request(`/api/mails?${params}`);
+      if (sequence !== mailRequestSequence || !currentUser) return;
+      if (page > (result.pagination?.totalPages || page)) return loadMailPage(result.pagination.totalPages);
       mailState.page = result.pagination?.page || page;
       mailState.pagination = result.pagination || mailState.pagination;
       mailState.facets = result.facets || mailState.facets;
       mailState.selectedId = "";
       renderMailCenter(result.mails || []);
-    } catch (error) {
-      alert(error.message);
-    }
+      writePreferences();
+    } catch (error) { if (sequence === mailRequestSequence) alert(error.message); }
   }
 
   function renderMailReader(mail) {
@@ -472,13 +523,13 @@
       reader.append(recipients);
     }
     if (mail.code && mail.code !== "未发现验证码") {
-      const codeBox = element("div", "ih-code-box");
+      const codeBox = element("div", "ih-code-box ih-code-box-prominent");
       const copy = element("button", "ih-button ih-button-quiet", "复制验证码");
-      copy.onclick = async () => {
-        await copyText(mail.code, copy);
-        copy.textContent = "已复制";
-      };
-      codeBox.append(element("span", "", "验证码"), element("strong", "", mail.code), copy);
+      copy.onclick = async () => { const ok = await copyText(mail.code, copy); if (ok) copy.textContent = "已复制"; };
+      const related = mailState.mails.filter(item => item.id !== mail.id && item.account === mail.account && item.sender === mail.sender && item.code && item.code !== "未发现验证码").sort((a,b) => new Date(b.receivedAt||0)-new Date(a.receivedAt||0));
+      const newest = related[0];
+      const freshness = !Number.isFinite(Date.parse(mail.receivedAt)) ? "邮件时间未知，无法比较新旧" : newest && new Date(newest.receivedAt||0) > new Date(mail.receivedAt||0) ? "本页同账户、同发件人有更新验证码，请核对后复制" : "本页同账户、同发件人中最新；其他页可能有更新邮件";
+      codeBox.append(element("span", "", "验证码（邮件内容识别，未验证有效性）"), element("strong", "", mail.code), copy, element("small", "", `${freshness} · ${formatMailTime(mail.receivedAt)}`));
       reader.append(codeBox);
     }
     const body = element("div", "ih-mail-body", mail.content || "无正文内容");
@@ -594,16 +645,65 @@
   function accounts() {
     const s = element("section", "ih-page");
     s.id = "ih-accounts";
-    s.innerHTML =
-      '<div class="ih-section-head"><div><h1>邮箱账户</h1><p class="ih-section-copy">统一管理 Google 与 Microsoft 邮箱授权、收件和发信权限。</p></div><div class="ih-section-actions"><button id="ih-fetch" class="ih-button ih-button-quiet">手动取件</button><button id="ih-add" class="ih-button">添加邮箱</button></div></div><div class="ih-account-surface" id="ih-accounts-list">正在加载账户…</div>';
+    s.innerHTML = '<div class="ih-section-head"><div><h1>邮箱账户</h1><p class="ih-section-copy">统一管理 Google 与 Microsoft 邮箱授权、收件和发信权限。</p></div><div class="ih-section-actions"><button id="ih-fetch" class="ih-button ih-button-quiet">手动取件</button><button id="ih-add" class="ih-button">添加邮箱</button></div></div><div id="ih-fetch-summary" class="ih-fetch-summary" role="status"></div><div class="ih-account-surface" id="ih-accounts-list">正在加载账户…</div>';
+    s.querySelector("#ih-fetch").onclick = async () => {
+      const button=s.querySelector("#ih-fetch"), summary=s.querySelector("#ih-fetch-summary");
+      button.disabled=true; button.textContent="取件中…"; summary.textContent="正在检查账户…";
+      try {
+        const result=await request("/api/accounts/fetch-mail",{method:"POST",body:JSON.stringify({})});
+        const failed=Number(result.failedCount||0), succeeded=Number(result.succeededCount||0);
+        summary.textContent = `检查完成：${succeeded} 个成功，${failed} 个需处理，${Number(result.skippedCount||0)} 个已暂停；新增 ${Number(result.fetchedCount||0)} 封通知邮件。`;
+        await load();
+      } catch(error) { summary.textContent=error.message; }
+      finally { button.disabled=false; button.textContent="手动取件"; }
+    };
+    s.querySelector("#ih-add").onclick = openAddAccounts;
     return s;
   }
   function notifications() {
     const s = element("section", "ih-page");
     s.id = "ih-notifications";
-    s.innerHTML =
-      '<div class="ih-section-head"><div><p class="ih-eyebrow">SUMMARY DELIVERY</p><h2>通知渠道</h2><p class="ih-section-copy">配置推送渠道与共享阅读规则。</p></div></div><div class="ih-layout"><div><section class="ih-share-settings" aria-labelledby="ih-share-title"><div class="ih-share-icon" aria-hidden="true">🔗</div><div class="ih-share-copy"><h3 id="ih-share-title">共享阅读链接</h3><p>通知中的“查看邮件”链接免登录、只读，过期后自动失效。</p></div><label class="ih-share-field" for="ih-share-days"><span>有效期</span><span class="ih-share-input"><input id="ih-share-days" type="number" min="1" max="365" value="30" inputmode="numeric" aria-label="查看链接有效期（天）" aria-describedby="ih-share-hint"><b>天</b></span><small id="ih-share-hint">1–365 天，默认 30 天</small></label></section><div class="ih-channels" id="ih-channel-list"></div><div class="ih-save-row"><button id="ih-save" class="ih-button">保存通知设置</button><span>保存后对新生成的链接生效</span></div></div><aside class="ih-card ih-guide" id="ih-channel-guide"><p class="ih-eyebrow">CONFIGURATION</p><h3>选择一个渠道</h3><p>所有渠道只推送摘要与免登录只读链接；凭据不会回显。</p></aside></div>';
+    s.innerHTML = '<div class="ih-section-head"><div><h2>通知渠道</h2><p class="ih-section-copy">配置推送渠道与共享阅读规则。</p></div></div><div class="ih-layout"><div><section class="ih-share-settings" aria-labelledby="ih-share-title"><div class="ih-share-icon" aria-hidden="true">🔗</div><div class="ih-share-copy"><h3 id="ih-share-title">共享阅读链接</h3><p>通知中的“查看邮件”链接免登录、只读，过期后自动失效。</p></div><label class="ih-share-field" for="ih-share-days"><span>有效期</span><span class="ih-share-input"><input id="ih-share-days" type="number" min="1" max="365" value="30" inputmode="numeric" aria-label="查看链接有效期（天）" aria-describedby="ih-share-hint"><b>天</b></span><small id="ih-share-hint">1–365 天，默认 30 天</small></label></section><div class="ih-channels" id="ih-channel-list"></div><div class="ih-save-row"><button id="ih-save" class="ih-button">保存通知设置</button><span>保存后对新生成的链接生效</span></div></div><aside class="ih-card ih-guide" id="ih-channel-guide"><p>选择一个渠道</p><h3>配置说明</h3><p>所有渠道只推送摘要与免登录只读链接；凭据不会回显。</p></aside></div><section class="ih-card ih-delivery-history"><div class="ih-section-head"><div><h3>通知历史</h3><p class="ih-section-copy">仅展示当前账户的投递状态，不包含凭据。</p></div><button id="ih-history-refresh" class="ih-button ih-button-quiet">刷新历史</button></div><div id="ih-delivery-history" class="ih-simple-list">正在加载…</div></section>';
+    const historyControls = element("div","ih-history-controls");
+    const historyState = document.createElement("select"); historyState.id="ih-history-state"; historyState.setAttribute("aria-label","通知状态");
+    [["","全部状态"],["failed","失败"],["delivered","渠道已接受"],["sending","发送中"]].forEach(([v,l])=>historyState.add(new Option(l,v)));
+    historyState.onchange=()=>loadNotificationHistory(1); historyControls.append(historyState);
+    s.querySelector(".ih-delivery-history").insertBefore(historyControls,s.querySelector("#ih-delivery-history"));
+    const pager=element("div","ih-history-pager"); pager.id="ih-history-pager"; s.querySelector(".ih-delivery-history").append(pager);
+    s.querySelector("#ih-history-refresh").onclick=()=>loadNotificationHistory(historyPage);
     return s;
+  }
+  async function loadNotificationHistory(page = 1) {
+    const box=document.getElementById("ih-delivery-history"); if(!box || !currentUser)return;
+    const sequence=++historySequence, epoch=sessionEpoch; historyPage=page;
+    const refresh=document.getElementById("ih-history-refresh"); if(refresh)refresh.disabled=true;
+    box.textContent="正在加载…";
+    try {
+      const params=new URLSearchParams({page:String(page),pageSize:"20"});
+      const state=document.getElementById("ih-history-state")?.value; if(state)params.set("state",state);
+      const result=await request("/api/v1/notifications/deliveries?"+params);
+      if(sequence!==historySequence || epoch!==sessionEpoch || !box.isConnected)return;
+      box.replaceChildren();
+      const stateLabels={pending:"等待发送",sending:"发送中",delivered:"渠道已接受",failed:"发送失败"};
+      (result.deliveries||[]).forEach(item=>{
+        const row=element("div","ih-simple-row ih-delivery-row"), detail=element("div","ih-delivery-detail");
+        const title=item.kind==="test" ? "渠道测试" : item.mail?.subject || "原邮件已删除";
+        detail.append(element("b","",(catalog[item.channelType]?.name||item.channelType||"通知")+" · "+title));
+        detail.append(element("small","", "最近尝试："+formatMailTime(item.updatedAt||item.createdAt)+" · 尝试 "+(item.attempts||0)+" 次"));
+        if(item.mail?.account)detail.append(element("small","",item.mail.account));
+        if(item.error)detail.append(element("small","ih-delivery-error",item.error.label+"："+item.error.hint));
+        if(item.nextRetryAt)detail.append(element("small","","预计重试："+formatMailTime(item.nextRetryAt)));
+        else if(item.state==="failed")detail.append(element("small","",item.kind==="test"?"测试不会自动重试，请修正配置后再次测试。":"暂无自动重试计划，请检查渠道配置。"));
+        row.append(detail,element("span","ih-delivery-state",stateLabels[item.state]||"状态未知"));box.append(row);
+      });
+      if(!(result.deliveries||[]).length)box.textContent="暂无符合条件的通知记录。";
+      const pager=document.getElementById("ih-history-pager");pager.replaceChildren();
+      const previous=element("button","ih-button ih-button-quiet","上一页记录"),next=element("button","ih-button ih-button-quiet","下一页记录");
+      previous.disabled=page<=1;next.disabled=page*20>=result.total;
+      previous.onclick=()=>loadNotificationHistory(page-1);next.onclick=()=>loadNotificationHistory(page+1);
+      pager.append(previous,element("span","","共 "+(result.total||0)+" 条 · 渠道接受不代表终端已读"),next);
+    } catch(error) { if(sequence===historySequence&&epoch===sessionEpoch)box.textContent="通知历史暂时不可用："+error.message; }
+    finally { if(sequence===historySequence&&refresh?.isConnected)refresh.disabled=false; }
   }
   function profile() {
     const s = element("section", "ih-page"); s.id="ih-profile";
@@ -743,20 +843,18 @@
 
   async function copyText(value, button) {
     try {
+      if (!navigator.clipboard?.writeText) throw new Error("clipboard unavailable");
       await navigator.clipboard.writeText(value);
+      const previous = button.textContent; button.textContent = "已复制"; setTimeout(() => { button.textContent = previous; }, 1500);
+      return true;
     } catch {
-      const area = document.createElement("textarea");
-      area.value = value;
-      document.body.append(area);
-      area.select();
-      document.execCommand("copy");
-      area.remove();
+      try {
+        const area = document.createElement("textarea"); area.value = value; area.setAttribute("readonly",""); document.body.append(area); area.select();
+        const ok = document.execCommand("copy"); area.remove(); if (!ok) throw new Error("copy failed");
+        const previous = button.textContent; button.textContent = "已复制"; setTimeout(() => { button.textContent = previous; }, 1500);
+        return true;
+      } catch { button.textContent = "请手动复制"; return false; }
     }
-    const previous = button.textContent;
-    button.textContent = "已复制";
-    setTimeout(() => {
-      button.textContent = previous;
-    }, 1500);
   }
 
   async function loadConnectors() {
@@ -841,26 +939,25 @@
     return s;
   }
   async function load() {
+    const loadSequence = ++activeLoadSequence;
+    const epoch = sessionEpoch;
     try {
-      const [stats, accounts, notices, mails] = await Promise.all([
-        request("/api/stats"),
+      const [accounts, notices] = await Promise.all([
         request("/api/accounts"),
         request("/api/v1/notifications").catch(() => null),
-        request("/api/mails?direction=received&page=1&pageSize=50"),
       ]);
+      if (loadSequence !== activeLoadSequence || !currentUser) return;
+      try { const validAccounts = new Set((accounts.accounts||[]).map(a=>a.username)); if(mailState.account !== "全部" && !validAccounts.has(mailState.account)) mailState.account="全部"; } catch {}
       renderAccounts(accounts.accounts);
-      mailState.pagination = mails.pagination || mailState.pagination;
-      mailState.facets = mails.facets || mailState.facets;
-      renderMailCenter(mails.mails || [], accounts.accounts || []);
+      mailState.accounts = accounts.accounts || [];
+      await loadMailPage(mailState.page || 1);
+      if (loadSequence !== activeLoadSequence || epoch !== sessionEpoch || !currentUser) return;
       loadConnectors().catch(() => {});
-      if (notices) {
-        catalog = notices.catalog;
-        config = notices.configuration;
-        renderChannels();
-      }
+      if (notices) { catalog = notices.catalog; config = notices.configuration; renderChannels(); loadNotificationHistory().catch(()=>{}); }
       loadUserAreas().catch(() => {});
       setTimeout(()=>{const recovery=document.getElementById('ih-recovery');if(recovery)recovery.onclick=async()=>{const currentPassword=prompt('输入当前密码以生成新恢复码');if(!currentPassword)return;try{const result=await request('/api/auth/recovery/regenerate',{method:'POST',body:JSON.stringify({currentPassword})});displayRecoveryCodes(result.recoveryCodes);renderRecoveryNotice();}catch(error){alert(error.message);}};const remove=document.getElementById('ih-delete-account');if(remove)remove.onclick=async()=>{const currentPassword=prompt('输入当前密码以永久删除账户');if(!currentPassword)return;if(!confirm('邮件、账户、通知和共享链接将被永久删除。'))return;try{await request('/api/auth/me',{method:'DELETE',body:JSON.stringify({currentPassword})});lock();}catch(error){alert(error.message);}};},0);
     } catch (err) {
+      if (epoch !== sessionEpoch) return;
       alert(err.message);
       if (/口令/.test(err.message)) lock();
     }
@@ -969,25 +1066,12 @@
       });
       test.onclick = async (event) => {
         event.stopPropagation();
-        const values = Object.fromEntries(
-          [...fields.querySelectorAll("input")]
-            .filter((input) => input.value)
-            .map((input) => [input.dataset.key, input.value]),
-        );
-        test.disabled = true;
-        test.textContent = "测试中";
-        try {
-          const result = await request(`/api/v1/notifications/${type}/test`, {
-            method: "POST",
-            body: JSON.stringify({ config: values }),
-          });
-          alert(result.message);
-        } catch (error) {
-          alert(error.message);
-        } finally {
-          test.disabled = false;
-          test.textContent = "测试";
-        }
+        const values = Object.fromEntries([...fields.querySelectorAll("input")].filter(input => input.value).map(input => [input.dataset.key, input.value]));
+        const status = element("small","ih-inline-feedback"); status.setAttribute("role","status"); test.parentElement.querySelector(".ih-inline-feedback")?.remove(); test.parentElement.append(status);
+        test.disabled=true; test.textContent="测试中…"; status.textContent="正在发送测试通知…";
+        try { const result=await request(`/api/v1/notifications/${type}/test`,{method:"POST",body:JSON.stringify({config:values})}); status.textContent=result.message||"测试请求已接受。"; status.className="ih-inline-feedback success"; }
+        catch(error) { status.textContent=error.message; status.className="ih-inline-feedback error"; }
+        finally { test.disabled=false; test.textContent="测试"; if(test.isConnected)loadNotificationHistory(1); }
       };
       card.append(top, fields);
       card.onclick = () => {
@@ -1265,20 +1349,28 @@
       } else {
         permissions.append(element("span", "ih-muted", "仅可清理"));
       }
-      const checked = element(
-        "div",
-        "ih-last-checked",
-        a.lastSyncAt
-          ? `${new Date(a.lastSyncAt).toLocaleString()} · ${a.syncStatus === "failed" ? "失败" : "正常"}`
-          : a.lastSyncError || "尚未同步",
-      );
+      const health = a.health || {};
+      const healthState = health.state || (a.syncStatus === "failed" ? "network" : a.lastSyncAt ? "normal" : "unsynced");
+      const healthLabel = health.label || ({normal:"同步正常",network:"网络异常",authorization:"需要重新授权",permission:"权限不足",paused:"同步已暂停",unsynced:"尚未同步",configuration:"连接器未配置",sync_failed:"同步失败",syncing:"同步中",unsupported:"历史账户"}[healthState] || "状态未知");
+      const checked = element("div", "ih-last-checked");
+      checked.append(element("b", "", healthLabel), element("small", "", health.lastSyncedAt ? `最近同步：${new Date(health.lastSyncedAt).toLocaleString()}` : "最近同步：尚未同步"), element("small", "", health.nextSyncAt ? `下次同步：${new Date(health.nextSyncAt).toLocaleString()}` : "下次同步：未安排"), element("small", "", health.hint || a.lastSyncError || ""));
+      if (["authorization","permission","configuration","sync_failed","network"].includes(healthState)) {
+        const recover = element("button", "ih-button ih-button-quiet", healthState === "authorization" ? "重新授权" : ["sync_failed","network"].includes(healthState) ? "重试同步" : healthState === "configuration" ? (currentUser?.role === "owner" ? "配置连接器" : "联系管理员") : "检查权限");
+        recover.type="button";
+        recover.onclick=async()=>{ if(healthState==="configuration"){if(currentUser?.role==="owner")show("connectors");else checked.append(element("small","","请联系此站点 Owner 检查连接器设置。"));return;} recover.disabled=true;try{if(["authorization","permission"].includes(healthState))await authorize(a);else await request("/api/accounts/fetch-mail",{method:"POST",body:JSON.stringify({ids:[a.id]})});await load();}catch(error){handleAuthorizationError(error);}finally{recover.disabled=false;}};
+        checked.append(recover);
+      }
       const actions = element("div", "ih-account-actions");
       const fetchButton = element("button", "ih-button ih-button-quiet", "取件");
       fetchButton.type = "button";
       fetchButton.onclick = async () => {
         fetchButton.disabled = true; fetchButton.textContent = "取件中…";
-        try { await request("/api/accounts/fetch-mail", { method: "POST", body: JSON.stringify({ ids: [a.id] }) }); await load(); }
-        catch (error) { alert(error.message); }
+        try {
+          const result = await request("/api/accounts/fetch-mail", { method: "POST", body: JSON.stringify({ ids: [a.id] }) });
+          const item = (result.results || []).find(row => row.accountId === a.id);
+          fetchButton.title = item?.health?.hint || "";
+          await load();
+        } catch (error) { alert(error.message); }
         finally { fetchButton.disabled = false; fetchButton.textContent = "取件"; }
       };
       const auth = element("button", "ih-button", "授权");
@@ -1410,23 +1502,7 @@
       renderAccounts(allAccounts);
     };
     document.getElementById("ih-add").onclick = openAddAccounts;
-    document.getElementById("ih-fetch").onclick = async (event) => {
-      const button = event.currentTarget;
-      button.disabled = true;
-      button.textContent = "正在取件…";
-      try {
-        await request("/api/accounts/fetch-mail", {
-          method: "POST",
-          body: "{}",
-        });
-        await load();
-      } catch (error) {
-        alert(error.message);
-      } finally {
-        button.disabled = false;
-        button.textContent = "手动取件";
-      }
-    };
+
   }
   (async()=>{try{[authConfig,branding]=await Promise.all([request("/api/auth/config"),request("/api/auth/branding").catch(()=>({logoDataUrl:""}))]);if(authConfig.user){currentUser=authConfig.user;render();}else renderLock();}catch(error){renderLock();}})();
 })();
