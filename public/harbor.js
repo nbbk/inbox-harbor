@@ -115,12 +115,34 @@
   function refreshBrandMarks() {
     root.querySelectorAll(".ih-mark:not(.ih-logo-preview .ih-mark)").forEach(mark => mark.replaceWith(brandMark()));
   }
+
+  function legalLinks() {
+    const nav = element('nav', 'ih-legal-links'); nav.setAttribute('aria-label', '政策与条款');
+    nav.style.cssText = 'display:flex;justify-content:center;flex-wrap:wrap;gap:12px 24px;margin-top:22px;font-size:13px;line-height:1.8';
+    for (const [text, href] of [['隐私权政策','/privacy'],['服务条款','/terms']]) { const a = element('a','',text); a.href = href; nav.append(a); }
+    return nav;
+  }
+  function legalSettings() {
+    const section = element('section','ih-card'); section.id = 'ih-legal-settings';
+    section.append(element('h2','','公开运营信息'),element('p','ih-section-copy','这些信息会公开显示在隐私权政策与服务条款中，可随时修改，不影响登录账号。对外开放和提交 OAuth 审核前，请填写真实运营者名称，并确认联系邮箱可用。'));
+    const form = element('form','ih-auth-form');
+    const ownerLabel = element('label','ih-field-label','运营者名称'); const ownerInput = document.createElement('input'); ownerInput.maxLength=200; ownerInput.value=branding.legal?.operatorName||''; ownerInput.placeholder='个人姓名或机构名称'; ownerLabel.append(ownerInput);
+    const emailLabel = element('label','ih-field-label','公开联系邮箱'); const emailInput = document.createElement('input'); emailInput.type='email'; emailInput.required=true; emailInput.maxLength=254; emailInput.value=branding.legal?.contactEmail||''; emailLabel.append(emailInput);
+    const save=element('button','ih-button','保存公开运营信息'); save.type='submit'; const status=element('p','ih-section-copy'); status.setAttribute('role','status');
+    form.append(ownerLabel,emailLabel,save,status);
+    form.onsubmit=async event=>{event.preventDefault();save.disabled=true;status.textContent='正在保存…';try{const out=await request('/api/v1/legal-settings',{method:'PUT',body:JSON.stringify({operatorName:ownerInput.value,contactEmail:emailInput.value})});branding.legal=out;ownerInput.value=out.operatorName;emailInput.value=out.contactEmail;status.textContent='已保存，公开页面已同步更新。';}catch(error){status.textContent=error.message;}finally{save.disabled=false;}};
+    section.append(form);
+    for(const [label,path] of [['应用首页','/'],['隐私权政策','/privacy'],['服务条款','/terms']]){const row=element('div','ih-simple-row');row.style.cssText='display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:16px';const link=element('a','',label);link.href=path;link.target='_blank';link.rel='noopener noreferrer';const field=document.createElement('input');field.readOnly=true;field.value=new URL(path,location.origin).href;field.setAttribute('aria-label',label+'地址');field.style.cssText='flex:1;min-width:180px;max-width:100%';const copy=element('button','ih-button ih-button-quiet','复制地址');copy.type='button';copy.setAttribute('aria-label','复制'+label+'地址');copy.onclick=async()=>{try{await navigator.clipboard.writeText(field.value);status.textContent=label+'地址已复制。';}catch{field.focus();field.select();status.textContent='请复制已选中的地址。';}};row.append(link,field,copy);section.append(row);}
+    section.append(element('p','ih-section-copy','以上为当前访问域名的地址。请从正式 HTTPS 域名登录后复制，并用未登录窗口确认页面可访问，再填写到 Google Branding 或 Microsoft 应用信息中。'));
+    return section;
+  }
+
   function renderLock() {
     root.innerHTML = "";
     const box = element("div", "ih-lock");
     const card = element("div");
     const title = element("h1", "", branding.siteName || "InboxHarbor"); title.dataset.siteName = "true";
-    card.append(brandMark(), title, element("p", "", "私有、克制的邮件工作台。"));
+    card.append(brandMark(), title, element("p", "", "连接 Google 与 Microsoft 邮箱，集中阅读、搜索、分类邮件，提取验证码并按需发送通知。"));
     const form = element("form", "ih-auth-form");
     const email = document.createElement("input");
     email.type = "email"; email.placeholder = "邮箱地址"; email.required = true;
@@ -147,7 +169,7 @@
     if (authConfig.allowPublicRegistration) action("创建账号", () => renderRegistration());
     if (pendingInviteToken) action("接受邀请", () => renderRegistration(pendingInviteToken));
     action("忘记密码", renderRecoveryReset);
-    card.append(form, actions); box.append(card); root.append(box);
+    card.append(form, actions, legalLinks()); box.append(card); root.append(box);
   }
   function displayRecoveryCodes(codes){pendingRecoveryCodes=Array.isArray(codes)?codes.filter(Boolean):[];}
   function renderRecoveryNotice() {
@@ -854,7 +876,7 @@ return [...document.querySelectorAll("#ih-rules-list .ih-rule-row")].map(row=>({
     if(currentUser?.role==='user'){const danger=element('button','ih-button ih-button-danger','永久删除我的账户');danger.id='ih-delete-account';danger.type='button';s.append(danger);}s.querySelector('#ih-password-form').onsubmit=async e=>{e.preventDefault();try{await request('/api/auth/change-password',{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(e.currentTarget)))});alert('密码已更新，请重新登录');lock();}catch(error){alert(error.message);}};
     s.querySelector('#ih-logout-all').onclick=async()=>{await request('/api/auth/logout-all',{method:'POST'});lock();}; return s;
   }
-  function admin(){const s=element('section','ih-page');s.id='ih-admin';s.innerHTML='<div class="ih-section-head"><div><h1>管理后台</h1><p class="ih-section-copy">仅展示必要的成员、邀请与实例审计信息。</p></div></div><div class="ih-admin-grid"><section class="ih-card"><h2>成员</h2><div id="ih-users" class="ih-simple-list"></div></section><section class="ih-card"><h2>创建邀请</h2><form id="ih-invite-form"><label class="ih-field-label">邮箱（可留空）<input name="email" type="email" placeholder="member@example.com"></label><label class="ih-field-label">角色<select name="role"><option value="user">成员</option><option value="admin">管理员</option></select></label><label class="ih-field-label">有效期（小时）<input name="ttlHours" type="number" min="1" max="720" value="72"></label><button class="ih-button" type="submit">生成邀请链接</button></form><div id="ih-invite-result" class="ih-invite-result"></div><div id="ih-invites" class="ih-simple-list"></div></section></div><section class="ih-card ih-owner-only" id="ih-public-registration"><h2>公开注册</h2><p>关闭时仅可通过邀请创建成员。</p><label class="ih-switch"><input type="checkbox" id="ih-public-toggle"><span class="ih-switch-track"></span><span class="ih-switch-label">允许公开注册</span></label></section><section class="ih-card"><h2>审计日志</h2><div id="ih-audit" class="ih-simple-list"></div></section>';if(currentUser?.role==='owner')s.append(brandingSettings());return s;}
+  function admin(){const s=element('section','ih-page');s.id='ih-admin';s.innerHTML='<div class="ih-section-head"><div><h1>管理后台</h1><p class="ih-section-copy">仅展示必要的成员、邀请与实例审计信息。</p></div></div><div class="ih-admin-grid"><section class="ih-card"><h2>成员</h2><div id="ih-users" class="ih-simple-list"></div></section><section class="ih-card"><h2>创建邀请</h2><form id="ih-invite-form"><label class="ih-field-label">邮箱（可留空）<input name="email" type="email" placeholder="member@example.com"></label><label class="ih-field-label">角色<select name="role"><option value="user">成员</option><option value="admin">管理员</option></select></label><label class="ih-field-label">有效期（小时）<input name="ttlHours" type="number" min="1" max="720" value="72"></label><button class="ih-button" type="submit">生成邀请链接</button></form><div id="ih-invite-result" class="ih-invite-result"></div><div id="ih-invites" class="ih-simple-list"></div></section></div><section class="ih-card ih-owner-only" id="ih-public-registration"><h2>公开注册</h2><p>关闭时仅可通过邀请创建成员。</p><label class="ih-switch"><input type="checkbox" id="ih-public-toggle"><span class="ih-switch-track"></span><span class="ih-switch-label">允许公开注册</span></label></section><section class="ih-card"><h2>审计日志</h2><div id="ih-audit" class="ih-simple-list"></div></section>';if(currentUser?.role==='owner')s.append(brandingSettings(),legalSettings());return s;}
   function brandingSettings() {
     const section = element("section", "ih-card ih-branding-settings");
     section.append(element("h2", "", "站点品牌"), element("p", "ih-section-copy", "站点名称会显示在登录页、侧边栏和浏览器标题中。名称支持 1–60 个 Unicode 字符；留空恢复默认名称。"));
@@ -1703,5 +1725,5 @@ return [...document.querySelectorAll("#ih-rules-list .ih-rule-row")].map(row=>({
     document.getElementById("ih-add").onclick = openAddAccounts;
 
   }
-  (async()=>{try{[authConfig,branding]=await Promise.all([request("/api/auth/config"),request("/api/auth/branding").catch(()=>({siteName:"InboxHarbor",logoDataUrl:""}))]);branding={siteName:branding.siteName||"InboxHarbor",logoDataUrl:branding.logoDataUrl||""};applyBranding();if(authConfig.user){currentUser=authConfig.user;render();}else renderLock();}catch(error){branding={siteName:"InboxHarbor",logoDataUrl:""};renderLock();}})();
+  (async()=>{try{[authConfig,branding]=await Promise.all([request("/api/auth/config"),request("/api/auth/branding").catch(()=>({siteName:"InboxHarbor",logoDataUrl:""}))]);branding={...branding,siteName:branding.siteName||"InboxHarbor",logoDataUrl:branding.logoDataUrl||""};applyBranding();if(authConfig.user){currentUser=authConfig.user;render();}else renderLock();}catch(error){branding={siteName:"InboxHarbor",logoDataUrl:""};renderLock();}})();
 })();
