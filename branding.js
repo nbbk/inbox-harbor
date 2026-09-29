@@ -1,3 +1,4 @@
+const { readLegalSettings, registerLegalRoutes } = require('./legal');
 const MAX_LOGO_BYTES = 128 * 1024;
 function validateLogo(value) {
   if (value === '') return '';
@@ -25,7 +26,8 @@ function readSiteName(auth) {
   return auth.setting('branding_site_name', DEFAULT_SITE_NAME) || DEFAULT_SITE_NAME;
 }
 function registerBrandingRoutes(app, auth) {
-  const read = () => ({ success: true, logoDataUrl: auth.setting('branding_logo', ''), siteName: readSiteName(auth) });
+  registerLegalRoutes(app, auth, readSiteName);
+  const read = () => ({ success: true, logoDataUrl: auth.setting('branding_logo', ''), siteName: readSiteName(auth), legal: readLegalSettings(auth) });
   app.get('/api/auth/branding', (req,res) => { res.set('Cache-Control','no-store'); res.json(read()); });
   app.put('/api/v1/branding', (req,res) => {
     if (req.user?.role !== 'owner') return res.status(403).json({success:false,message:'仅 Owner 可以修改站点名称和 Logo'});
