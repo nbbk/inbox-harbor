@@ -27,7 +27,7 @@ const { accountHealth, safeFailure, isoTime } = require("./health-status");
 const { registerBrandingRoutes, readSiteName: brandingReadSiteName } = require("./branding");
 const readSiteName = brandingReadSiteName || ((auth) => auth.setting("branding_site_name", "InboxHarbor") || "InboxHarbor");
 const { DEFAULT_POLICY, normalizePolicy, isQuiet, quietEndsAt, matchingChannelIds, dedupeKey } = require("./notification-policy");
-const { listAllAccountsWithUser } = require("./repository");
+const { UserRepository, listAllAccountsWithUser } = require("./repository");
 const { recoverInterruptedRestore } = require("./migration-service");
 const {
   detectProvider,
@@ -769,6 +769,13 @@ async function checkAndPushNewMailsToTelegram(newMails) {
     console.log(`🎉 成功推送到 Telegram ${pushCount} 封最新模板一邮件！`);
 }
 
+function clearCachedOAuthToken(acc) {
+  // A token minted before a permission or credential change may have old scopes.
+  delete acc._cachedToken;
+  delete acc._cachedExpiresAt;
+  delete acc._cachedOAuthGeneration;
+}
+
 function parseCredentials(acc) {
   let clientId = GOOGLE_CLIENT_ID;
   let clientSecret = GOOGLE_CLIENT_SECRET;
@@ -803,6 +810,7 @@ async function verifyMicrosoftAccount(acc) {
   if (
     acc._cachedToken &&
     acc._cachedExpiresAt &&
+    acc._cachedOAuthGeneration === Number(acc.oauthGeneration || 0) &&
     Date.now() < acc._cachedExpiresAt
   ) {
     return { status: "active", accessToken: acc._cachedToken, error: null };
@@ -841,6 +849,7 @@ async function verifyMicrosoftAccount(acc) {
 
     if (resp.ok && data.access_token) {
       acc._cachedToken = data.access_token;
+      acc._cachedOAuthGeneration = Number(acc.oauthGeneration || 0);
       acc._cachedExpiresAt =
         Date.now() +
         (data.expires_in ? (data.expires_in - 120) * 1000 : 3400 * 1000);
@@ -884,6 +893,7 @@ async function verifyGoogleAccount(acc) {
   if (
     acc._cachedToken &&
     acc._cachedExpiresAt &&
+    acc._cachedOAuthGeneration === Number(acc.oauthGeneration || 0) &&
     Date.now() < acc._cachedExpiresAt
   ) {
     return { status: "active", accessToken: acc._cachedToken, error: null };
@@ -915,6 +925,7 @@ async function verifyGoogleAccount(acc) {
       if (resp.ok && data.access_token) {
         if (data.scope) acc.providerScopes = data.scope;
         acc._cachedToken = data.access_token;
+        acc._cachedOAuthGeneration = Number(acc.oauthGeneration || 0);
         acc._cachedExpiresAt =
           Date.now() +
           (data.expires_in ? (data.expires_in - 120) * 1000 : 3400 * 1000);
@@ -1193,6 +1204,59 @@ async function fetchGoogleMails(acc, accessToken, persistBootstrap) {
   return { mails: [], cursor: acc.syncCursor || null };
 }
 
+function hasCurrentSendAuthorization(userId, snapshot) {
+  const current = new UserRepository(storage, userId).get("accounts", snapshot.id)?.payload;
+  // Refresh can await user actions. Recheck only authorization fields so a
+  // concurrent sync checkpoint cannot invalidate an otherwise permitted send.
+  return current?.sendEnabled === true &&
+    current.provider === snapshot.provider && current.username === snapshot.username &&
+    Number(current.oauthGeneration || 0) === Number(snapshot.oauthGeneration || 0) &&
+    current.note === snapshot.note && current.providerScopes === snapshot.providerScopes;
+}
+
+async function mailSendFailure(response, provider) {
+  const providerStatus = Number.isInteger(response.status) && response.status >= 100 && response.status <= 599
+    ? response.status : null;
+  const messages = {
+    send_permission_missing: "邮件服务未授予发信权限，请在账户页重新授权并允许发信。",
+    provider_authorization_invalid: "邮件服务授权已失效，请在账户页重新授权后重试。",
+    provider_api_disabled: "Gmail API 未启用，请在 Google Cloud 项目中启用后重试。",
+    provider_policy_denied: "邮箱组织策略禁止此应用访问 Gmail，请联系组织管理员。",
+    provider_access_denied: "微软拒绝发信，请检查发信授权及邮箱或组织的访问限制。",
+    provider_rate_limited: "邮件服务的发信或请求配额已达上限，请稍后重试。",
+  };
+  let reason = providerStatus === 401 ? "provider_authorization_invalid"
+    : providerStatus === 429 ? "provider_rate_limited" : "provider_error";
+  if (providerStatus === 403) {
+    // Provider messages, metadata and unknown codes can contain credentials or
+    // mail content. Only exact, known machine codes select fixed local copy.
+    try {
+      const data = await response.json();
+      const error = data?.error;
+      const codes = provider === "google"
+        ? [...(Array.isArray(error?.errors) ? error.errors : []), ...(Array.isArray(error?.details) ? error.details : [])].map((item) => item?.reason)
+        : [error?.code];
+      const allowed = provider === "google" ? {
+        insufficientPermissions: "send_permission_missing",
+        ACCESS_TOKEN_SCOPE_INSUFFICIENT: "send_permission_missing",
+        accessNotConfigured: "provider_api_disabled",
+        SERVICE_DISABLED: "provider_api_disabled",
+        domainPolicy: "provider_policy_denied",
+        dailyLimitExceeded: "provider_rate_limited",
+        rateLimitExceeded: "provider_rate_limited",
+        userRateLimitExceeded: "provider_rate_limited",
+      } : {
+        ErrorAccessDenied: "provider_access_denied",
+        Authorization_RequestDenied: "provider_access_denied",
+        accessDenied: "provider_access_denied",
+      };
+      const code = codes.find((item) => typeof item === "string" && Object.hasOwn(allowed, item));
+      if (code) reason = allowed[code];
+    } catch {}
+  }
+  return { reason, providerStatus, message: messages[reason] || `邮件服务返回 HTTP ${providerStatus || "未知"}` };
+}
+
 async function sendMicrosoftMail(accessToken, targetEmail, testCode, testLink) {
   const mailPayload = {
     message: {
@@ -1221,12 +1285,8 @@ async function sendMicrosoftMail(accessToken, targetEmail, testCode, testLink) {
   });
 
   if (!resp.ok) {
-    const errText = await resp.text();
-    console.error("Microsoft sendMail API error status:", resp.status, errText);
-    return {
-      ok: false,
-      error: `微软返回 HTTP ${resp.status} (若无写权限请点击该账号【授权】刷新权限)`,
-    };
+    const failure = await mailSendFailure(resp, "microsoft");
+    return { ok: false, error: failure.message, reason: failure.reason, providerStatus: failure.providerStatus };
   }
 
   return { ok: true };
@@ -1249,7 +1309,10 @@ async function sendGoogleMail(accessToken, targetEmail, testCode, testLink) {
       body: JSON.stringify({ raw }),
     },
   );
-  if (!resp.ok) return { ok: false, error: `Gmail 返回 HTTP ${resp.status}` };
+  if (!resp.ok) {
+    const failure = await mailSendFailure(resp, "google");
+    return { ok: false, error: failure.message, reason: failure.reason, providerStatus: failure.providerStatus };
+  }
   return { ok: true };
 }
 
@@ -1447,6 +1510,7 @@ app.post("/api/auth/microsoft/poll-device-token", async (req, res) => {
       latestAcc.status = "active";
       latestAcc.note = refreshToken;
       latestAcc.providerScopes = tokenData.scope || latestAcc.providerScopes || "";
+      clearCachedOAuthToken(latestAcc);
       latestAcc.lastChecked = new Date().toISOString();
       const expected = latestAcc.storageUpdatedAt; delete latestAcc.storageUpdatedAt; delete latestAcc.storageCreatedAt;
       if (!latestTenant.repo.updateIfUnchanged('accounts', latestAcc.id, latestAcc, { provider: latestAcc.provider, address: latestAcc.username }, expected)) {
@@ -1602,6 +1666,7 @@ app.get("/auth/google/callback", async (req, res) => {
       latestAcc.status = "active";
       latestAcc.note = refreshToken;
       latestAcc.providerScopes = tokenData.scope || latestAcc.providerScopes || "";
+      clearCachedOAuthToken(latestAcc);
       latestAcc.lastChecked = new Date().toISOString();
       const expected = latestAcc.storageUpdatedAt; delete latestAcc.storageUpdatedAt; delete latestAcc.storageCreatedAt;
       if (!latestTenant.repo.updateIfUnchanged('accounts', latestAcc.id, latestAcc, { provider: latestAcc.provider, address: latestAcc.username }, expected)) {
@@ -1648,6 +1713,7 @@ function publicAccount(account) {
     token,
     _cachedToken,
     _cachedExpiresAt,
+    _cachedOAuthGeneration,
     errorDetail,
     lastSyncError,
     ...safe
@@ -1702,7 +1768,10 @@ app.put("/api/accounts/:id/permissions", (req, res) => {
     account.readEnabled = req.body.readEnabled;
   if (typeof req.body.sendEnabled === "boolean")
     account.sendEnabled = req.body.sendEnabled;
-  if (oauthPermissionChanged) account.oauthGeneration = Number(account.oauthGeneration || 0) + 1;
+  if (oauthPermissionChanged) {
+    account.oauthGeneration = Number(account.oauthGeneration || 0) + 1;
+    clearCachedOAuthToken(account);
+  }
   if (typeof req.body.syncEnabled === "boolean")
     account.syncEnabled = req.body.syncEnabled;
   if (req.body.pollIntervalSeconds !== undefined) {
@@ -1724,6 +1793,7 @@ app.post("/api/accounts/:id/revoke", (req, res) => {
   if (!account)
     return res.status(404).json({ success: false, message: "账号不存在" });
   clearOAuthSecrets(account);
+  clearCachedOAuthToken(account);
   account.oauthGeneration = Number(account.oauthGeneration || 0) + 1;
   account.status = "pending";
   account.syncStatus = "pending";
@@ -2376,6 +2446,7 @@ app.post("/api/accounts/send-test-mail", async (req, res) => {
   const testCode = Math.floor(100000 + Math.random() * 900000).toString();
   const testLink = `https://example.invalid/inboxharbor-test?code=${testCode}`;
 
+  const sendAuthorization = { ...senderAcc };
   const verify =
     senderAcc.provider === "google"
       ? await verifyGoogleAccount(senderAcc)
@@ -2395,6 +2466,8 @@ app.post("/api/accounts/send-test-mail", async (req, res) => {
       success: false,
       message: "当前 OAuth 授权未包含发信权限，请重新授权。",
     });
+  if (!hasCurrentSendAuthorization(req.user.id, sendAuthorization))
+    return res.status(403).json({ success: false, message: "账户已移除或发信授权已变更，请检查账户权限后重试。" });
   const sendResult =
     senderAcc.provider === "google"
       ? await sendGoogleMail(verify.accessToken, recipient, testCode, testLink)
@@ -2407,7 +2480,7 @@ app.post("/api/accounts/send-test-mail", async (req, res) => {
   if (!sendResult.ok)
     return res
       .status(502)
-      .json({ success: false, message: sendResult.error || "邮件发送失败" });
+      .json({ success: false, message: sendResult.error || "邮件发送失败", reason: sendResult.reason, providerStatus: sendResult.providerStatus });
 
   res.json({
     success: true,
@@ -2552,6 +2625,7 @@ app.post("/api/mails/send", async (req, res) => {
       success: false,
       message: "请填写有效收件人、主题和正文（主题最多 200 字，正文最多 100000 字）",
     });
+  const sendAuthorization = { ...account };
   const verified =
     account.provider === "google"
       ? await verifyGoogleAccount(account)
@@ -2569,6 +2643,8 @@ app.post("/api/mails/send", async (req, res) => {
       success: false,
       message: "发信授权无效，请在账户页重新授权并允许发信",
     });
+  if (!hasCurrentSendAuthorization(req.user.id, sendAuthorization))
+    return res.status(403).json({ success: false, message: "账户已移除或发信授权已变更，请检查账户权限后重试。" });
   let response;
   if (account.provider === "google") {
     const encodedSubject = Buffer.from(mailSubject).toString("base64");
@@ -2605,7 +2681,7 @@ app.post("/api/mails/send", async (req, res) => {
   if (!response.ok)
     return res.status(502).json({
       success: false,
-      message: `邮件服务返回 HTTP ${response.status}`,
+      ...await mailSendFailure(response, account.provider),
     });
   const sentMail = {
     id: `sent_${crypto.randomUUID()}`,

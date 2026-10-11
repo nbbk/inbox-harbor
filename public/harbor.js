@@ -649,7 +649,7 @@
   }
 
   async function deleteMail(mail) {
-    if (!confirm(`确定从本地归档删除“${mail.subject || "无主题"}”吗？`)) return;
+    if (!confirm(`确定从本地归档删除“${mail.subject || "无主题"}”吗？\n此操作仅删除 InboxHarbor 本地副本，不会删除 Gmail / Microsoft 等原邮箱中的邮件，也不会更改原邮箱标签。`)) return;
     try {
       await request(`/api/mails/${encodeURIComponent(mail.id)}`, {
         method: "DELETE",
@@ -1176,7 +1176,7 @@ return [...document.querySelectorAll("#ih-rules-list .ih-rule-row")].map(row=>({
       else loadConnectorStatus();
       if (notices) { catalog = notices.catalog; config = notices.configuration; renderChannels(); if (document.getElementById("ih-rules-list")) { if(rulesLoaded){const draft=captureNotificationRules();document.getElementById("ih-rules-list").replaceChildren();draft.forEach(addNotificationRule);}else loadNotificationRules().catch(()=>{}); } loadNotificationHistory().catch(()=>{}); }
       loadUserAreas().catch(() => {});
-      setTimeout(()=>{const recovery=document.getElementById('ih-recovery');if(recovery)recovery.onclick=async()=>{const currentPassword=prompt('输入当前密码以生成新恢复码');if(!currentPassword)return;try{const result=await request('/api/auth/recovery/regenerate',{method:'POST',body:JSON.stringify({currentPassword})});displayRecoveryCodes(result.recoveryCodes);renderRecoveryNotice();}catch(error){alert(error.message);}};const remove=document.getElementById('ih-delete-account');if(remove)remove.onclick=async()=>{const currentPassword=prompt('输入当前密码以永久删除账户');if(!currentPassword)return;if(!confirm('邮件、账户、通知和共享链接将被永久删除。'))return;try{await request('/api/auth/me',{method:'DELETE',body:JSON.stringify({currentPassword})});lock();}catch(error){alert(error.message);}};},0);
+      setTimeout(()=>{const recovery=document.getElementById('ih-recovery');if(recovery)recovery.onclick=async()=>{const currentPassword=prompt('输入当前密码以生成新恢复码');if(!currentPassword)return;try{const result=await request('/api/auth/recovery/regenerate',{method:'POST',body:JSON.stringify({currentPassword})});displayRecoveryCodes(result.recoveryCodes);renderRecoveryNotice();}catch(error){alert(error.message);}};const remove=document.getElementById('ih-delete-account');if(remove)remove.onclick=async()=>{const currentPassword=prompt('输入当前密码以永久删除 InboxHarbor 账户');if(!currentPassword)return;if(!confirm('你的 InboxHarbor 账户、本站邮件归档、通知和共享链接将被永久删除。Gmail / Microsoft 等原邮箱账户、邮件及标签不受影响。'))return;try{await request('/api/auth/me',{method:'DELETE',body:JSON.stringify({currentPassword})});lock();}catch(error){alert(error.message);}};},0);
     } catch (err) {
       if (epoch !== sessionEpoch) return;
       alert(err.message);
@@ -1610,7 +1610,7 @@ return [...document.querySelectorAll("#ih-rules-list .ih-rule-row")].map(row=>({
       const del = element("button", "ih-button ih-button-danger", "删除");
       del.type = "button";
       del.onclick = async () => {
-        if (!confirm(`删除 ${a.username}？`)) return;
+        if (!confirm(`删除 ${a.username} 的 InboxHarbor 连接？\n仅移除本站连接与保存的授权信息，已归档邮件仍保留。不会删除 Gmail / Microsoft 等原邮箱账户、邮件，也不会更改原邮箱标签。`)) return;
         del.disabled = true;
         try {
           await request(`/api/accounts/${encodeURIComponent(a.id)}`, {
